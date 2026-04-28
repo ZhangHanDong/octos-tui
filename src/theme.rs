@@ -1,0 +1,102 @@
+use ratatui::style::{Color, Style};
+
+use crate::cli::ThemeName;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub surface: Color,
+    pub surface_alt: Color,
+    pub frame: Color,
+    pub accent: Color,
+    pub highlight: Color,
+    pub text: Color,
+    pub muted: Color,
+    pub success: Color,
+    pub success_bg: Color,
+    pub danger: Color,
+    pub danger_bg: Color,
+    pub diff_context_bg: Color,
+}
+
+impl Palette {
+    pub fn for_theme(theme: ThemeName) -> Self {
+        match theme {
+            ThemeName::Slate => Self {
+                surface: Color::Rgb(20, 25, 35),
+                surface_alt: Color::Rgb(28, 34, 46),
+                frame: Color::Rgb(48, 57, 73),
+                accent: Color::Rgb(99, 151, 255),
+                highlight: Color::Rgb(246, 199, 94),
+                text: Color::Rgb(230, 236, 242),
+                muted: Color::Rgb(145, 156, 170),
+                success: Color::Rgb(91, 196, 129),
+                success_bg: Color::Rgb(22, 48, 36),
+                danger: Color::Rgb(232, 95, 95),
+                danger_bg: Color::Rgb(58, 28, 32),
+                diff_context_bg: Color::Rgb(24, 31, 43),
+            },
+            ThemeName::Codex => Self {
+                surface: Color::Rgb(15, 18, 24),
+                surface_alt: Color::Rgb(26, 30, 39),
+                frame: Color::Rgb(90, 94, 108),
+                accent: Color::Rgb(110, 188, 255),
+                highlight: Color::Rgb(255, 209, 102),
+                text: Color::Rgb(236, 239, 244),
+                muted: Color::Rgb(154, 162, 175),
+                success: Color::Rgb(104, 211, 145),
+                success_bg: Color::Rgb(18, 50, 34),
+                danger: Color::Rgb(248, 113, 113),
+                danger_bg: Color::Rgb(64, 27, 32),
+                diff_context_bg: Color::Rgb(22, 26, 34),
+            },
+            ThemeName::Claude => Self {
+                surface: Color::Rgb(38, 31, 26),
+                surface_alt: Color::Rgb(54, 44, 36),
+                frame: Color::Rgb(92, 78, 65),
+                accent: Color::Rgb(242, 143, 93),
+                highlight: Color::Rgb(126, 210, 166),
+                text: Color::Rgb(244, 241, 234),
+                muted: Color::Rgb(174, 164, 150),
+                success: Color::Rgb(120, 205, 150),
+                success_bg: Color::Rgb(37, 58, 43),
+                danger: Color::Rgb(235, 111, 106),
+                danger_bg: Color::Rgb(70, 38, 34),
+                diff_context_bg: Color::Rgb(45, 37, 31),
+            },
+            ThemeName::Solarized => Self {
+                surface: Color::Rgb(0, 43, 54),
+                surface_alt: Color::Rgb(7, 54, 66),
+                frame: Color::Rgb(88, 110, 117),
+                accent: Color::Rgb(38, 139, 210),
+                highlight: Color::Rgb(181, 137, 0),
+                text: Color::Rgb(238, 232, 213),
+                muted: Color::Rgb(147, 161, 161),
+                success: Color::Rgb(133, 153, 0),
+                success_bg: Color::Rgb(17, 67, 48),
+                danger: Color::Rgb(220, 50, 47),
+                danger_bg: Color::Rgb(75, 44, 48),
+                diff_context_bg: Color::Rgb(5, 50, 61),
+            },
+        }
+    }
+
+    pub fn border(self) -> Style {
+        Style::default().fg(self.frame)
+    }
+
+    pub fn title(self) -> Style {
+        Style::default().fg(self.accent)
+    }
+
+    pub fn selected(self) -> Style {
+        Style::default().fg(self.highlight)
+    }
+
+    pub fn text(self) -> Style {
+        Style::default().fg(self.text)
+    }
+
+    pub fn muted(self) -> Style {
+        Style::default().fg(self.muted)
+    }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "octos-tui"
+version = "0.1.1"
+edition = "2024"
+rust-version = "1.85.0"
+license = "Apache-2.0"
+repository = "https://github.com/octos-org/octos-tui"
+description = "Terminal UI client for Octos AppUi/UI Protocol"
+
+[[bin]]
+name = "octos-tui"
+path = "src/main.rs"
+
+[dependencies]
+octos-core = { path = "../octos/crates/octos-core" }
+clap = { version = "4", features = ["derive"] }
+eyre = "0.6"
+color-eyre = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
+crossterm = "0.28"
+ratatui = "0.29"
+
+[lints.rust]
+unsafe_code = "deny"
