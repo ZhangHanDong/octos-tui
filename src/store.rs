@@ -11,7 +11,7 @@ use crate::{
     client_event::ClientEvent,
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalAction, ApprovalModalState,
-        DiffPreviewGetResult, LiveReply, SessionView, TaskView,
+        DiffPreviewGetResult, FocusPane, LiveReply, SessionView, TaskView,
     },
 };
 
@@ -36,7 +36,7 @@ impl Store {
     pub fn compose_command(&mut self) -> Option<AppUiCommand> {
         if self.state.readonly {
             self.state.status = "Read-only mode: turn/start disabled".into();
-            self.state.composer.clear();
+            self.state.clear_current_composer_draft();
             return None;
         }
 
@@ -45,7 +45,7 @@ impl Store {
             return None;
         }
 
-        self.state.composer.clear();
+        self.state.clear_current_composer_draft();
         if self.state.active_turn().is_some() {
             self.state.pending_messages.push(prompt);
             self.state.status =
@@ -120,6 +120,7 @@ impl Store {
 
         self.state.status = format!("Approval {}: {}", action.status_label(), approval.title);
         self.state.set_run_state_in_progress();
+        self.state.approval_auto_open = true;
 
         let mut params = ApprovalRespondParams::new(
             approval.session_id,
@@ -129,6 +130,40 @@ impl Store {
         params.approval_scope = Some(action.approval_scope().into());
 
         Some(AppUiCommand::RespondApproval(params))
+    }
+
+    pub fn clear_composer_or_staged_messages(&mut self) {
+        if !self.state.pending_messages.is_empty() {
+            let cleared = self.state.pending_messages.len();
+            self.state.pending_messages.clear();
+            self.state.status = format!("Cleared {cleared} staged message(s)");
+            return;
+        }
+
+        if !self.state.composer.is_empty() {
+            self.state.clear_current_composer_draft();
+            self.state.status = "Cleared composer draft".into();
+            return;
+        }
+
+        self.state.status = "No composer draft or staged message to clear".into();
+    }
+
+    pub fn show_pending_approval(&mut self) -> bool {
+        let title = {
+            let Some(approval) = self.state.approval.as_mut() else {
+                self.state.status = "No pending approval to show".into();
+                return false;
+            };
+
+            approval.visible = true;
+            approval.title.clone()
+        };
+
+        self.state.approval_auto_open = true;
+        self.state.focus = FocusPane::Composer;
+        self.state.status = format!("Approval shown: {title}");
+        true
     }
 
     pub fn read_task_output_command(&mut self) -> Option<AppUiCommand> {
@@ -186,7 +221,9 @@ impl Store {
             && approval.visible
         {
             approval.visible = false;
-            self.state.status = "Approval pane hidden; request is still pending".into();
+            self.state.approval_auto_open = false;
+            self.state.status =
+                "Approval pane hidden; auto-open disabled until approval is shown again".into();
             return true;
         }
 
@@ -454,11 +491,13 @@ impl Store {
                     ),
                 );
                 let mut approval = ApprovalModalState::from_event(event);
+                approval.visible = self.state.approval_auto_open;
                 let diff_preview_id = approval.diff_preview_id();
                 if diff_preview_id.is_some() {
                     approval.visible = false;
                 }
                 self.state.approval = Some(approval);
+                self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
                 self.state.status = format!("Approval requested: {title}");
                 if let Some(preview_id) = diff_preview_id {
@@ -1334,10 +1373,35 @@ mod tests {
             .as_ref()
             .expect("approval remains pending");
         assert!(!approval.visible);
+        assert!(!store.state.approval_auto_open);
         assert_eq!(
             store.state.status,
-            "Approval pane hidden; request is still pending"
+            "Approval pane hidden; auto-open disabled until approval is shown again"
         );
+    }
+
+    #[test]
+    fn approval_auto_open_setting_applies_to_next_request() {
+        let mut store = store_with_empty_session();
+        store.state.approval_auto_open = false;
+        store.state.focus = FocusPane::Git;
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ApprovalRequested(
+            ApprovalRequestedEvent::generic(
+                session_id,
+                ApprovalId::new(),
+                TurnId::new(),
+                "shell",
+                "Run command",
+                "cargo test",
+            ),
+        )));
+
+        let approval = store.state.approval.as_ref().expect("approval pending");
+        assert!(!approval.visible);
+        assert_eq!(store.state.focus, FocusPane::Composer);
+        assert_eq!(store.state.run_state.label(), "blocked");
     }
 
     #[test]

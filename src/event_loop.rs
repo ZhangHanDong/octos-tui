@@ -86,8 +86,18 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             .map_or(KeyAction::Continue, KeyAction::Send);
     }
 
+    if is_control_char(&key, 'u') {
+        store.clear_composer_or_staged_messages();
+        return KeyAction::Continue;
+    }
+
     if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
         return handle_plain_key(store, key);
+    }
+
+    if is_alt_char(&key, 'a') {
+        store.show_pending_approval();
+        return KeyAction::Continue;
     }
 
     if is_alt_char(&key, 'j') {
@@ -489,6 +499,61 @@ mod tests {
     }
 
     #[test]
+    fn session_switch_preserves_per_session_composer_drafts() {
+        let mut store = store_with_sessions(2);
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "draft one".into();
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Tab)),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.focus, FocusPane::Sessions);
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('j'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.selected_session, 1);
+        assert!(store.state.composer.is_empty());
+
+        store.state.composer = "draft two".into();
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('k'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.selected_session, 0);
+        assert_eq!(store.state.composer, "draft one");
+    }
+
+    #[test]
+    fn ctrl_u_clears_staged_messages_before_composer_draft() {
+        let mut store = store_with_sessions(1);
+        store.state.composer = "draft".into();
+        store.state.pending_messages.push("next prompt".into());
+
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            KeyAction::Continue
+        ));
+        assert!(store.state.pending_messages.is_empty());
+        assert_eq!(store.state.composer, "draft");
+        assert_eq!(store.state.status, "Cleared 1 staged message(s)");
+
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('u'), KeyModifiers::CONTROL)
+            ),
+            KeyAction::Continue
+        ));
+        assert!(store.state.composer.is_empty());
+        assert_eq!(store.state.status, "Cleared composer draft");
+    }
+
+    #[test]
     fn ctrl_c_emits_interrupt_for_active_turn() {
         let turn_id = TurnId::new();
         let mut store = store_with_sessions(1);
@@ -567,6 +632,40 @@ mod tests {
         };
         assert_eq!(params.approval_id, approval_id);
         assert!(store.state.diff_preview.active);
+    }
+
+    #[test]
+    fn hidden_approval_can_be_reopened_with_alt_a() {
+        let (mut store, _) = store_with_visible_approval();
+        store.close_modal();
+        assert!(
+            !store
+                .state
+                .approval
+                .as_ref()
+                .expect("approval pending")
+                .visible
+        );
+        assert!(!store.state.approval_auto_open);
+
+        assert!(matches!(
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char('a'), KeyModifiers::ALT)
+            ),
+            KeyAction::Continue
+        ));
+
+        assert!(
+            store
+                .state
+                .approval
+                .as_ref()
+                .expect("approval pending")
+                .visible
+        );
+        assert!(store.state.approval_auto_open);
+        assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
     #[test]

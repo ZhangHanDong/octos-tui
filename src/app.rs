@@ -118,7 +118,9 @@ fn composer_height(app: &AppState) -> u16 {
         1 + shown_messages + overflow_row
     };
 
-    pending_rows + 5
+    let blocked_rows = u16::from(app.run_state.detail().is_some());
+
+    pending_rows + blocked_rows + 5
 }
 
 fn is_running_activity(item: &ActivityItem) -> bool {
@@ -1329,7 +1331,10 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            "Messages to be submitted after active turn/tool call (Esc interrupt/send now)",
+            format!(
+                "Staged messages ({}) submit after active turn/tool call | Esc interrupt/send | Ctrl+U clear",
+                app.pending_messages.len()
+            ),
             palette.muted().bg(palette.surface),
         )]));
         for pending in app.pending_messages.iter().take(2) {
@@ -1344,6 +1349,16 @@ fn render_composer(app: &AppState, palette: Palette) -> Paragraph<'static> {
                 palette.muted().bg(palette.surface),
             )]));
         }
+    }
+    if let Some(detail) = app.run_state.detail() {
+        lines.push(Line::from(vec![
+            Span::styled("Blocked: ", palette.selected().bg(palette.surface)),
+            Span::styled(detail.to_string(), palette.text().bg(palette.surface)),
+            Span::styled(
+                "  y/s/n approval | Alt+A show",
+                palette.muted().bg(palette.surface),
+            ),
+        ]));
     }
     lines.push(Line::from(Span::styled(
         " ",
@@ -2127,7 +2142,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(text.contains("Messages to be submitted after active turn/tool call"));
+        assert!(text.contains("Staged messages (2) submit after active turn/tool call"));
+        assert!(text.contains("Ctrl+U clear"));
         assert!(text.contains("it did not do error recovery?"));
         assert!(text.contains("what is ip for mini5"));
         let pending_style =

@@ -82,17 +82,25 @@ pub struct AppState {
     pub workspace: WorkspacePaneState,
     pub git: GitPaneState,
     pub composer: String,
+    pub composer_drafts: Vec<ComposerDraft>,
     pub pending_messages: Vec<String>,
     pub status: String,
     pub target: Option<String>,
     pub readonly: bool,
     pub protocol_version: &'static str,
     pub run_state: SessionRunState,
+    pub approval_auto_open: bool,
     pub approval: Option<ApprovalModalState>,
     pub task_output: TaskOutputDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
     pub diff_preview: DiffPreviewPaneState,
     pub activity: Vec<ActivityItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerDraft {
+    pub session_id: SessionKey,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -871,12 +879,14 @@ impl AppState {
             workspace: panes.workspace,
             git: panes.git,
             composer: String::new(),
+            composer_drafts: Vec::new(),
             pending_messages: Vec::new(),
             status,
             target,
             readonly,
             protocol_version: APP_UI_API_V1,
             run_state,
+            approval_auto_open: true,
             approval: None,
             task_output: TaskOutputDetailState::default(),
             task_output_cursors: Vec::new(),
@@ -1000,9 +1010,11 @@ impl AppState {
         if self.sessions.is_empty() {
             return;
         }
+        self.persist_composer_draft_for_selected_session();
         self.selected_session = (self.selected_session + 1) % self.sessions.len();
         self.selected_task = 0;
         self.transcript_scroll = 0;
+        self.load_composer_draft_for_selected_session();
         self.refresh_run_state_from_selection();
     }
 
@@ -1010,6 +1022,7 @@ impl AppState {
         if self.sessions.is_empty() {
             return;
         }
+        self.persist_composer_draft_for_selected_session();
         if self.selected_session == 0 {
             self.selected_session = self.sessions.len() - 1;
         } else {
@@ -1017,6 +1030,7 @@ impl AppState {
         }
         self.selected_task = 0;
         self.transcript_scroll = 0;
+        self.load_composer_draft_for_selected_session();
         self.refresh_run_state_from_selection();
     }
 
@@ -1179,6 +1193,46 @@ impl AppState {
 
     pub fn refresh_run_state_from_selection(&mut self) {
         self.run_state = initial_run_state(&self.sessions, self.selected_session);
+    }
+
+    pub fn persist_composer_draft_for_selected_session(&mut self) {
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            return;
+        };
+        let text = self.composer.clone();
+        if let Some(draft) = self
+            .composer_drafts
+            .iter_mut()
+            .find(|draft| draft.session_id == session_id)
+        {
+            draft.text = text;
+        } else if !text.is_empty() {
+            self.composer_drafts
+                .push(ComposerDraft { session_id, text });
+        }
+        self.composer_drafts.retain(|draft| !draft.text.is_empty());
+    }
+
+    pub fn load_composer_draft_for_selected_session(&mut self) {
+        let Some(session_id) = self.active_session().map(|session| session.id.clone()) else {
+            self.composer.clear();
+            return;
+        };
+        self.composer = self
+            .composer_drafts
+            .iter()
+            .find(|draft| draft.session_id == session_id)
+            .map(|draft| draft.text.clone())
+            .unwrap_or_default();
+    }
+
+    pub fn clear_current_composer_draft(&mut self) {
+        let session_id = self.active_session().map(|session| session.id.clone());
+        self.composer.clear();
+        if let Some(session_id) = session_id {
+            self.composer_drafts
+                .retain(|draft| draft.session_id != session_id);
+        }
     }
 }
 
