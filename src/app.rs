@@ -14,7 +14,7 @@ use crate::{
     keymap::HELP,
     model::{
         ActivityItem, ActivityKind, AppState, ApprovalModalState, DiffPreviewPaneState, FocusPane,
-        TaskOutputDetailState, task_state_label,
+        SessionRunState, TaskOutputDetailState, task_state_label,
     },
     theme::Palette,
 };
@@ -1454,6 +1454,11 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
             app.protocol_version.to_string(),
             palette.muted().bg(palette.surface_alt),
         ),
+        Span::styled(" | state ", palette.title().bg(palette.surface_alt)),
+        Span::styled(
+            app.run_state.label().to_string(),
+            run_state_style(&app.run_state, palette).bg(palette.surface_alt),
+        ),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(policy.to_string(), palette.text().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
@@ -1469,6 +1474,22 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(HELP.to_string(), palette.selected().bg(palette.surface_alt)),
     ]))
     .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+}
+
+fn run_state_style(state: &SessionRunState, palette: Palette) -> Style {
+    match state {
+        SessionRunState::Idle => palette.muted(),
+        SessionRunState::InProgress => palette.selected().add_modifier(Modifier::BOLD),
+        SessionRunState::Blocked { .. } => Style::default()
+            .fg(palette.highlight)
+            .add_modifier(Modifier::BOLD),
+        SessionRunState::Success => Style::default()
+            .fg(palette.success)
+            .add_modifier(Modifier::BOLD),
+        SessionRunState::Error { .. } => Style::default()
+            .fg(palette.danger)
+            .add_modifier(Modifier::BOLD),
+    }
 }
 
 fn active_spinner() -> &'static str {
@@ -2219,6 +2240,7 @@ mod tests {
         assert!(text.contains("Progress"));
         assert!(text.contains("call call-1"));
         assert!(text.contains("gpt-5-codex"));
+        assert!(text.contains("state running"));
         assert!(text.contains("approval gated"));
         assert!(text.contains("1 msgs/0 tasks"));
     }

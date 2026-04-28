@@ -70,6 +70,7 @@ impl Store {
             .push(Message::user(prompt.clone()));
         self.state.scroll_transcript_to_latest();
         self.state.status = status.into();
+        self.state.set_run_state_in_progress();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
             session_id,
             turn_id: octos_core::ui_protocol::TurnId::new(),
@@ -118,6 +119,7 @@ impl Store {
         };
 
         self.state.status = format!("Approval {}: {}", action.status_label(), approval.title);
+        self.state.set_run_state_in_progress();
 
         let mut params = ApprovalRespondParams::new(
             approval.session_id,
@@ -246,6 +248,7 @@ impl Store {
                     .with_detail("app-ui error"),
                 );
                 self.state.status = format!("Error [{}]: {}", error.code, error.message);
+                self.state.set_run_state_error(error.message);
                 None
             }
         }
@@ -288,13 +291,16 @@ impl Store {
                 .unwrap_or_else(|| event.metadata.kind.clone()),
             status.clone(),
         );
-        if let Some(turn_id) = event.turn_id {
+        if let Some(turn_id) = event.turn_id.clone() {
             item = item.with_turn(turn_id);
         }
         if let Some(detail) = event.metadata.detail.or(mutation_detail) {
             item = item.with_detail(detail);
         }
         self.state.push_activity(item);
+        if event.turn_id.is_some() {
+            self.state.set_run_state_in_progress();
+        }
 
         if let Some((operation, path, preview_id)) = diff_preview_request {
             let request_already_in_flight = self.state.diff_preview.loading
@@ -321,6 +327,9 @@ impl Store {
                 if let Some(panes) = event.panes {
                     self.state.apply_pane_snapshot(panes);
                 }
+                if self.state.active_turn().is_none() {
+                    self.state.set_run_state_idle();
+                }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
                 None
@@ -332,6 +341,7 @@ impl Store {
                         text: String::new(),
                     });
                     self.state.status = format!("Turn started in {}", session.title);
+                    self.state.set_run_state_in_progress();
                 }
                 None
             }
@@ -366,6 +376,7 @@ impl Store {
                     item = item.with_arguments(arguments);
                 }
                 self.state.push_activity(item);
+                self.state.set_run_state_in_progress();
                 self.state.status =
                     format!("Tool started: {} ({})", event.tool_name, event.tool_call_id);
                 None
@@ -383,6 +394,7 @@ impl Store {
                     None,
                     None,
                 );
+                self.state.set_run_state_in_progress();
                 self.state.status = event
                     .message
                     .unwrap_or_else(|| format!("Tool progress {}", event.tool_call_id));
@@ -447,6 +459,7 @@ impl Store {
                     approval.visible = false;
                 }
                 self.state.approval = Some(approval);
+                self.state.set_run_state_blocked(title.clone());
                 self.state.status = format!("Approval requested: {title}");
                 if let Some(preview_id) = diff_preview_id {
                     let request_already_in_flight = self.state.diff_preview.loading
@@ -542,7 +555,7 @@ impl Store {
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
-        let (status, reset_scroll) = {
+        let (status, reset_scroll, completed_current_turn) = {
             let Some(session) = self.find_session_mut(&event.session_id) else {
                 return None;
             };
@@ -550,19 +563,34 @@ impl Store {
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
                     session.messages.push(Message::assistant(live_reply.text));
-                    (format!("Turn completed in {title} at seq {seq}"), true)
+                    (
+                        format!("Turn completed in {title} at seq {seq}"),
+                        true,
+                        true,
+                    )
                 }
                 Some(live_reply) => {
                     session.live_reply = Some(live_reply);
-                    (format!("Ignored completed stale turn in {title}"), false)
+                    (
+                        format!("Ignored completed stale turn in {title}"),
+                        false,
+                        false,
+                    )
                 }
-                None => (format!("Turn completed in {title} at seq {seq}"), false),
+                None => (
+                    format!("Turn completed in {title} at seq {seq}"),
+                    false,
+                    true,
+                ),
             }
         };
         if reset_scroll {
             self.state.scroll_transcript_to_latest();
         }
         self.state.status = status;
+        if completed_current_turn {
+            self.state.set_run_state_success();
+        }
         self.submit_next_pending_if_idle()
     }
 
@@ -571,17 +599,28 @@ impl Store {
             return None;
         };
         let title = session.title.clone();
-        let status = match session.live_reply.take() {
-            Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                format!("Turn error {}: {}", event.code, event.message)
-            }
+        let (status, failed_current_turn) = match session.live_reply.take() {
+            Some(live_reply) if live_reply.turn_id == event.turn_id => (
+                format!("Turn error {}: {}", event.code, event.message),
+                true,
+            ),
             Some(live_reply) => {
                 session.live_reply = Some(live_reply);
-                format!("Ignored stale turn error in {title}: {}", event.code)
+                (
+                    format!("Ignored stale turn error in {title}: {}", event.code),
+                    false,
+                )
             }
-            None => format!("Turn error {}: {}", event.code, event.message),
+            None => (
+                format!("Turn error {}: {}", event.code, event.message),
+                true,
+            ),
         };
         self.state.status = status;
+        if failed_current_turn {
+            self.state
+                .set_run_state_error(format!("{}: {}", event.code, event.message));
+        }
         self.submit_next_pending_if_idle()
     }
 
@@ -893,6 +932,7 @@ mod tests {
 
         assert_eq!(store.state.sessions[0].messages.len(), 1);
         assert!(store.state.sessions[0].live_reply.is_none());
+        assert_eq!(store.state.run_state.label(), "done");
     }
 
     #[test]
@@ -916,6 +956,7 @@ mod tests {
             .expect("live reply remains active");
         assert_eq!(live_reply.turn_id, live_turn_id);
         assert_eq!(live_reply.text, "do not commit");
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     #[test]
@@ -982,6 +1023,7 @@ mod tests {
                 .status
                 .contains("Message staged; it will submit after the active turn")
         );
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     #[test]
@@ -1014,6 +1056,7 @@ mod tests {
         assert!(store.state.pending_messages.is_empty());
         assert_eq!(store.state.sessions[0].messages.len(), 2);
         assert_eq!(store.state.sessions[0].messages[1].content, "continue now");
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     fn open_generic_approval(store: &mut Store) -> (SessionKey, ApprovalId) {
@@ -1043,6 +1086,7 @@ mod tests {
         assert!(approval.visible);
         assert_eq!(approval.title, "Run command");
         assert_eq!(approval.body, "cargo test");
+        assert_eq!(store.state.run_state.label(), "blocked");
 
         let command = store
             .respond_approval_command(ApprovalModalAction::ApproveRequest)
@@ -1063,6 +1107,7 @@ mod tests {
             store.state.status,
             "Approval approved for this request: Run command"
         );
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     #[test]
@@ -1150,6 +1195,7 @@ mod tests {
             store.state.status,
             "Opening inline diff preview: Approve diff"
         );
+        assert_eq!(store.state.run_state.label(), "blocked");
         assert!(store.state.diff_preview.active);
         assert!(store.state.diff_preview.loading);
         assert!(
@@ -1207,6 +1253,7 @@ mod tests {
         assert_eq!(activity.success, Some(true));
         assert_eq!(activity.duration_ms, Some(1250));
         assert_eq!(activity.tool_call_id.as_deref(), Some("call-1"));
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     #[test]
@@ -1250,6 +1297,7 @@ mod tests {
                 && activity.title == "Recovery suggestion"
                 && activity.status.contains("npm registry DNS failed")
         }));
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     #[test]
@@ -1440,6 +1488,11 @@ mod tests {
             store.state.status,
             "Turn error interrupted: turn interrupted by client"
         );
+        assert_eq!(store.state.run_state.label(), "error");
+        assert_eq!(
+            store.state.run_state.detail(),
+            Some("interrupted: turn interrupted by client")
+        );
     }
 
     #[test]
@@ -1532,6 +1585,7 @@ mod tests {
             .expect("live reply remains active");
         assert_eq!(live_reply.turn_id, live_turn_id);
         assert_eq!(live_reply.text, "still streaming");
+        assert_eq!(store.state.run_state.label(), "running");
     }
 
     #[test]

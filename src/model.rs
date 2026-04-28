@@ -37,6 +37,40 @@ impl FocusPane {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionRunState {
+    Idle,
+    InProgress,
+    Blocked { message: String },
+    Success,
+    Error { message: String },
+}
+
+impl SessionRunState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::InProgress => "running",
+            Self::Blocked { .. } => "blocked",
+            Self::Success => "done",
+            Self::Error { .. } => "error",
+        }
+    }
+
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Blocked { message } | Self::Error { message } => Some(message.as_str()),
+            Self::Idle | Self::InProgress | Self::Success => None,
+        }
+    }
+}
+
+impl Default for SessionRunState {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub sessions: Vec<SessionView>,
@@ -53,6 +87,7 @@ pub struct AppState {
     pub target: Option<String>,
     pub readonly: bool,
     pub protocol_version: &'static str,
+    pub run_state: SessionRunState,
     pub approval: Option<ApprovalModalState>,
     pub task_output: TaskOutputDetailState,
     pub task_output_cursors: Vec<TaskOutputCursor>,
@@ -824,6 +859,7 @@ impl AppState {
         } else {
             selected_session.min(sessions.len() - 1)
         };
+        let run_state = initial_run_state(&sessions, selected_session);
 
         Self {
             sessions,
@@ -840,6 +876,7 @@ impl AppState {
             target,
             readonly,
             protocol_version: APP_UI_API_V1,
+            run_state,
             approval: None,
             task_output: TaskOutputDetailState::default(),
             task_output_cursors: Vec::new(),
@@ -966,6 +1003,7 @@ impl AppState {
         self.selected_session = (self.selected_session + 1) % self.sessions.len();
         self.selected_task = 0;
         self.transcript_scroll = 0;
+        self.refresh_run_state_from_selection();
     }
 
     pub fn select_prev_session(&mut self) {
@@ -979,6 +1017,7 @@ impl AppState {
         }
         self.selected_task = 0;
         self.transcript_scroll = 0;
+        self.refresh_run_state_from_selection();
     }
 
     pub fn select_next_task(&mut self) {
@@ -1112,6 +1151,46 @@ impl AppState {
                 item.duration_ms = duration_ms;
             }
         }
+    }
+
+    pub fn set_run_state_idle(&mut self) {
+        self.run_state = SessionRunState::Idle;
+    }
+
+    pub fn set_run_state_in_progress(&mut self) {
+        self.run_state = SessionRunState::InProgress;
+    }
+
+    pub fn set_run_state_blocked(&mut self, message: impl Into<String>) {
+        self.run_state = SessionRunState::Blocked {
+            message: message.into(),
+        };
+    }
+
+    pub fn set_run_state_success(&mut self) {
+        self.run_state = SessionRunState::Success;
+    }
+
+    pub fn set_run_state_error(&mut self, message: impl Into<String>) {
+        self.run_state = SessionRunState::Error {
+            message: message.into(),
+        };
+    }
+
+    pub fn refresh_run_state_from_selection(&mut self) {
+        self.run_state = initial_run_state(&self.sessions, self.selected_session);
+    }
+}
+
+fn initial_run_state(sessions: &[SessionView], selected_session: usize) -> SessionRunState {
+    if sessions
+        .get(selected_session)
+        .and_then(|session| session.live_reply.as_ref())
+        .is_some()
+    {
+        SessionRunState::InProgress
+    } else {
+        SessionRunState::Idle
     }
 }
 
