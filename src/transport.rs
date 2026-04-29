@@ -10,7 +10,6 @@ use octos_core::app_ui::{
     AppUiCommand, AppUiError, AppUiEvent, AppUiLaunch, AppUiSession, AppUiSnapshot, AppUiStatus,
     AppUiTask,
 };
-use octos_core::ui_protocol::UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1;
 use octos_core::ui_protocol::{
     ApprovalCommandDetails, ApprovalDiffDetails, ApprovalFilesystemDetails, ApprovalNetworkDetails,
     ApprovalRequestedEvent, ApprovalSandboxDetails, ApprovalSandboxEscalationDetails,
@@ -21,7 +20,9 @@ use octos_core::ui_protocol::{
     approval_kinds, methods,
 };
 use octos_core::ui_protocol::{
-    JSON_RPC_VERSION, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1, UI_PROTOCOL_V1,
+    JSON_RPC_VERSION, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::de::DeserializeOwned;
@@ -63,9 +64,17 @@ fn launch_from_cli(cli: &Cli) -> AppUiLaunch {
         base_url: cli.base_url.clone(),
         session_id: cli.session.clone().map(SessionKey),
         profile_id: cli.profile_id.clone(),
+        cwd: launch_cwd_from_cli(cli),
         auth_token: auth_token_from_cli(cli),
         readonly: cli.readonly,
     }
+}
+
+fn launch_cwd_from_cli(cli: &Cli) -> Option<String> {
+    cli.cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 fn auth_token_from_cli(cli: &Cli) -> Option<String> {
@@ -402,6 +411,7 @@ impl AppUiBackend for ProtocolAppUiBackend {
                 octos_core::ui_protocol::SessionOpenParams {
                     session_id,
                     profile_id: self.launch.profile_id.clone(),
+                    cwd: self.launch.cwd.clone(),
                     after: None,
                 },
             ))?;
@@ -546,9 +556,11 @@ fn websocket_request(endpoint: &str, auth_token: Option<&str>) -> Result<WsReque
     }
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
-        format!("{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}")
-            .parse()
-            .wrap_err("failed to build UI protocol feature header")?,
+        format!(
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
+        )
+        .parse()
+        .wrap_err("failed to build UI protocol feature header")?,
     );
 
     Ok(request)
@@ -1193,6 +1205,7 @@ impl AppUiBackend for MockAppUiBackend {
         self.enqueue_protocol(UiNotification::SessionOpened(SessionOpened {
             session_id: coding_session.id.clone(),
             active_profile_id: coding_session.profile_id.clone(),
+            workspace_root: self.launch.cwd.clone(),
             cursor: Some(UiCursor {
                 stream: "session_events".into(),
                 seq: 0,
@@ -1232,6 +1245,7 @@ impl AppUiBackend for MockAppUiBackend {
                 self.enqueue_protocol(UiNotification::SessionOpened(SessionOpened {
                     session_id: params.session_id,
                     active_profile_id: params.profile_id,
+                    workspace_root: params.cwd,
                     cursor: params.after,
                     panes: None,
                 }));
@@ -1579,7 +1593,7 @@ mod tests {
         let request = websocket_request("wss://example.test/ui-protocol", Some(" secret-token "))
             .expect("request builds");
         let expected_features = format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}"
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
         );
 
         assert_eq!(
@@ -1926,6 +1940,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: SessionKey("local:test".into()),
                 profile_id: Some("coding".into()),
+                cwd: None,
                 after: None,
             }))
             .expect("request builds");
@@ -1954,6 +1969,51 @@ mod tests {
         assert!(error.message.contains(&request.id));
         assert!(error.message.contains("missing session"));
         assert!(backend.pending_requests.is_empty());
+    }
+
+    #[test]
+    fn launch_from_cli_defaults_cwd_to_process_current_dir() {
+        let cli = Cli {
+            mode: crate::cli::Mode::Protocol,
+            base_url: Some("wss://example.test/ui-protocol".into()),
+            session: Some("local:test".into()),
+            profile_id: Some("coding".into()),
+            cwd: None,
+            auth_token: None,
+            readonly: false,
+            theme: crate::cli::ThemeName::Codex,
+        };
+
+        let launch = launch_from_cli(&cli);
+
+        assert_eq!(
+            launch.cwd,
+            Some(
+                std::env::current_dir()
+                    .expect("current dir")
+                    .to_string_lossy()
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn protocol_session_open_request_includes_cwd() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch {
+            base_url: Some("wss://example.test/ui-protocol".into()),
+            cwd: Some("/tmp/project".into()),
+            ..AppUiLaunch::default()
+        });
+        let request = backend
+            .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
+                session_id: SessionKey("local:test".into()),
+                profile_id: Some("coding".into()),
+                cwd: Some("/tmp/project".into()),
+                after: None,
+            }))
+            .expect("request builds");
+
+        assert_eq!(request.params["cwd"], json!("/tmp/project"));
     }
 
     #[test]
@@ -2017,6 +2077,7 @@ mod tests {
             .build_tracked_request(AppUiCommand::OpenSession(SessionOpenParams {
                 session_id: session_id.clone(),
                 profile_id: Some("coding".into()),
+                cwd: None,
                 after: None,
             }))
             .expect("request builds");

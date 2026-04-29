@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Mode {
@@ -40,6 +41,10 @@ pub struct Cli {
     /// Profile id to use for the session.
     #[arg(long = "profile-id", alias = "profile")]
     pub profile_id: Option<String>,
+
+    /// Workspace cwd to request for this AppUi session. Defaults to the launch directory.
+    #[arg(long = "cwd", value_name = "DIR")]
+    pub cwd: Option<PathBuf>,
 
     /// Bearer token for UI Protocol authentication. Falls back to OCTOS_AUTH_TOKEN.
     #[arg(long = "auth-token", value_name = "TOKEN")]
@@ -90,6 +95,8 @@ mod tests {
             "session-123",
             "--profile-id",
             "coding",
+            "--cwd",
+            "/tmp/project",
             "--auth-token",
             "secret-token",
             "--readonly",
@@ -103,6 +110,10 @@ mod tests {
         );
         assert_eq!(cli.session.as_deref(), Some("session-123"));
         assert_eq!(cli.profile_id.as_deref(), Some("coding"));
+        assert_eq!(
+            cli.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/project"))
+        );
         assert_eq!(cli.auth_token.as_deref(), Some("secret-token"));
         assert!(cli.readonly);
     }

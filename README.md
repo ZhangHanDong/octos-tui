@@ -92,7 +92,7 @@ Important server settings:
 
 | Setting | Purpose |
 |---|---|
-| `--cwd` | Workspace the coding agent can read/edit. This is the TUI session cwd. |
+| `--cwd` | Server-approved filesystem root for coding tools. TUI sessions can request this directory or an approved subdirectory as their session cwd. |
 | `--data-dir` | Runtime state, sessions, auth, logs, and config. |
 | `--provider` | LLM provider override. Example: `deepseek`. |
 | `--model` | Model override. Example: `deepseek-v4-pro`. |
@@ -115,8 +115,13 @@ CARGO_TARGET_DIR=/tmp/octos-tui-target cargo run -- \
   --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws \
   --session coding:local:readme-demo \
   --profile-id coding \
+  --cwd "$PWD/../octos/e2e/fixtures/coding-agent-compare-multifile" \
   --theme codex
 ```
+
+If `--cwd` is omitted, `octos-tui` requests the directory it was launched from,
+matching Codex-style project selection. The server still decides whether that
+cwd is approved.
 
 You can also pass the token explicitly:
 
@@ -197,15 +202,30 @@ Start-ScheduledTask -TaskName OctosServe
 
 ## Cwd Behavior
 
-The coding cwd belongs to `octos serve`, not the terminal where `octos-tui` is
-launched. To test a project, start the server with that project as `--cwd`:
+`octos-tui` requests a session cwd through `session/open`. By default that cwd
+is the terminal launch directory; `--cwd DIR` overrides it. `octos serve`
+canonicalizes the requested directory and accepts it only if it is inside the
+server-approved filesystem roots.
+
+For local development, start the server at the broad workspace root and launch
+the TUI from the project directory:
 
 ```bash
-octos serve --cwd /path/to/project ...
+cd /path/to/workspace-root
+octos serve --cwd "$PWD" ...
+
+cd /path/to/workspace-root/my-project
+octos-tui --mode protocol --endpoint ws://127.0.0.1:50080/api/ui-protocol/ws ...
 ```
 
-Launching `octos-tui` from another directory does not change the backend
-workspace.
+For remote servers, pass a cwd that exists on the server host:
+
+```bash
+octos-tui --cwd /Users/cloud/work/my-project --mode protocol ...
+```
+
+If the requested cwd is outside the approved roots, `session/open` fails with a
+typed protocol error instead of silently running tools in the wrong directory.
 
 ## Tmux AppUi Smoke Tests
 
