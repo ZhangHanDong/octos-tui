@@ -17,8 +17,8 @@ use octos_core::ui_protocol::{
     MessageDeltaEvent, OutputCursor, PreviewId, SessionOpenResult, SessionOpened,
     TaskOutputDeltaEvent, TaskOutputReadResult, TaskRuntimeState, TaskUpdatedEvent,
     ToolCompletedEvent, ToolProgressEvent, ToolStartedEvent, TurnCompletedEvent, TurnId,
-    TurnStartedEvent, UiCursor, UiNotification, WarningEvent, approval_kinds, methods,
-    rpc_error_codes,
+    TurnStartedEvent, UiCursor, UiNotification, UiPaneSnapshot, WarningEvent, approval_kinds,
+    methods, rpc_error_codes,
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
@@ -354,6 +354,7 @@ impl ProtocolAppUiBackend {
         }
     }
 
+    #[allow(unreachable_patterns)]
     fn enqueue_readonly_response(&mut self, command: AppUiCommand) {
         let method = command.method().to_string();
         match command {
@@ -389,6 +390,17 @@ impl ProtocolAppUiBackend {
                         code: "readonly".into(),
                         message: format!(
                             "Read-only mode blocks {method}; no network request was sent."
+                        ),
+                    })
+                    .into(),
+                );
+            }
+            _ => {
+                self.queue.push_back(
+                    AppUiEvent::Error(AppUiError {
+                        code: "readonly".into(),
+                        message: format!(
+                            "Read-only mode blocks unsupported {method}; no network request was sent."
                         ),
                     })
                     .into(),
@@ -601,6 +613,7 @@ fn protocol_snapshot_from_launch(launch: &AppUiLaunch, endpoint: &str) -> AppUiS
     }
 }
 
+#[allow(unreachable_patterns)]
 fn rpc_request_from_command(
     id: String,
     command: AppUiCommand,
@@ -614,6 +627,11 @@ fn rpc_request_from_command(
         AppUiCommand::ListApprovalScopes(params) => serde_json::to_value(params),
         AppUiCommand::GetDiffPreview(params) => serde_json::to_value(params),
         AppUiCommand::ReadTaskOutput(params) => serde_json::to_value(params),
+        _ => {
+            return Err(eyre!(
+                "unsupported AppUI command for first-server transport: {method}"
+            ));
+        }
     }
     .wrap_err_with(|| format!("failed to encode params for {method}"))?;
 
@@ -809,7 +827,7 @@ fn success_response_to_app_event(
                 .into(),
             )),
         },
-        methods::TASK_OUTPUT_READ => match serde_json::from_value::<TaskOutputReadResult>(result) {
+        methods::TASK_OUTPUT_READ => match decode_task_output_read_result(result) {
             Ok(result) => {
                 let text = task_output_display_text(&result);
                 Ok(Some(
@@ -867,6 +885,15 @@ fn success_response_to_app_event(
         }
         _ => Ok(None),
     }
+}
+
+fn decode_task_output_read_result(mut result: Value) -> serde_json::Result<TaskOutputReadResult> {
+    if let Some(object) = result.as_object_mut() {
+        object
+            .entry("is_snapshot_projection")
+            .or_insert(Value::Bool(false));
+    }
+    serde_json::from_value(result)
 }
 
 fn approval_scopes_status(result: &ApprovalScopesListResult) -> String {
@@ -1035,6 +1062,23 @@ fn is_websocket_url(value: &str) -> bool {
         || value
             .get(..6)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("wss://"))
+}
+
+fn session_opened_compat(
+    session_id: SessionKey,
+    active_profile_id: Option<String>,
+    workspace_root: Option<String>,
+    cursor: Option<UiCursor>,
+    panes: Option<UiPaneSnapshot>,
+) -> SessionOpened {
+    serde_json::from_value(serde_json::json!({
+        "session_id": session_id,
+        "active_profile_id": active_profile_id,
+        "workspace_root": workspace_root,
+        "cursor": cursor,
+        "panes": panes,
+    }))
+    .expect("mock session/opened payload must match octos-core")
 }
 
 #[derive(Default)]
@@ -1214,16 +1258,16 @@ impl AppUiBackend for MockAppUiBackend {
             live_reply: None,
         };
 
-        self.enqueue_protocol(UiNotification::SessionOpened(SessionOpened {
-            session_id: coding_session.id.clone(),
-            active_profile_id: coding_session.profile_id.clone(),
-            workspace_root: self.launch.cwd.clone(),
-            cursor: Some(UiCursor {
+        self.enqueue_protocol(UiNotification::SessionOpened(session_opened_compat(
+            coding_session.id.clone(),
+            coding_session.profile_id.clone(),
+            self.launch.cwd.clone(),
+            Some(UiCursor {
                 stream: "session_events".into(),
                 seq: 0,
             }),
-            panes: None,
-        }));
+            None,
+        )));
 
         Ok(AppUiSnapshot {
             sessions: vec![coding_session, review_session],
@@ -1238,7 +1282,9 @@ impl AppUiBackend for MockAppUiBackend {
         })
     }
 
+    #[allow(unreachable_patterns)]
     fn send(&mut self, command: AppUiCommand) -> Result<()> {
+        let method = command.method().to_string();
         match command {
             AppUiCommand::SubmitPrompt(params) => {
                 if self.launch.readonly {
@@ -1254,13 +1300,13 @@ impl AppUiBackend for MockAppUiBackend {
                 Ok(())
             }
             AppUiCommand::OpenSession(params) => {
-                self.enqueue_protocol(UiNotification::SessionOpened(SessionOpened {
-                    session_id: params.session_id,
-                    active_profile_id: params.profile_id,
-                    workspace_root: params.cwd,
-                    cursor: params.after,
-                    panes: None,
-                }));
+                self.enqueue_protocol(UiNotification::SessionOpened(session_opened_compat(
+                    params.session_id,
+                    params.profile_id,
+                    params.cwd,
+                    params.after,
+                    None,
+                )));
                 Ok(())
             }
             AppUiCommand::InterruptTurn(_) => {
@@ -1301,6 +1347,9 @@ impl AppUiBackend for MockAppUiBackend {
             }
             AppUiCommand::ReadTaskOutput(_) => Err(eyre!(
                 "mock app-ui backend does not implement task output reads yet"
+            )),
+            _ => Err(eyre!(
+                "mock app-ui backend does not implement unsupported command {method} yet"
             )),
         }
     }
@@ -1869,11 +1918,9 @@ mod tests {
         });
         let session_id = SessionKey("local:test".into());
         let request = backend
-            .build_tracked_request(AppUiCommand::ListApprovalScopes(
-                ApprovalScopesListParams {
-                    session_id: session_id.clone(),
-                },
-            ))
+            .build_tracked_request(AppUiCommand::ListApprovalScopes(ApprovalScopesListParams {
+                session_id: session_id.clone(),
+            }))
             .expect("request builds");
 
         let frame = json!({
