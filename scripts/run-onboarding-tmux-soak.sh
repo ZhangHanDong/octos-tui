@@ -42,7 +42,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|restart-server|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|drive-approval-denial|drive-task-subagent-tree|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -546,6 +546,36 @@ Manual checkpoints:
 EOF
 }
 
+restart_server() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for restart-server"
+  require_bin OCTOS_BIN "$octos_bin"
+  if [ "$transport" != "ws" ]; then
+    die "restart-server is only supported for WebSocket transport"
+  fi
+
+  mkdir -p "$workspace" "$data_dir" "$logs_dir" "$artifact_dir"
+  if [ -f "$logs_dir/server.log" ]; then
+    cp "$logs_dir/server.log" "$artifact_dir/server-before-restart.log"
+  fi
+  tmux kill-session -t "$server_session" 2>/dev/null || true
+  sleep "${OCTOS_TUI_SOAK_SERVER_RESTART_DOWN_SECS:-1}"
+  : > "$logs_dir/server.log"
+
+  local env_prefix
+  env_prefix="$(runtime_env_prefix)"
+  local server_cmd
+  server_cmd="cd $(shell_quote "$workspace") && ${env_prefix}$(shell_quote "$octos_bin") serve --host $(shell_quote "$host") --port $(shell_quote "$port") --data-dir $(shell_quote "$data_dir") --auth-token $(shell_quote "$auth_token")"
+  if [ -n "$serve_args" ]; then
+    server_cmd="$server_cmd $serve_args"
+  fi
+  server_cmd="$server_cmd 2>&1 | tee $(shell_quote "$logs_dir/server.log")"
+  tmux new-session -d -s "$server_session" "$server_cmd"
+  wait_for_server_ready "${OCTOS_TUI_SOAK_SERVER_WAIT_SECS:-20}"
+  capture_pane "$server_session" "$artifact_dir/server-pane-after-restart.txt"
+  capture
+  echo "Restarted backend tmux server for $tui_session"
+}
+
 capture() {
   mkdir -p "$artifact_dir"
   write_summary
@@ -991,6 +1021,7 @@ stop() {
 
 case "${1:-help}" in
   start) start ;;
+  restart-server) restart_server ;;
   drive-onboard) drive_onboard ;;
   drive-solo) drive_solo ;;
   drive-permissions) drive_permissions ;;
