@@ -42,7 +42,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -753,6 +753,29 @@ drive_solo() {
   echo "Drove M12 solo no-OTP AppUI probe in $artifact_dir"
 }
 
+drive_permissions() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-permissions"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  wait_for_tui_text "Ask Octos to change code" "${OCTOS_TUI_SOAK_TUI_READY_WAIT_SECS:-20}" || \
+    die "Timed out waiting for TUI composer before opening permissions"
+  send_tui_line "/permissions"
+  wait_for_tui_text "Update Model Permissions" "${OCTOS_TUI_SOAK_PERMISSIONS_WAIT_SECS:-20}" || \
+    die "Timed out waiting for /permissions menu"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-permissions-open.txt"
+
+  tmux send-keys -t "$tui_session" j
+  tmux send-keys -t "$tui_session" j
+  tmux send-keys -t "$tui_session" j
+  tmux send-keys -t "$tui_session" Enter
+  sleep "${OCTOS_TUI_SOAK_PERMISSIONS_APPLY_WAIT_SECS:-2}"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-permissions-applied.txt"
+  capture
+  echo "Drove /permissions selection in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -894,6 +917,7 @@ case "${1:-help}" in
   start) start ;;
   drive-onboard) drive_onboard ;;
   drive-solo) drive_solo ;;
+  drive-permissions) drive_permissions ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
