@@ -42,7 +42,7 @@ endpoint="ws://$host:$port/api/ui-protocol/ws"
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
+Usage: scripts/run-onboarding-tmux-soak.sh <start|drive-onboard|drive-solo|drive-permissions|drive-provider-missing|capture|send-turn|verify|verify-solo|api-parity|self-test|solo-self-test|stop|help>
 
 Environment:
   OCTOS_REPO                     Path to sibling octos checkout.
@@ -776,6 +776,19 @@ drive_permissions() {
   echo "Drove /permissions selection in $tui_session"
 }
 
+drive_provider_missing() {
+  command -v tmux >/dev/null 2>&1 || die "tmux is required for drive-provider-missing"
+  if ! tmux has-session -t "$tui_session" 2>/dev/null; then
+    die "TUI tmux session is not running: $tui_session"
+  fi
+
+  wait_for_tui_text "Set Up LLM Provider" "${OCTOS_TUI_SOAK_PROVIDER_WAIT_SECS:-20}" || \
+    die "Timed out waiting for missing-provider setup menu"
+  capture_pane "$tui_session" "$artifact_dir/tui-capture-provider-missing.txt"
+  capture
+  echo "Drove missing-provider recovery capture in $tui_session"
+}
+
 verify_solo() {
   capture
   local required=(
@@ -918,6 +931,7 @@ case "${1:-help}" in
   drive-onboard) drive_onboard ;;
   drive-solo) drive_solo ;;
   drive-permissions) drive_permissions ;;
+  drive-provider-missing) drive_provider_missing ;;
   capture) capture ;;
   send-turn) send_turn ;;
   verify) verify ;;
