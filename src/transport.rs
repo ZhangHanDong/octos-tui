@@ -19,6 +19,8 @@ use octos_core::ui_protocol::{
 };
 use octos_core::ui_protocol::{
     JSON_RPC_VERSION, MAX_TEXT_FRAME_BYTES, RpcRequest, UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1,
+    UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
+    UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
     UI_PROTOCOL_V1,
 };
@@ -42,13 +44,14 @@ use crate::{
     cli::{Cli, Mode},
     client_event::{
         AuthLogoutClientEvent, AuthMeClientEvent, AuthSendCodeClientEvent, AuthStatusClientEvent,
-        AuthVerifyClientEvent, CapabilitiesClientEvent, ClientEvent, McpConfigListClientEvent,
-        McpConfigMutationClientEvent, McpStatusClientEvent, ModelListClientEvent,
-        ModelSelectClientEvent, PermissionProfileClientEvent, ProfileLlmCatalogClientEvent,
-        ProfileLlmListClientEvent, ProfileLlmMutationClientEvent, ProfileLocalCreateClientEvent,
-        ProfileSkillsListClientEvent, ProfileSkillsMutationClientEvent,
-        ProfileSkillsRegistrySearchClientEvent, SessionStatusClientEvent,
-        ToolConfigListClientEvent, ToolConfigMutationClientEvent, ToolStatusClientEvent,
+        AuthVerifyClientEvent, AutonomyClientEvent, AutonomyResult, CapabilitiesClientEvent,
+        ClientEvent, McpConfigListClientEvent, McpConfigMutationClientEvent, McpStatusClientEvent,
+        ModelListClientEvent, ModelSelectClientEvent, PermissionProfileClientEvent,
+        ProfileLlmCatalogClientEvent, ProfileLlmListClientEvent, ProfileLlmMutationClientEvent,
+        ProfileLocalCreateClientEvent, ProfileSkillsListClientEvent,
+        ProfileSkillsMutationClientEvent, ProfileSkillsRegistrySearchClientEvent,
+        SessionStatusClientEvent, ToolConfigListClientEvent, ToolConfigMutationClientEvent,
+        ToolStatusClientEvent,
     },
     model::{
         AppUiAuthToken, AppUiCommand, AuthLogoutResult, AuthMeResult, AuthSendCodeResult,
@@ -1005,6 +1008,15 @@ impl ProtocolAppUiBackend {
                 | AppUiCommand::ProfileLlmFetchModels(_)
                 | AppUiCommand::ProfileSkillsList(_)
                 | AppUiCommand::ProfileSkillsRegistrySearch(_)
+                // M15-E read-only autonomy inspection. Reconnect
+                // hydration depends on these, and `--readonly` users
+                // still want to see backend agent/goal/loop state.
+                | AppUiCommand::ListAgents(_)
+                | AppUiCommand::ReadAgentStatus(_)
+                | AppUiCommand::ReadAgentOutput(_)
+                | AppUiCommand::ListAgentArtifacts(_)
+                | AppUiCommand::GetSessionGoal(_)
+                | AppUiCommand::ListLoops(_)
         )
     }
 
@@ -1352,7 +1364,7 @@ fn websocket_request(
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
         format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}"
         )
         .parse()
         .wrap_err("failed to build UI protocol feature header")?,
@@ -1512,6 +1524,21 @@ fn rpc_request_from_command(
         AppUiCommand::ProfileSkillsRegistrySearch(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSkillsInstall(params) => serde_json::to_value(params),
         AppUiCommand::ProfileSkillsRemove(params) => serde_json::to_value(params),
+        AppUiCommand::ListAgents(params) => serde_json::to_value(params),
+        AppUiCommand::ReadAgentStatus(params) => serde_json::to_value(params),
+        AppUiCommand::ReadAgentOutput(params) => serde_json::to_value(params),
+        AppUiCommand::ListAgentArtifacts(params) => serde_json::to_value(params),
+        AppUiCommand::InterruptAgent(params) => serde_json::to_value(params),
+        AppUiCommand::CloseAgent(params) => serde_json::to_value(params),
+        AppUiCommand::GetSessionGoal(params) => serde_json::to_value(params),
+        AppUiCommand::SetSessionGoal(params) => serde_json::to_value(params),
+        AppUiCommand::ClearSessionGoal(params) => serde_json::to_value(params),
+        AppUiCommand::CreateLoop(params) => serde_json::to_value(params),
+        AppUiCommand::ListLoops(params) => serde_json::to_value(params),
+        AppUiCommand::DeleteLoop(params)
+        | AppUiCommand::PauseLoop(params)
+        | AppUiCommand::ResumeLoop(params)
+        | AppUiCommand::FireLoopNow(params) => serde_json::to_value(params),
         _ => {
             return Err(eyre!(
                 "unsupported AppUI command for first-server transport: {method}"
@@ -2123,8 +2150,137 @@ fn success_response_to_app_event(
                 )),
             }
         }
+        // M15-E autonomy results. We decode and forward as
+        // ClientEvent::Autonomy so the store can update the per-session
+        // mirror.
+        crate::model::APPUI_METHOD_AGENT_LIST => {
+            match serde_json::from_value::<crate::model::AgentListResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentList(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_LIST,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_AGENT_STATUS_READ => {
+            match serde_json::from_value::<crate::model::AgentStatusReadResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentStatus(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_STATUS_READ,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_AGENT_OUTPUT_READ => {
+            match serde_json::from_value::<crate::model::AgentOutputReadResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentOutput(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_OUTPUT_READ,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST => {
+            match serde_json::from_value::<crate::model::AgentArtifactListResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentArtifacts(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_ARTIFACT_LIST,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_AGENT_INTERRUPT => {
+            match serde_json::from_value::<crate::model::AgentInterruptResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentInterrupt(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_INTERRUPT,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_AGENT_CLOSE => {
+            match serde_json::from_value::<crate::model::AgentCloseResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::AgentClose(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_AGENT_CLOSE,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_SESSION_GOAL_GET => {
+            match serde_json::from_value::<crate::model::SessionGoalGetResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::GoalGet(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_SESSION_GOAL_GET,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_SESSION_GOAL_SET => {
+            match serde_json::from_value::<crate::model::SessionGoalSetResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::GoalSet(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_SESSION_GOAL_SET,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR => {
+            match serde_json::from_value::<crate::model::SessionGoalClearResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::GoalClear(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_SESSION_GOAL_CLEAR,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_LOOP_CREATE => {
+            match serde_json::from_value::<crate::model::LoopCreateResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::LoopCreate(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_LOOP_CREATE,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_LOOP_LIST => {
+            match serde_json::from_value::<crate::model::LoopListResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::LoopList(result)))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    crate::model::APPUI_METHOD_LOOP_LIST,
+                    err,
+                ))),
+            }
+        }
+        crate::model::APPUI_METHOD_LOOP_DELETE
+        | crate::model::APPUI_METHOD_LOOP_PAUSE
+        | crate::model::APPUI_METHOD_LOOP_RESUME
+        | crate::model::APPUI_METHOD_LOOP_FIRE_NOW => {
+            match serde_json::from_value::<crate::model::LoopMutationResult>(result) {
+                Ok(result) => Ok(Some(autonomy_event(AutonomyResult::LoopMutation {
+                    method: pending_request.method.clone(),
+                    result,
+                }))),
+                Err(err) => Ok(Some(autonomy_decode_error(
+                    pending_request.method.as_str(),
+                    err,
+                ))),
+            }
+        }
         _ => Ok(None),
     }
+}
+
+fn autonomy_event(result: AutonomyResult) -> ClientEvent {
+    ClientEvent::Autonomy(AutonomyClientEvent { result })
+}
+
+fn autonomy_decode_error(method: &str, err: serde_json::Error) -> ClientEvent {
+    app_error(
+        "invalid_result",
+        format!("failed to decode UI protocol result for {method}: {err}"),
+    )
+    .into()
 }
 
 fn decode_task_output_read_result(mut result: Value) -> serde_json::Result<TaskOutputReadResult> {
@@ -4659,7 +4815,7 @@ mod tests {
         )
         .expect("request builds");
         let expected_features = format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}"
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}"
         );
 
         assert_eq!(
