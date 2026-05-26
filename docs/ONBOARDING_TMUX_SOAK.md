@@ -202,6 +202,25 @@ usable composer. It also checks the retained transcript/ledger evidence and
 fails if the TUI issued client-owned `task/spawn`, `task/send`, or `task/join`
 calls in the normal backend-supervised review flow.
 
+For the WebSocket reconnect/hydration leg, keep the same run id and run:
+
+```sh
+OCTOS_TUI_SOAK_TRANSPORT=ws \
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh drive-task-subagent-reconnect
+
+OCTOS_TUI_SOAK_TRANSPORT=ws \
+OCTOS_TUI_SOAK_RUN_ID=<same-run-id> \
+scripts/run-onboarding-tmux-soak.sh verify-task-subagent-reconnect
+```
+
+`drive-task-subagent-reconnect` restarts the backend tmux session, waits for
+the TUI to settle again, and saves
+`tui-capture-task-subagent-tree-reconnect.txt`. The verifier checks the restart
+capture, the post-reconnect composer/status line, and AppUI hydration method
+evidence such as `session/open`, `agent/list`, `session/goal/get`,
+`loop/list`, or `task/list`.
+
 ## M19 UX Run Bundle
 
 For M19 runner-owned artifacts, set `OCTOS_TUI_SOAK_ARTIFACT_DIR` to the
@@ -234,6 +253,8 @@ The solo lane writes these M12 artifacts into
   `tui-capture-task-subagent-tree-final.txt`, and
   `tui-capture-task-subagent-tree-summary.txt` when running
   `drive-task-subagent-tree`
+- `tui-capture-task-subagent-tree-reconnect.txt` when running
+  `drive-task-subagent-reconnect`
 - `server.log`
 - `appui-transcript.jsonl`
 - `runtime-policy-stamp.json`
