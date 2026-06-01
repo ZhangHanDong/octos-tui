@@ -281,8 +281,15 @@ const CODE_BLOCK_LINE_LIMIT: usize = 120;
 const COLLAPSED_TOOL_PREVIEW_LINES: usize = 1;
 const EXPANDED_TOOL_PREVIEW_LINES: usize = 24;
 
+/// An activity is "running" until it reaches a terminal state. The server
+/// reports several non-terminal task states beyond `running`/`queued` — e.g.
+/// `TaskRuntimeState::Active` (`"active"`) and `"delivering_outputs"` — so an
+/// explicit running-list silently miscounts those as inactive and flips the
+/// agent-task group title to "Agent task completed" while a sub-agent is still
+/// working. Classify by terminality instead, so any present (or future)
+/// non-terminal state counts as active.
 fn is_running_activity(item: &ActivityItem) -> bool {
-    matches!(item.status.as_str(), "running" | "queued") || item.status.ends_with('%')
+    !activity_is_completed(item) && !activity_is_failed(item) && !activity_is_cancelled(item)
 }
 
 fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
@@ -2017,6 +2024,10 @@ fn activity_is_completed(item: &ActivityItem) -> bool {
 
 fn activity_is_failed(item: &ActivityItem) -> bool {
     matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error")
+}
+
+fn activity_is_cancelled(item: &ActivityItem) -> bool {
+    matches!(item.status.as_str(), "cancelled" | "canceled")
 }
 
 fn push_inline_diff_preview(
@@ -5594,6 +5605,74 @@ mod tests {
         assert!(text.contains("... +9 more"));
         assert!(text.contains("12 completed"));
         assert!(!text.contains("src/file_1.rs"));
+    }
+
+    #[test]
+    fn active_and_delivering_sub_agents_count_as_running() {
+        // Regression: the server reports non-terminal task states beyond
+        // running/queued (TaskRuntimeState::Active -> "active",
+        // "delivering_outputs"). They must classify as running, else the
+        // agent-task group title flips to "Agent task completed" while a
+        // sub-agent is still working.
+        for status in ["active", "delivering_outputs", "running", "queued", "42%"] {
+            assert!(
+                is_running_activity(&ActivityItem::new(ActivityKind::Tool, "spawn", status)),
+                "status {status:?} should count as running"
+            );
+        }
+        for status in [
+            "completed",
+            "complete",
+            "done",
+            "success",
+            "failed",
+            "error",
+            "cancelled",
+        ] {
+            assert!(
+                !is_running_activity(&ActivityItem::new(ActivityKind::Tool, "spawn", status)),
+                "terminal status {status:?} should NOT count as running"
+            );
+        }
+
+        // ...and the group title reflects it.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do multi-agent work")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("do multi-agent work".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "active").with_turn(turn_id.clone()),
+                ActivityItem::new(ActivityKind::Tool, "deep_research", "delivering_outputs")
+                    .with_turn(turn_id),
+            ],
+        });
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Orchestrating..."),
+            "active/delivering sub-agents must keep the running title: {text:?}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "must NOT show completed while sub-agents are active/delivering"
+        );
     }
 
     #[test]
