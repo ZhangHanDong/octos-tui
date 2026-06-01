@@ -189,10 +189,11 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         searchable: true,
         search_placeholder: Some("Filter commands".into()),
         footer_hint: Some("Enter open/run | Esc close".into()),
-        preview: Some(MenuPreview::Text {
-            title: Some("Routing".into()),
-            body: "Exact slash commands are handled locally before prompt submission. Unknown slash commands are never sent to the model.".into(),
-        }),
+        // No right-hand preview: the static "Routing" blurb was internal plumbing
+        // info (not actionable) and, with the two-pane split, its text collided
+        // with the command column. Each command already carries its own inline
+        // description, so the list renders full-width instead.
+        preview: None,
         mode: MenuMode::SingleSelect,
     }
 }
@@ -4645,6 +4646,25 @@ mod tests {
             assert_eq!(spec.id, MenuId::from(id));
             assert!(!spec.title.is_empty());
         }
+    }
+
+    #[test]
+    fn slash_command_menu_has_no_routing_preview_pane() {
+        // Regression: the slash-command menu must NOT carry the static "Routing"
+        // preview — it was non-actionable internal info, and the two-pane split
+        // collided its text with the command column. Full-width list instead.
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: Some("terminal"),
+            selected_path: &[],
+        };
+        let spec = help_menu(&ctx);
+        assert!(
+            spec.preview.is_none(),
+            "slash-command menu should render full-width (no Routing preview pane)"
+        );
     }
 
     #[test]
