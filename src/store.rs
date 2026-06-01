@@ -6497,7 +6497,13 @@ fn is_low_value_progress_name(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
     matches!(
         normalized.as_str(),
-        "thinking"
+        // Persona spinner words (`progress/updated{kind:"status_word"}`,
+        // octos-core progress_kinds::STATUS_WORD) belong in the status line, not
+        // the activity log. The words themselves are dynamic (LLM-generated), so
+        // filter on the stable `kind`, never the word — otherwise the chip counts
+        // "Composing/Contemplating/…" as fake "active actions" with no real work.
+        "status_word"
+            | "thinking"
             | "response"
             | "stream_start"
             | "stream_end"
@@ -11106,6 +11112,26 @@ mod tests {
         )));
 
         assert_eq!(store.state.status, "Thinking");
+    }
+
+    #[test]
+    fn status_word_persona_spinner_updates_status_without_activity() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        // Persona spinner: kind="status_word", dynamic label (LLM-generated). It
+        // must update the status line but NOT pile up as counted activity actions
+        // (otherwise the agent-task chip shows "N active" with no real work).
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id,
+            Some(TurnId::new()),
+            UiProgressMetadata::new(progress_kinds::STATUS_WORD).with_message("Composing"),
+        )));
+
+        assert_eq!(store.state.status, "Composing");
+        assert!(
+            store.state.activity.is_empty(),
+            "status_word spinner must not be recorded as activity"
+        );
     }
 
     #[test]
