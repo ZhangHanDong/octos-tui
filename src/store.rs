@@ -4900,10 +4900,13 @@ impl Store {
                 self.state
                     .upsert_session_agent(&event.session_id, event.agent.clone());
                 self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Progress, title.clone(), status_label)
+                    ActivityItem::new(ActivityKind::Progress, title, status_label)
                         .with_detail(detail),
                 );
-                self.state.status = format!("Agent status refreshed: {title}");
+                // Don't churn the status bar with "Agent status refreshed: …" on
+                // every agent-status event — during a multi-agent turn that floods
+                // the bottom line. The activity item above already surfaces it; the
+                // status bar is reserved for low-frequency, meaningful state.
                 None
             }
             UiNotification::AgentOutputDelta(event) => {
@@ -5108,17 +5111,23 @@ impl Store {
                         session.messages.push(message);
                     }
                 }
-                self.state.status = format!("User message projected for {thread_id}");
+                // Envelope projection is internal bookkeeping — don't leak the
+                // thread_id into the status bar on every projected message (it
+                // churned "… projected for <thread_id>" at the bottom of the
+                // composer). The transcript already reflects the message.
                 None
             }
             Payload::AssistantDelta { text } => {
                 self.upsert_envelope_assistant_message(&session_id, &thread_id, text, false);
-                self.state.status = format!("Assistant delta projected for {thread_id}");
+                // Streaming deltas arrive many times per second; writing the
+                // status bar each time flooded the bottom line with "Assistant
+                // delta projected for <thread_id>". The streamed text is already
+                // visible in the transcript — leave the status line stable.
                 None
             }
             Payload::AssistantPersisted { text, .. } => {
                 self.upsert_envelope_assistant_message(&session_id, &thread_id, text, true);
-                self.state.status = format!("Assistant message persisted for {thread_id}");
+                // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
             Payload::ToolStart { tool_call_id, name } => {
@@ -10009,6 +10018,35 @@ mod tests {
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
         assert_eq!(messages[0].content, "hello world");
+    }
+
+    #[test]
+    fn envelope_assistant_delta_does_not_churn_status_bar() {
+        // mini5 soak UX: streaming deltas arrive many times/sec and used to
+        // overwrite the status bar with "Assistant delta projected for
+        // <thread_id>", churning the bottom-of-composer line. The projection is
+        // internal bookkeeping — it must NOT touch the status bar (the streamed
+        // text is already visible in the transcript).
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.status = "Working".into();
+
+        for seq in 1..=3 {
+            store.apply_event(AppUiEvent::Protocol(envelope_notification(
+                session_id.clone(),
+                seq,
+                Payload::AssistantDelta {
+                    text: "tok ".into(),
+                },
+            )));
+        }
+
+        assert_eq!(
+            store.state.status, "Working",
+            "assistant-delta projection must not overwrite the status bar"
+        );
+        // The delta still projects into the transcript — only the status churn is gone.
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
     }
 
     #[test]
