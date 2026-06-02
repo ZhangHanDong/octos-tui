@@ -2123,6 +2123,12 @@ fn push_inline_diff_preview(
     palette: Palette,
     diff: &DiffPreviewPaneState,
 ) {
+    // C6: when there is no usable line diff ("line diff unavailable for this
+    // mutation"), hide the box entirely instead of rendering an empty preview
+    // with a dead "[/] select hunk | c stage" UI. Loading/error stay visible.
+    if !diff.has_renderable_diff() {
+        return;
+    }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -4405,7 +4411,15 @@ mod tests {
                     path: "styles.css".into(),
                     old_path: None,
                     status: "modified".into(),
-                    hunks: Vec::new(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![DiffPreviewLine {
+                            kind: "added".into(),
+                            content: "body {}".into(),
+                            old_line: None,
+                            new_line: Some(1),
+                        }],
+                    }],
                 }],
             },
         });
@@ -4490,7 +4504,15 @@ mod tests {
                     path: "src/styles.css".into(),
                     old_path: None,
                     status: "modified".into(),
-                    hunks: Vec::new(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![DiffPreviewLine {
+                            kind: "added".into(),
+                            content: "body {}".into(),
+                            old_line: None,
+                            new_line: Some(1),
+                        }],
+                    }],
                 }],
             },
         });
@@ -6779,6 +6801,40 @@ mod tests {
         assert!(text.contains("@@ -1 +1 @@"));
         assert!(text.contains("todo!()"));
         assert!(text.contains("Ok(42)"));
+    }
+
+    #[test]
+    fn diff_box_hidden_when_no_usable_hunks() {
+        // C6 (mini5 soak): an auto-opened preview whose file carries no hunks
+        // ("line diff unavailable for this mutation") must hide the whole box —
+        // no "Diff Preview" header, no dead "[/] select hunk | c stage" UI.
+        let app = app_with_diff(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Empty mutation".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/empty.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![],
+                }],
+            },
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(
+            !text.contains("Diff Preview"),
+            "diff box must be hidden when no usable hunks: {text:?}"
+        );
+        assert!(
+            !text.contains("select hunk"),
+            "dead hunk-select UI must not render: {text:?}"
+        );
+        assert!(!text.contains("line diff unavailable"));
     }
 
     #[test]

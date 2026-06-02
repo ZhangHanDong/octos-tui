@@ -3850,6 +3850,20 @@ impl DiffPreviewPaneState {
         self.clamp_selection();
     }
 
+    /// Whether the inline diff box has anything worth rendering. A preview whose
+    /// files carry no hunks ("line diff unavailable for this mutation") is not a
+    /// usable diff — the box should be hidden rather than shown empty with a dead
+    /// "[/] select hunk | c stage" UI (mini5 soak C6). Loading and error states
+    /// stay visible: loading is a transient "fetching…", error is actionable.
+    pub fn has_renderable_diff(&self) -> bool {
+        if self.loading || self.error.is_some() {
+            return true;
+        }
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| preview.files.iter().any(|file| !file.hunks.is_empty()))
+    }
+
     pub fn close(&mut self) {
         *self = Self::default();
     }
