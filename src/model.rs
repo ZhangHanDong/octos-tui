@@ -5,10 +5,11 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
-    SessionHydrateParams, TaskArtifactReadParams, TaskCancelParams, TaskListParams,
-    TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams,
-    ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams,
-    TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
+    SessionHydrateParams, SessionOrchestrationEvent, TaskArtifactReadParams, TaskCancelParams,
+    TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState,
+    ThreadGraphGetParams, ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams,
+    TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities,
+    approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -3024,6 +3025,9 @@ impl Default for SessionRunState {
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub sessions: Vec<SessionView>,
+    /// Latest whole-job orchestration status per session (`session/orchestration`).
+    /// Drives the composer top-border job indicator; absent/`active:false` hides it.
+    pub orchestration: std::collections::HashMap<SessionKey, SessionOrchestrationEvent>,
     pub selected_session: usize,
     pub selected_task: usize,
     pub transcript_scroll: usize,
@@ -4324,6 +4328,7 @@ impl AppState {
 
         Self {
             sessions,
+            orchestration: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
             transcript_scroll: 0,

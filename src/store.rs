@@ -5145,6 +5145,20 @@ impl Store {
                 self.state.status = format!("Context normalized: {prompt_count} prompt messages");
                 None
             }
+            UiNotification::SessionOrchestration(event) => {
+                // Whole-job status for the composer top-border indicator. Keep
+                // it only while active; drop on the terminal active:false so the
+                // indicator hides when the job (turn + sub-agents +
+                // continuations) is fully done.
+                if event.active {
+                    self.state
+                        .orchestration
+                        .insert(event.session_id.clone(), event);
+                } else {
+                    self.state.orchestration.remove(&event.session_id);
+                }
+                None
+            }
         }
     }
 
