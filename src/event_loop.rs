@@ -319,8 +319,13 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             store.state.focus = store.state.focus.next();
         }
         KeyCode::Esc => {
-            if store.state.active_turn().is_some() && store.state.has_pending_messages() {
-                if let Some(command) = store.interrupt_staged_command() {
+            if store.state.active_turn().is_some() {
+                let command = if store.state.has_pending_messages() {
+                    store.interrupt_staged_command()
+                } else {
+                    store.interrupt_command()
+                };
+                if let Some(command) = command {
                     return KeyAction::Send(command);
                 }
             }
@@ -1762,6 +1767,37 @@ mod tests {
             store.state.status,
             "Interrupt requested; staged message will submit when the turn stops"
         );
+    }
+
+    #[test]
+    fn esc_interrupts_active_turn_without_staged_messages() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_sessions(1);
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "streaming".into(),
+        });
+        assert!(!store.state.has_pending_messages());
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        let KeyAction::Send(AppUiCommand::InterruptTurn(params)) = action else {
+            panic!("expected interrupt command");
+        };
+        assert_eq!(params.turn_id, turn_id);
+        assert_eq!(store.state.status, "Interrupt requested for active turn");
+    }
+
+    #[test]
+    fn esc_without_active_turn_only_refocuses_composer() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Tasks;
+        assert!(store.state.active_turn().is_none());
+
+        let action = handle_key(&mut store, key(KeyCode::Esc));
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
     #[test]
