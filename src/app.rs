@@ -324,7 +324,7 @@ const EXPANDED_TOOL_PREVIEW_LINES: usize = 24;
 /// reaches a terminal value — e.g. a file-mutation / diff-preview row stuck at
 /// `preview ready` / `pending_store` — would pin the chip on "Orchestrating…"
 /// forever. Sub-agent liveness is tracked separately via the task count
-/// ([`running_subagents_for_chip`]), so anything not in this set is treated as
+/// ([`running_subagent_titles_for_chip`]), so anything not in this set is treated as
 /// not-running here.
 fn is_running_activity(item: &ActivityItem) -> bool {
     let status = item.status.trim().to_ascii_lowercase();
@@ -1761,7 +1761,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
                     palette,
                     last_turn,
                     &group,
-                    running_subagents_for_chip(app, last_turn),
+                    &running_subagent_titles_for_chip(app, last_turn),
                     app.expanded_tool_outputs,
                 );
                 group.clear();
@@ -1776,7 +1776,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
             palette,
             last_turn,
             &group,
-            running_subagents_for_chip(app, last_turn),
+            &running_subagent_titles_for_chip(app, last_turn),
             app.expanded_tool_outputs,
         );
     }
@@ -1804,9 +1804,21 @@ fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
         .iter()
         .filter(|item| match active_turn_id {
             Some(turn_id) => item.turn_id.as_ref() == Some(turn_id),
-            None => item.turn_id.is_none(),
+            // When no turn is active, turn-less running sub-agent progress is
+            // folded into the orchestrating turn's chip (as children) — don't
+            // also render it here as a separate turn-less "Orchestrating" chip.
+            None => item.turn_id.is_none() && !is_subagent_progress(item),
         })
         .collect()
+}
+
+/// A turn-less running sub-agent progress row (an `AgentUpdated` / spawn-complete
+/// `Progress` item with no originating turn). These are surfaced under the
+/// orchestrating turn's chip via `running_subagent_titles_for_chip`, so they must
+/// not also form their own phantom turn-less "Orchestrating" chip (mini5 soak:
+/// the "two Orchestrating chips" the user saw for one parallel-spawn turn).
+fn is_subagent_progress(item: &ActivityItem) -> bool {
+    item.turn_id.is_none() && item.kind == ActivityKind::Progress && is_running_activity(item)
 }
 
 fn push_turn_activity_log_section(
@@ -1834,7 +1846,7 @@ fn push_turn_activity_log_section(
         palette,
         Some(&log.turn_id),
         &shown,
-        running_subagents_for_chip(app, Some(&log.turn_id)),
+        &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
     );
     if log.items.len() > shown.len() {
@@ -1882,10 +1894,11 @@ fn push_agent_task_group(
     palette: Palette,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
     items: &[&ActivityItem],
-    active_subagents: usize,
+    subagent_titles: &[String],
     expanded: bool,
 ) {
-    if items.is_empty() {
+    let active_subagents = subagent_titles.len();
+    if items.is_empty() && subagent_titles.is_empty() {
         return;
     }
     let active = items
@@ -1940,6 +1953,21 @@ fn push_agent_task_group(
 
     for (idx, item) in items.iter().enumerate() {
         push_agent_task_child(lines, palette, item, idx == 0, expanded);
+    }
+
+    // List this turn's running sub-agents (from session.tasks, attributed by
+    // turn) as children, so their live progress shows under THIS chip instead
+    // of forming a separate turn-less "Orchestrating" chip (mini5 soak: folds
+    // the phantom second chip into the orchestrating turn's chip).
+    for (idx, title) in subagent_titles.iter().enumerate() {
+        let first = items.is_empty() && idx == 0;
+        let prefix = if first { "  ⎿  " } else { "     " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, palette.border()),
+            Span::styled("◻ ", palette.selected()),
+            Span::styled(title.clone(), palette.text()),
+            Span::styled("  running", palette.muted()),
+        ]));
     }
 }
 
@@ -2319,27 +2347,29 @@ fn active_background_tasks(app: &AppState) -> usize {
         .unwrap_or(0)
 }
 
-/// Running sub-agents to attribute to an agent-task chip. Each running task is
-/// attributed to the chip for its OWN originating turn (`task.turn_id`, stamped
-/// by the server per C1 step 4), so two turns can no longer both claim the same
-/// global sub-agent count — the "two Orchestrating chips" bug (C5). Background
-/// sub-agents outlive the parent turn (it shows "done" while they keep running),
-/// and that still works: their `turn_id` keeps pointing at the turn that spawned
-/// them, so that — and only that — chip stays "Orchestrating".
+/// Titles of the running sub-agents attributed to an agent-task chip. Each
+/// running task is attributed to the chip for its OWN originating turn
+/// (`task.turn_id`, stamped by the server per C1 step 4), so two turns can no
+/// longer both claim the same global sub-agent count — the "two Orchestrating
+/// chips" bug (C5). Background sub-agents outlive the parent turn (it shows
+/// "done" while they keep running), and that still works: their `turn_id` keeps
+/// pointing at the turn that spawned them, so that — and only that — chip stays
+/// "Orchestrating", and lists those agents as its children (so their live
+/// progress no longer forms a *second*, turn-less "Orchestrating" chip).
 ///
 /// Tasks the server couldn't stamp with a turn (legacy daemons, `session/open`
 /// replay, synthetic emitters → `turn_id == None`) fall back to a SINGLE current
 /// chip — the active (live) turn if one exists, else the latest activity-log
 /// turn — so they still surface without being double-counted across chips.
-fn running_subagents_for_chip(
+fn running_subagent_titles_for_chip(
     app: &AppState,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
-) -> usize {
+) -> Vec<String> {
     let Some(chip_turn) = turn_id else {
-        return 0;
+        return Vec::new();
     };
     let Some(session) = app.active_session() else {
-        return 0;
+        return Vec::new();
     };
     // The one chip that owns turn-less tasks: prefer the active (live) turn; if
     // the turn already finished, this session's latest activity-log turn. At most
@@ -2363,7 +2393,8 @@ fn running_subagents_for_chip(
             Some(task_turn) => task_turn == chip_turn,
             None => owns_unattributed,
         })
-        .count()
+        .map(|task| task.title.clone())
+        .collect()
 }
 
 fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -5910,7 +5941,7 @@ mod tests {
     #[test]
     fn subagents_attributed_per_turn_not_double_counted() {
         // C5 regression: two turns each spawn sub-agents. Before C1's `turn_id`
-        // landed on the task wire, `running_subagents_for_chip` returned the
+        // landed on the task wire, `running_subagent_titles_for_chip` returned the
         // GLOBAL active count for every chip matching active-OR-latest, so both
         // turns' chips lit up "Orchestrating" with the same total ("two chips").
         // Now each chip counts ONLY its own turn's running tasks; turn-less tasks
@@ -5964,13 +5995,19 @@ mod tests {
 
         // turn_a (active) chip: its own 1 running task + the orphan (None → the
         // single current chip, which is the active turn).
-        assert_eq!(running_subagents_for_chip(&app, Some(&turn_a)), 2);
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_a)).len(),
+            2
+        );
         // turn_b chip: its own 2 running tasks — NOT the global 4, NOT the orphan.
-        assert_eq!(running_subagents_for_chip(&app, Some(&turn_b)), 2);
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_b)).len(),
+            2
+        );
         // The pre-C5 bug would have returned the global active count (4) for BOTH.
         assert_ne!(
-            running_subagents_for_chip(&app, Some(&turn_a)),
-            running_subagents_for_chip(&app, Some(&turn_b)) + 2,
+            running_subagent_titles_for_chip(&app, Some(&turn_a)).len(),
+            running_subagent_titles_for_chip(&app, Some(&turn_b)).len() + 2,
             "chips must not both report the global total"
         );
     }
@@ -6039,9 +6076,91 @@ mod tests {
         });
 
         // The orphan attaches to the active session's own latest turn…
-        assert_eq!(running_subagents_for_chip(&app, Some(&turn_active)), 1);
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_active)).len(),
+            1
+        );
         // …and NOT to the other (globally-newest) session's turn.
-        assert_eq!(running_subagents_for_chip(&app, Some(&turn_other)), 0);
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_other)).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn subagent_progress_folds_into_orchestrating_chip_not_a_second_chip() {
+        // mini5 soak: a parallel-spawn turn rendered TWO "Orchestrating" chips —
+        // the parent turn's chip (spawn calls + "N sub-agent(s) running") AND a
+        // phantom turn-less chip made of the sub-agents' own progress rows. The
+        // progress rows must fold into the parent chip as children → exactly ONE
+        // orchestrating chip, with the sub-agents listed under it.
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let running = |title: &str| crate::model::TaskView {
+            id: octos_core::TaskId::new(),
+            title: title.into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: Some(turn.clone()),
+        };
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run parallel agents")],
+                tasks: vec![
+                    running("openclaw-deep-analysis"),
+                    running("hermes-deep-analysis"),
+                ],
+                // Parent turn finished; its sub-agents keep running.
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Parent turn's spawn tool-calls, logged + completed.
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn.clone(),
+            request: Some("run parallel agents".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn.clone())
+                    .with_success(true),
+            ],
+        });
+        // The sub-agents' own live progress rows (turn-less) — the phantom-chip
+        // source. These must NOT form their own chip.
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "openclaw-deep-analysis",
+            "running",
+        ));
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "hermes-deep-analysis",
+            "running",
+        ));
+
+        let text = rendered_text(&app);
+        assert_eq!(
+            text.matches("Orchestrating").count(),
+            1,
+            "exactly one Orchestrating chip (the phantom must fold in): {text:?}"
+        );
+        assert!(
+            text.contains("2 sub-agent(s) running"),
+            "the orchestrating chip surfaces the count: {text:?}"
+        );
+        assert!(
+            text.contains("openclaw-deep-analysis") && text.contains("hermes-deep-analysis"),
+            "the running sub-agents are folded in as children: {text:?}"
+        );
     }
 
     #[test]
