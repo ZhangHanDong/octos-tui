@@ -4563,6 +4563,22 @@ impl Store {
     }
 
     fn apply_progress(&mut self, event: UiProgressEvent) -> Option<AppUiCommand> {
+        // Retain the latest cumulative usage (tokens + session cost) per session
+        // for the whole-job indicator. Merge so a partial update (only cost, or
+        // only tokens) doesn't wipe the other field.
+        if let Some(token_cost) = event.metadata.token_cost.as_ref() {
+            let entry = self
+                .state
+                .session_usage
+                .entry(event.session_id.clone())
+                .or_insert((None, None));
+            if token_cost.total_tokens.is_some() {
+                entry.0 = token_cost.total_tokens;
+            }
+            if token_cost.session_cost.is_some() {
+                entry.1 = token_cost.session_cost;
+            }
+        }
         let status = progress_status(&event);
         let record_activity = should_record_progress_activity(&event);
         let diff_preview_request = event.metadata.file_mutation.as_ref().and_then(|notice| {

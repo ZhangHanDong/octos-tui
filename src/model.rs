@@ -3028,6 +3028,9 @@ pub struct AppState {
     /// Latest whole-job orchestration status per session (`session/orchestration`).
     /// Drives the composer top-border job indicator; absent/`active:false` hides it.
     pub orchestration: std::collections::HashMap<SessionKey, SessionOrchestrationEvent>,
+    /// Latest cumulative usage per session — (total tokens, session cost USD) —
+    /// merged from `token_cost` progress updates. Rendered on the job indicator.
+    pub session_usage: std::collections::HashMap<SessionKey, (Option<u64>, Option<f64>)>,
     pub selected_session: usize,
     pub selected_task: usize,
     pub transcript_scroll: usize,
@@ -4329,6 +4332,7 @@ impl AppState {
         Self {
             sessions,
             orchestration: std::collections::HashMap::new(),
+            session_usage: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
             transcript_scroll: 0,

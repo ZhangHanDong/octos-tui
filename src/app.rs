@@ -3034,7 +3034,32 @@ fn orchestration_indicator(app: &AppState) -> Option<String> {
     } else {
         String::new()
     };
-    Some(format!(" {} {}{} ", spinner_frame(), phase, agents))
+    // Cumulative tokens + session cost (from token_cost progress updates).
+    let mut usage = String::new();
+    if let Some((tokens, cost)) = app.session_usage.get(&session.id) {
+        if let Some(tokens) = tokens {
+            usage.push_str(&format!(" · {} tok", humanize_token_count(*tokens)));
+        }
+        if let Some(cost) = cost.filter(|c| *c > 0.0) {
+            usage.push_str(&format!(" · ${cost:.4}"));
+        }
+    }
+    Some(format!(
+        " {} {}{}{} ",
+        spinner_frame(),
+        phase,
+        agents,
+        usage
+    ))
+}
+
+/// Compact token count for the job indicator: `34211` -> `34.2k`.
+fn humanize_token_count(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -4065,10 +4090,15 @@ mod tests {
                 phase: Some("orchestrating".into()),
             },
         );
+        // Cumulative usage (from token_cost progress) is folded in.
+        app.session_usage
+            .insert(session_id.clone(), (Some(34_211), Some(0.0123)));
         let indicator =
             orchestration_indicator(&app).expect("active orchestration shows an indicator");
         assert!(indicator.contains("Orchestrating"), "{indicator}");
         assert!(indicator.contains("2 agents"), "{indicator}");
+        assert!(indicator.contains("34.2k tok"), "{indicator}");
+        assert!(indicator.contains("$0.0123"), "{indicator}");
 
         // The re-entry gap (no running agents, a continuation pending) STILL
         // shows the indicator — the whole point: it no longer reads as "done".
