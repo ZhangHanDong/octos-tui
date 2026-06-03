@@ -10785,6 +10785,141 @@ mod tests {
         );
     }
 
+    /// Build the wire `projection/envelope` `params` the SERVER actually
+    /// emits when the turn is TOPIC-scoped: the emitting
+    /// `EnvelopeNotification.session_id` carries the `"base#topic"`
+    /// composite key (`turn/start` folds the topic in). Driving it
+    /// through the REAL `into_rpc_notification` boundary exercises the
+    /// core wire-normalization (session_id → bare base, topic preserved),
+    /// so this guard fails if that normalization regresses.
+    fn topic_folded_envelope_wire_params(
+        base_topic_session_id: &str,
+        thread_id: &str,
+        seq: u64,
+        payload: Payload,
+    ) -> serde_json::Value {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey(base_topic_session_id.into()),
+            topic: None,
+            envelope: Envelope {
+                thread_id: thread_id.into(),
+                seq,
+                client_message_id: None,
+                payload,
+            },
+        });
+        notif
+            .into_rpc_notification()
+            .expect("topic-folded envelope serializes to the wire")
+            .params
+    }
+
+    /// feat(envelope-wire-routing) — codex BLOCKER, TUI decode-path guard.
+    /// On a TOPIC turn the server's `EnvelopeNotification.session_id` is
+    /// the composite `"local:a#research"` key. The TUI knows only the
+    /// BARE base session `"local:a"`, so it must route by the base key.
+    /// We drive the FULL real path: build the wire from the topic-folded
+    /// notification → `into_rpc_notification` (core normalizes the wire
+    /// session_id to the base) → `from_method_and_params` →
+    /// `apply_envelope`, and assert:
+    ///   (a) the message lands in the BARE `"local:a"` session
+    ///       (`find_session_mut` succeeds), and
+    ///   (b) the topic-turn's `TurnCompleted` reconcile scopes to the
+    ///       BARE `"local:a"` session — healing its own stranded chip
+    ///       without touching a sibling.
+    ///
+    /// RED before the core fix: the wire carried `"local:a#research"`, so
+    /// `find_session_mut` and the reconcile both searched the composite
+    /// key, missing the real `"local:a"` session → message dropped and
+    /// the self-heal scoped to the wrong key.
+    #[test]
+    fn topic_folded_envelope_wire_routes_to_base_session_and_scopes_reconcile() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        assert_eq!(session_a, SessionKey("local:a".into()));
+
+        // (a) A topic-scoped user_message for session A's research topic.
+        apply_envelope_wire_frame(
+            &mut store,
+            topic_folded_envelope_wire_params(
+                "local:a#research",
+                "thread-topic",
+                1,
+                Payload::UserMessage {
+                    text: "topic msg for A".into(),
+                    files: vec![],
+                },
+            ),
+        );
+        let a_msgs = &store.state.sessions[0].messages;
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "topic-scoped message must route to the BARE base session, \
+             not a composite base#topic key",
+        );
+        assert_eq!(a_msgs[0].content, "topic msg for A");
+        assert!(
+            store.state.sessions[1].messages.is_empty(),
+            "session B must not receive session A's topic message",
+        );
+
+        // A turn-less running tool on session A's topic thread.
+        apply_envelope_wire_frame(
+            &mut store,
+            topic_folded_envelope_wire_params(
+                "local:a#research",
+                "thread-topic",
+                2,
+                Payload::ToolStart {
+                    tool_call_id: "call-topic".into(),
+                    name: "run_pipeline".into(),
+                },
+            ),
+        );
+
+        // The chip must be tagged with the BARE base session key so the
+        // session-scoped reconcile (which matches on the base key) finds
+        // it. RED on the pre-fix wire (tagged "local:a#research").
+        let chip = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-topic"))
+            .expect("topic envelope tool item retained");
+        assert_eq!(
+            chip.session_id.as_ref(),
+            Some(&SessionKey("local:a".into())),
+            "chip must be scoped to the bare base session key",
+        );
+
+        // (b) The topic turn's TurnCompleted reconciles A's stranded chip
+        // via the BARE base key.
+        apply_envelope_wire_frame(
+            &mut store,
+            topic_folded_envelope_wire_params(
+                "local:a#research",
+                "thread-topic",
+                3,
+                Payload::TurnCompleted {
+                    token_usage: Default::default(),
+                },
+            ),
+        );
+        let chip = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-topic"))
+            .expect("topic envelope tool item retained after turn complete");
+        assert_eq!(
+            chip.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "topic turn's TurnCompleted must reconcile the chip scoped to \
+             the bare base session key",
+        );
+    }
+
     /// feat(envelope-wire-routing) backward-compat at the consumer: an
     /// OLD bare-envelope wire frame (no `session_id`) still decodes
     /// without error through the transport path. The routing key is
