@@ -1752,6 +1752,16 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         .copied()
         .collect::<Vec<_>>();
     let pending_continuations = active_session_pending_continuations(app);
+    // The header counts tally the FULL per-turn set (from `flow_activity`), not
+    // the display-capped `group` — so a chip header agrees with the sibling
+    // "... +N older action(s)" footer below.
+    let full_group = |turn: Option<&octos_core::ui_protocol::TurnId>| -> Vec<&ActivityItem> {
+        flow_activity
+            .iter()
+            .copied()
+            .filter(|item| item.turn_id.as_ref() == turn)
+            .collect()
+    };
     let mut group: Vec<&ActivityItem> = Vec::new();
     let mut last_turn: Option<&octos_core::ui_protocol::TurnId> = None;
     for item in recent.iter().copied() {
@@ -1762,6 +1772,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
                     lines,
                     palette,
                     last_turn,
+                    &full_group(last_turn),
                     &group,
                     &running_subagent_titles_for_chip(app, last_turn),
                     pending_continuations,
@@ -1779,6 +1790,7 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
             lines,
             palette,
             last_turn,
+            &full_group(last_turn),
             &group,
             &running_subagent_titles_for_chip(app, last_turn),
             pending_continuations,
@@ -1892,35 +1904,30 @@ fn push_turn_activity_log_section(
         lines.push(Line::from(""));
     }
     let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
-    let shown = log
-        .items
+    // Full uncapped set (header counts + footer tally both derive from this via
+    // `task_group_counts`, so they cannot diverge).
+    let full = log.items.iter().collect::<Vec<_>>();
+    let shown = full
         .iter()
         .rev()
         .take(shown_limit)
         .rev()
+        .copied()
         .collect::<Vec<_>>();
     push_agent_task_group(
         lines,
         palette,
         Some(&log.turn_id),
+        &full,
         &shown,
         &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
         active_session_pending_continuations(app),
         is_active_group(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
     );
-    if log.items.len() > shown.len() {
-        let hidden = log.items.len() - shown.len();
-        let completed = log
-            .items
-            .iter()
-            .filter(|item| activity_is_completed(item))
-            .count();
-        let active = log
-            .items
-            .iter()
-            .filter(|item| is_running_activity(item))
-            .count();
+    if full.len() > shown.len() {
+        let hidden = full.len() - shown.len();
+        let (_, completed, active, _) = task_group_counts(&full);
         lines.push(Line::from(vec![
             Span::styled("     ", palette.muted()),
             Span::styled(
@@ -1984,11 +1991,21 @@ fn agent_task_group_title(
     }
 }
 
+/// Render an agent-task-group chip: a header (title + count metadata) plus the
+/// display-capped `items` as children.
+///
+/// `full_items` is the UNCAPPED turn activity set used for the HEADER counts;
+/// `items` is the display-capped slice (last N rows) actually rendered as
+/// children. The header tallies `full_items` via [`task_group_counts`] — the
+/// SAME helper the sibling "... +N older" footer uses — so the header and
+/// footer numbers cannot diverge (render-cap bug: a 66-action turn previously
+/// read "3 action(s) · 3 completed" because the header counted the cap).
 #[allow(clippy::too_many_arguments)]
 fn push_agent_task_group(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
+    full_items: &[&ActivityItem],
     items: &[&ActivityItem],
     subagent_titles: &[String],
     pending_continuations: u32,
@@ -1999,15 +2016,8 @@ fn push_agent_task_group(
     if items.is_empty() && subagent_titles.is_empty() {
         return;
     }
-    let active = items
-        .iter()
-        .filter(|item| is_running_activity(item))
-        .count();
-    let completed = items
-        .iter()
-        .filter(|item| activity_is_completed(item))
-        .count();
-    let failed = items.iter().filter(|item| activity_is_failed(item)).count();
+    // Header counts tally the FULL turn set, not the display-capped `items`.
+    let (total, completed, active, failed) = task_group_counts(full_items);
     // `spawn` returns immediately, so the parent's tool-call rollup can be all
     // "completed" while the sub-agents it launched are still running (tracked
     // separately in `session.tasks`). Treat the turn as still orchestrating
@@ -2015,7 +2025,7 @@ fn push_agent_task_group(
     // with work outstanding.
     let in_progress = active > 0 || active_subagents > 0;
     let title = agent_task_group_title(in_progress, failed, pending_continuations, is_active_group);
-    let mut metadata = vec![format!("{} action(s)", items.len())];
+    let mut metadata = vec![format!("{total} action(s)")];
     if active > 0 {
         metadata.push(format!("{active} active"));
     }
@@ -2241,6 +2251,35 @@ fn activity_is_completed(item: &ActivityItem) -> bool {
 
 fn activity_is_failed(item: &ActivityItem) -> bool {
     matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error")
+}
+
+/// Tally the agent-task-group counts over a slice of activity items.
+///
+/// Returns `(total, completed, active, failed)` using the SAME predicates the
+/// chip header and footer already use ([`activity_is_completed`],
+/// [`is_running_activity`], [`activity_is_failed`]).
+///
+/// The chip header MUST tally over the FULL turn activity set, not the
+/// display-capped slice of children that's actually rendered — otherwise a
+/// 66-action turn showing the last 3 rows reads "3 action(s) · 3 completed"
+/// while its own "... +63 older action(s)" footer proves the real total is 66.
+/// Both the header and the footer call this single helper so their numbers
+/// cannot diverge.
+fn task_group_counts(full_items: &[&ActivityItem]) -> (usize, usize, usize, usize) {
+    let total = full_items.len();
+    let completed = full_items
+        .iter()
+        .filter(|item| activity_is_completed(item))
+        .count();
+    let active = full_items
+        .iter()
+        .filter(|item| is_running_activity(item))
+        .count();
+    let failed = full_items
+        .iter()
+        .filter(|item| activity_is_failed(item))
+        .count();
+    (total, completed, active, failed)
 }
 
 fn push_inline_diff_preview(
@@ -6472,6 +6511,133 @@ mod tests {
         assert!(
             !text.contains("Agent task completed"),
             "active turn group must NOT read completed during the re-entry gap: {text:?}"
+        );
+    }
+
+    #[test]
+    fn task_group_counts_tally_full_set_not_display_cap() {
+        // Render-cap bug: the chip header counted the DISPLAY-CAPPED slice (3 or
+        // 12 rows), so a 66-action turn read "3 action(s) · 3 completed" even
+        // though its sibling footer correctly tallied the full 66. The header
+        // and footer now both call `task_group_counts` over the FULL set, so the
+        // counts reflect 66 actions — not the cap.
+        let mut items: Vec<ActivityItem> = Vec::new();
+        // 60 completed earlier actions.
+        for _ in 0..60 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete").with_success(true),
+            );
+        }
+        // 2 active (still running) earlier actions.
+        items.push(ActivityItem::new(
+            ActivityKind::Tool,
+            "run_pipeline",
+            "running",
+        ));
+        items.push(ActivityItem::new(
+            ActivityKind::Tool,
+            "run_pipeline",
+            "running",
+        ));
+        // 1 failed earlier action.
+        items.push(ActivityItem::new(ActivityKind::Tool, "shell", "failed").with_success(false));
+        // Last 3 (the only ones the chip renders as children) are completed.
+        for _ in 0..3 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete").with_success(true),
+            );
+        }
+        assert_eq!(items.len(), 66, "fixture sanity: 66 total actions");
+
+        let full: Vec<&ActivityItem> = items.iter().collect();
+        let (total, completed, active, failed) = task_group_counts(&full);
+        assert_eq!(total, 66, "total must be the FULL set, not the display cap");
+        assert_eq!(completed, 63, "60 early + 3 late completed");
+        assert_eq!(active, 2, "two running actions");
+        assert_eq!(failed, 1, "one failed action");
+
+        // The display-capped slice (last 3) must NOT be what the header counts:
+        // if the header tallied the cap it would read 3/3/0/0 — the original bug.
+        let capped: Vec<&ActivityItem> = full.iter().rev().take(3).rev().copied().collect();
+        let (cap_total, cap_completed, _, _) = task_group_counts(&capped);
+        assert_eq!(cap_total, 3);
+        assert_eq!(cap_completed, 3);
+        assert_ne!(
+            (total, completed),
+            (cap_total, cap_completed),
+            "header tally must differ from the display-cap tally"
+        );
+    }
+
+    #[test]
+    fn chip_header_counts_full_turn_set_and_agrees_with_footer() {
+        // End-to-end render guard: a 66-action turn's chip HEADER must read the
+        // full set ("66 action(s) · ... 64 completed") and AGREE with its sibling
+        // "... +63 more" footer — not the display-capped "3 action(s) · 3
+        // completed". RED on the pre-fix code: the header counted only the last
+        // 3 rendered children.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut items: Vec<ActivityItem> = Vec::new();
+        // 63 earlier actions, all completed.
+        for _ in 0..63 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+            );
+        }
+        // Last 3 (the rendered children) completed too → 66 total, 66 completed.
+        for _ in 0..3 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+            );
+        }
+        assert_eq!(items.len(), 66);
+
+        let app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("big turn")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let mut app = app;
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id,
+            request: Some("big turn".into()),
+            anchor_index: Some(0),
+            items,
+        });
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("66 action(s)"),
+            "header must read the full 66-action set, not the display cap: {text:?}"
+        );
+        assert!(
+            !text.contains("3 action(s)"),
+            "header must NOT read the capped 3-action slice: {text:?}"
+        );
+        // 63 of the 66 are hidden (only 3 rendered as children); footer tallies
+        // the full set, so header and footer must agree.
+        assert!(
+            text.contains("+63 more"),
+            "footer must report the 63 hidden actions: {text:?}"
+        );
+        assert!(
+            text.contains("66 completed"),
+            "header completed count must reflect the full set: {text:?}"
         );
     }
 
