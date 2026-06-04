@@ -5807,15 +5807,22 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
-        // Idempotence vs a turn-switch (see `commit_live_reply`): a late
-        // `TurnError` for a turn already finalized at a switch boundary is a
-        // no-op — the turn was committed/dropped at switch time.
-        if self
+        // Idempotence vs a turn-switch (see `commit_live_reply`): the
+        // finalized-by-switch marker suppresses only a false COMPLETION
+        // fallback — it must NEVER hide a real ERROR. A turn finalized at a
+        // switch boundary (its text already committed, or it was an empty turn
+        // that was dropped) can still genuinely ERROR afterwards, and that
+        // failure must be surfaced (failure card + run-state Error), even though
+        // its partial text may already stand. So we CONSUME the marker for
+        // cleanup (so it cannot leak and mishandle a later same-id event) but
+        // then FALL THROUGH to the normal fail-path arms rather than
+        // early-returning `None`. Both orderings are handled below: B already
+        // completed (live_reply == None → the `None` arm pushes the failure
+        // card) and B still live (the `Some(mismatched)` arm preserves B's
+        // live_reply but still surfaces A's failure via the run-state error).
+        let was_finalized_by_switch = self
             .state
-            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
-        {
-            return None;
-        }
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -5823,7 +5830,13 @@ impl Store {
             return None;
         };
         let title = session.title.clone();
-        let (status, failed_current_turn) = match session.live_reply.take() {
+        // `failed_current_turn`: this error terminates the LIVE turn — it owns
+        // the retry-clear and the live-turn run-state transition.
+        // `surfaced_failure`: a failure card was pushed for this error. These
+        // coincide except for a switch-finalized turn whose error arrives while
+        // a DIFFERENT successor turn is still live: there we surface the failure
+        // (card + error run-state) without disturbing the live successor.
+        let (status, failed_current_turn, surfaced_failure) = match session.live_reply.take() {
             Some(live_reply) if live_reply.turn_id == event.turn_id => {
                 let partial = compact_first_line(&live_reply.text, 120);
                 let text = if partial.is_empty() {
@@ -5835,12 +5848,29 @@ impl Store {
                 (
                     format!("Turn error {}: {}", event.code, event.message),
                     true,
+                    true,
+                )
+            }
+            Some(live_reply) if was_finalized_by_switch => {
+                // A switch-finalized turn (A) errors while a different successor
+                // turn (B) is still live: surface A's failure card but PRESERVE
+                // B's in-flight live_reply untouched — the error is A's, not B's.
+                // A's (partial) text was already committed at switch time, so
+                // the card is the bare error summary (no partial-response tail
+                // here; that tail belongs to the live-turn arm above).
+                session.messages.push(Message::assistant(fallback_summary));
+                session.live_reply = Some(live_reply);
+                (
+                    format!("Turn error {}: {}", event.code, event.message),
+                    false,
+                    true,
                 )
             }
             Some(live_reply) => {
                 session.live_reply = Some(live_reply);
                 (
                     format!("Ignored stale turn error in {title}: {}", event.code),
+                    false,
                     false,
                 )
             }
@@ -5849,10 +5879,11 @@ impl Store {
                 (
                     format!("Turn error {}: {}", event.code, event.message),
                     true,
+                    true,
                 )
             }
         };
-        if failed_current_turn {
+        if surfaced_failure {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
             } else {
@@ -5869,8 +5900,13 @@ impl Store {
             //
             // Over-clear fix: only clear when this terminal applies to the LIVE
             // turn. A STALE `TurnError` (mismatched turn_id) preserves the live
-            // reply above, so it must also preserve the live turn's retry.
+            // reply above, so it must also preserve the live turn's retry. A
+            // switch-finalized turn's late error that surfaces while a different
+            // turn is live (`!failed_current_turn`) likewise leaves the live
+            // turn's retry alone.
             self.state.session_retry.remove(&event.session_id);
+        }
+        if surfaced_failure {
             self.state
                 .set_run_state_error(format!("{}: {}", event.code, event.message));
         }
@@ -5917,6 +5953,20 @@ impl Store {
     /// silently (its eventual `TurnCompleted`, if any, is handled by the
     /// fallback path); we only persist a prior turn that actually produced a
     /// visible answer.
+    ///
+    /// Activity vs. assistant-message decision (DO-NOT-SHIP #2): the assistant
+    /// MESSAGE and the tool ACTIVITY are two independent artifacts. A
+    /// switch-dropped EMPTY continuation turn produces NO assistant message and
+    /// NO "did not receive a final assistant answer" fallback card by design (it
+    /// was superseded by `new_turn`). But its tool activity must NOT be lost: we
+    /// capture it into `turn_activity_logs` (the chip source) on BOTH the
+    /// non-empty and the empty-drop path, identically to the live commit path.
+    /// `capture_completed_turn_activity` archives the turn's items out of the
+    /// live `activity` flow (which is filtered to the *active* turn, so once
+    /// `new_turn` is live the prior turn's items would otherwise be orphaned —
+    /// invisible — until a late terminal that, being a no-op for a marked turn,
+    /// never captures them). Capturing here keeps the dropped-empty turn's
+    /// activity chip visible without re-introducing the false-completion card.
     fn commit_pending_live_reply_for_turn_switch(
         &mut self,
         session_id: &octos_core::SessionKey,
@@ -5963,9 +6013,14 @@ impl Store {
                 committed = true;
             }
         }
+        // Capture the prior turn's tool activity on BOTH paths (committed
+        // non-empty AND dropped empty) so a switch-dropped empty turn's chip
+        // stays visible — see the method doc. This is a no-op when the turn ran
+        // no activity (`capture_completed_turn_activity` returns early), so the
+        // genuinely-empty no-activity case is unaffected.
+        self.state
+            .capture_completed_turn_activity(session_id, &prior_turn);
         if committed {
-            self.state
-                .capture_completed_turn_activity(session_id, &prior_turn);
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
             } else {
@@ -10984,6 +11039,288 @@ mod tests {
         assert_eq!(
             after, before,
             "late terminal for a dropped-empty prior turn must be a no-op"
+        );
+    }
+
+    #[test]
+    fn late_turn_error_after_switch_surfaces_failure_not_swallowed() {
+        // The finalized-by-switch marker must suppress only a false COMPLETION
+        // fallback — never hide a real ERROR. Turn A streams non-empty text, a
+        // delta for turn B switches turns (A is committed + marked at the
+        // switch), B completes (live_reply == None), and then a LATE
+        // `TurnError{A}` arrives. A switch-finalized turn that genuinely errored
+        // MUST surface its failure (its committed text already stands), so the
+        // late error is NOT a no-op: it commits a failure card AND flips the
+        // session run-state to Error.
+        //
+        // Pre-fix RED: `fail_live_reply` consumed the marker and early-returned
+        // `None`, swallowing the error entirely — no failure card, run-state
+        // never went to Error.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Deltas lazy-bind turn A (non-empty).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        // A delta for turn B switches turns: A is committed + marked at switch.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let committed_a_before = store.state.sessions[0]
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("answer A"))
+            .count();
+        assert_eq!(
+            committed_a_before, 1,
+            "turn A must be committed once before the late error"
+        );
+
+        // LATE TurnError{A} arrives after B already completed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                code: "provider_error".into(),
+                message: "upstream 500 on turn A".into(),
+            },
+        )));
+
+        let messages: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // Failure IS surfaced (not swallowed): a failure card for A's error.
+        assert!(
+            messages.iter().any(
+                |c| c.contains("Turn failed before producing a final answer")
+                    && c.contains("provider_error: upstream 500 on turn A")
+            ),
+            "late error for a switch-finalized turn must surface a failure card: {messages:?}"
+        );
+        // A's already-committed text still stands.
+        assert_eq!(
+            messages.iter().filter(|c| c.contains("answer A")).count(),
+            1,
+            "A's committed text must remain after its late error: {messages:?}"
+        );
+        // Run-state reflects the error.
+        assert!(
+            matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Error { .. }
+            ),
+            "late error must drive run-state to Error, got {:?}",
+            store.state.run_state
+        );
+    }
+
+    #[test]
+    fn late_turn_error_after_switch_surfaces_failure_with_b_still_live() {
+        // Same as above but the successor turn B is STILL streaming (live_reply
+        // bound to B) when the late `TurnError{A}` arrives. The error for the
+        // switch-finalized turn A must still be surfaced, and B's in-flight
+        // live_reply must be preserved untouched (the error is for A, not B).
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        // Switch to B (A committed + marked); B keeps streaming (still live).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B in progress".into(),
+            },
+        )));
+
+        // LATE TurnError{A} arrives while B is still live.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                code: "provider_error".into(),
+                message: "upstream 500 on turn A".into(),
+            },
+        )));
+
+        let messages: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(
+            messages.iter().any(
+                |c| c.contains("Turn failed before producing a final answer")
+                    && c.contains("provider_error: upstream 500 on turn A")
+            ),
+            "late error for A must surface even while B is still live: {messages:?}"
+        );
+        // B's in-flight live_reply is preserved (untouched by A's error).
+        let live = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("B's live_reply must remain bound");
+        assert_eq!(live.turn_id, turn_b, "B must remain the live turn");
+        assert_eq!(
+            live.text, "answer B in progress",
+            "B's streamed text must be preserved"
+        );
+    }
+
+    #[test]
+    fn switch_dropped_empty_turn_with_activity_keeps_activity_visible() {
+        // An empty (no assistant deltas) turn A that nevertheless DID run tool
+        // activity is switched away from to turn B. The empty live_reply text is
+        // dropped at the switch (no assistant message, no "did not receive
+        // answer" card — A was superseded). But A's tool ACTIVITY must NOT be
+        // lost: it must be captured into `turn_activity_logs` (the chip source)
+        // so it stays visible, exactly as the non-empty commit path captures it.
+        //
+        // Pre-fix RED: the empty-drop path skipped `capture_completed_turn_
+        // activity`, so A's tool items were left orphaned in `state.activity`
+        // (filtered out of the live flow once B is the active turn) and never
+        // archived to a log — invisible after the switch.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Turn A starts and runs a tool, but streams NO assistant deltas.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                tool_call_id: "call-A".into(),
+                tool_name: "shell".into(),
+                arguments: Some(serde_json::json!({"command": "ls"})),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
+            ToolCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                tool_call_id: "call-A".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                output_preview: Some("files".into()),
+                duration_ms: Some(10),
+            },
+        )));
+
+        // A delta for turn B switches turns: empty A's text is dropped.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+
+        // A produced no assistant message (it was an empty, superseded turn).
+        let has_a_message = store.state.sessions[0]
+            .messages
+            .iter()
+            .any(|m| m.role.as_str() == "assistant");
+        assert!(
+            !has_a_message,
+            "empty switch-dropped turn A must not produce an assistant message"
+        );
+
+        // A's tool activity is preserved in the chip source (turn_activity_logs)
+        // — not lost. The non-empty path would capture it the same way.
+        let a_log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_a);
+        assert!(
+            a_log.is_some(),
+            "empty switch-dropped turn A's activity must be captured to turn_activity_logs"
+        );
+        assert!(
+            a_log
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.title == "shell"),
+            "turn A's shell tool activity must be represented in its captured log"
+        );
+
+        // A's late terminal (a COMPLETION) is still a no-op (marker consumed) —
+        // it does not double-capture or emit a fallback card.
+        let logs_before = store.state.turn_activity_logs.len();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            !store.state.sessions[0].messages.iter().any(|m| m
+                .content
+                .contains("did not receive a final assistant answer")),
+            "late COMPLETION for the dropped-empty turn must remain a no-op (no fallback card)"
+        );
+        assert_eq!(
+            store.state.turn_activity_logs.len(),
+            logs_before,
+            "late COMPLETION for the dropped-empty turn must not change captured logs"
         );
     }
 
