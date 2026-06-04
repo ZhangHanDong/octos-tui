@@ -294,6 +294,15 @@ fn handle_plain_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         return handle_approval_modal_key(store, key);
     }
 
+    if store
+        .state
+        .user_question
+        .as_ref()
+        .is_some_and(|picker| picker.visible)
+    {
+        return handle_user_question_key(store, key);
+    }
+
     if store.state.task_output.active {
         return handle_task_output_key(store, key);
     }
@@ -677,6 +686,45 @@ fn handle_approval_modal_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             if let Some(command) = store.read_diff_preview_command() {
                 return KeyAction::Send(command);
             }
+        }
+        _ => {}
+    }
+
+    KeyAction::Continue
+}
+
+/// UPCR-2026-023: drive the AskUserQuestion picker. Keyboard model mirrors the
+/// multi-select menu (Up/Down move, Space toggle) plus typing-to-Other and
+/// Enter to step questions / submit. Esc hides the picker without answering.
+fn handle_user_question_key(store: &mut Store, key: KeyEvent) -> KeyAction {
+    match key.code {
+        KeyCode::Esc => {
+            store.close_modal();
+        }
+        KeyCode::Up => store.user_question_cursor_up(),
+        KeyCode::Down => store.user_question_cursor_down(),
+        KeyCode::Char(' ') if !store.user_question_editing_free_text() => {
+            store.user_question_toggle();
+        }
+        KeyCode::Char(']') => store.user_question_cursor_down(),
+        KeyCode::Char('[') => store.user_question_cursor_up(),
+        KeyCode::Tab => {
+            // Step forward through questions without submitting.
+            store.user_question_advance();
+        }
+        KeyCode::BackTab => store.user_question_back(),
+        KeyCode::Backspace => store.user_question_pop_free_text(),
+        KeyCode::Enter => {
+            // Stepping through questions; submit only on the final one.
+            if store.user_question_advance()
+                && let Some(command) = store.respond_user_question_command()
+            {
+                return KeyAction::Send(command);
+            }
+        }
+        KeyCode::Char(ch) => {
+            // Any other character is captured into the free-text "Other" box.
+            store.user_question_push_free_text(ch);
         }
         _ => {}
     }
