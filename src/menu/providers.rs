@@ -189,10 +189,11 @@ fn help_menu(ctx: &MenuContext<'_>) -> MenuSpec {
         searchable: true,
         search_placeholder: Some("Filter commands".into()),
         footer_hint: Some("Enter open/run | Esc close".into()),
-        preview: Some(MenuPreview::Text {
-            title: Some("Routing".into()),
-            body: "Exact slash commands are handled locally before prompt submission. Unknown slash commands are never sent to the model.".into(),
-        }),
+        // No right-hand preview: the static "Routing" blurb was internal plumbing
+        // info (not actionable) and, with the two-pane split, its text collided
+        // with the command column. Each command already carries its own inline
+        // description, so the list renders full-width instead.
+        preview: None,
         mode: MenuMode::SingleSelect,
     }
 }
@@ -1007,32 +1008,19 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
     })
 }
 
-/// M22 (#58): first-run ASCII splash. The narrow preview pane
-/// (80x24 layout) gives us only ~3 body rows after the title bar,
-/// so the splash body prioritises:
-///   line 1: tagline / call to action (always visible),
-///   line 2: a compact one-line OCTOS wordmark,
-///   line 3+: extended wordmark + stylised logo (visible when the
-///           preview row budget grows on a wider terminal).
-/// The title line "OCTOS" is rendered separately by the preview
-/// frame, so this body intentionally repeats the wordmark in
-/// ASCII below the tagline for users on wide terminals while
-/// keeping the most important content in the first row.
+/// M22 (#58): first-run ASCII splash, shown in the onboarding preview
+/// pane — a one-line tagline above the OCTOS figlet wordmark. The title
+/// line "OCTOS" is rendered separately by the preview frame.
 const ONBOARDING_SPLASH_ASCII: &str = "\
-  Welcome to Octos — local solo onboarding
-  [ O ][ C ][ T ][ O ][ S ]
-   ____   ____ _____ ___  ____
-  / __ \\ / ___|_   _/ _ \\/ ___|
- | |  | | |     | || | | \\___ \\
- | |__| | |___  | || |_| |___) |
-  \\____/ \\____| |_| \\___/|____/
-
-       .-''''-.
-    .-'  o  o  '-.
-   /      __      \\
-   \\   .-'  '-.   /
- ~~~\\_/  /\\/\\  \\_/~~~
-      \\_/ /\\ \\_/";
+  Welcome to Octos — Your Coding Buddy
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~ ██████╗  ██████╗████████╗ ██████╗ ███████╗~
+~██╔═══██╗██╔════╝╚══██╔══╝██╔═══██╗██╔════╝~
+~██║   ██║██║        ██║   ██║   ██║███████╗~
+~██║   ██║██║        ██║   ██║   ██║╚════██║~
+~╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║~
+~ ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~";
 
 fn onboarding_family_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let Some(catalog) = ctx.app.profile_llm_catalog else {
@@ -4645,6 +4633,25 @@ mod tests {
             assert_eq!(spec.id, MenuId::from(id));
             assert!(!spec.title.is_empty());
         }
+    }
+
+    #[test]
+    fn slash_command_menu_has_no_routing_preview_pane() {
+        // Regression: the slash-command menu must NOT carry the static "Routing"
+        // preview — it was non-actionable internal info, and the two-pane split
+        // collided its text with the command column. Full-width list instead.
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot::default(),
+            terminal: TerminalSize::default(),
+            theme_name: Some("terminal"),
+            selected_path: &[],
+        };
+        let spec = help_menu(&ctx);
+        assert!(
+            spec.preview.is_none(),
+            "slash-command menu should render full-width (no Routing preview pane)"
+        );
     }
 
     #[test]

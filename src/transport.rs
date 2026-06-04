@@ -23,7 +23,8 @@ use octos_core::ui_protocol::{
     UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1, UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1,
     UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1, UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1,
     UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1, UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1,
-    UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1, UI_PROTOCOL_V1,
+    UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1, UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1,
+    UI_PROTOCOL_V1,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde_json::Value;
@@ -1395,7 +1396,7 @@ fn websocket_request(
     request.headers_mut().insert(
         "X-Octos-Ui-Features",
         format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}"
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}"
         )
         .parse()
         .wrap_err("failed to build UI protocol feature header")?,
@@ -3016,6 +3017,7 @@ impl MockAppUiBackend {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: Some(turn_id.clone()),
         }));
         self.enqueue_protocol(UiNotification::TaskOutputDelta(TaskOutputDeltaEvent {
             session_id: session_id.clone(),
@@ -3052,6 +3054,7 @@ impl MockAppUiBackend {
             summary: None,
             artifact_count: None,
             runtime_policy_stamp: None,
+            turn_id: Some(turn_id.clone()),
         }));
         self.enqueue_protocol(UiNotification::Warning(WarningEvent {
             session_id: session_id.clone(),
@@ -3102,6 +3105,7 @@ impl AppUiBackend for MockAppUiBackend {
                 state: TaskRuntimeState::Running,
                 runtime_detail: Some("Spec + types drafted in octos-core".into()),
                 output_tail: "bootstrap: seeded mock session\n".into(),
+                turn_id: None,
             }],
             live_reply: None,
         };
@@ -3122,6 +3126,7 @@ impl AppUiBackend for MockAppUiBackend {
                 state: TaskRuntimeState::Completed,
                 runtime_detail: Some("Checklist written in docs/".into()),
                 output_tail: "review: m8 gate recorded\n".into(),
+                turn_id: None,
             }],
             live_reply: None,
         };
@@ -5385,7 +5390,7 @@ mod tests {
         )
         .expect("request builds");
         let expected_features = format!(
-            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}"
+            "{UI_PROTOCOL_FEATURE_APPROVAL_TYPED_V1}, {UI_PROTOCOL_FEATURE_PANE_SNAPSHOTS_V1}, {UI_PROTOCOL_FEATURE_SESSION_WORKSPACE_CWD_V1}, {UI_PROTOCOL_FEATURE_CODING_AUTONOMY_V1}, {UI_PROTOCOL_FEATURE_CODING_AGENT_CONTROL_V1}, {UI_PROTOCOL_FEATURE_CODING_GOAL_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_CODING_LOOP_RUNTIME_V1}, {UI_PROTOCOL_FEATURE_HARNESS_TASK_CONTROL_V1}, {UI_PROTOCOL_FEATURE_SESSION_HYDRATE_V1}"
         );
 
         assert_eq!(

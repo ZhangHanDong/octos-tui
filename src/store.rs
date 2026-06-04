@@ -8,8 +8,8 @@ use octos_core::ui_protocol::{
     ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionOpenParams,
     TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
     TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnSpawnCompleteEvent, TurnStartParams, TurnStateGetParams,
-    UiContextState, UiNotification, UiProgressEvent,
+    TurnInterruptParams, TurnLifecycleState, TurnSpawnCompleteEvent, TurnStartParams,
+    TurnStateGetParams, UiContextState, UiNotification, UiProgressEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -41,6 +41,7 @@ use crate::{
         SessionRuntimeStatus, SessionToolCatalog, SessionView, TaskView, ToolConfigDeleteParams,
         ToolConfigListParams, ToolConfigSetEnabledParams, ToolConfigTestParams,
         ToolConfigUpsertParams, complete_plan_steps_in_text, task_state_label,
+        terminal_task_state_from_agent_status,
     },
 };
 
@@ -104,6 +105,16 @@ fn compact_first_line(value: &str, max_chars: usize) -> String {
     out
 }
 
+/// Compact token-count for the compaction activity notice: `31200` -> `31.2k`,
+/// small counts stay verbatim.
+fn humanize_token_count(tokens: usize) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
 fn push_unique_summary(values: &mut Vec<String>, value: String) {
     if value.is_empty() || values.iter().any(|existing| existing == &value) {
         return;
@@ -136,6 +147,29 @@ fn looks_like_partial_live_answer(text: &str) -> bool {
         .chars()
         .next_back()
         .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | ':' | ')' | ']' | '`'))
+}
+
+/// Finalize the accumulated `live_reply` text into the assistant message body
+/// for a turn that just completed. Empty streams fall back to the summary card;
+/// non-empty streams may be appended with a partial-answer note or have their
+/// plan checkboxes completed. Shared by `commit_live_reply` (matched-turn arm)
+/// and the lazy-bind path so a continuation turn renders the same way whether
+/// or not its `TurnStarted` was delivered.
+fn finalize_live_reply_text(
+    text: String,
+    complete_live_plan: bool,
+    fallback_summary: &str,
+    partial_fallback_summary: &str,
+) -> String {
+    if text.trim().is_empty() {
+        fallback_summary.to_string()
+    } else if complete_live_plan && looks_like_partial_live_answer(&text) {
+        format!("{}\n\n{}", text.trim_end(), partial_fallback_summary)
+    } else if complete_live_plan {
+        complete_plan_steps_in_text(&text)
+    } else {
+        text
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3502,12 +3536,23 @@ impl Store {
         match event.result {
             AutonomyResult::AgentList(result) => {
                 let count = result.agents.len();
+                // Stuck-chip reconnect safety net: on session reopen the
+                // `agent/list` snapshot carries the authoritative terminal
+                // status for each background agent. Reconcile any stale
+                // running `session.tasks` entry against it so a chip that was
+                // pinned on "Orchestrating…" before the reconnect flips even
+                // if the live terminal `agent/updated` was missed while
+                // disconnected.
+                for agent in &result.agents {
+                    self.reconcile_task_from_agent_record(&result.session_id, agent);
+                }
                 self.state
                     .set_session_agents(&result.session_id, result.agents);
                 self.state.status = format!("Agent list refreshed: {count} agent(s)");
             }
             AutonomyResult::AgentStatus(result) => {
                 let agent_id = result.agent.agent_id.clone();
+                self.reconcile_task_from_agent_record(&result.session_id, &result.agent);
                 self.state
                     .upsert_session_agent(&result.session_id, result.agent);
                 self.state.status = format!("Agent {agent_id} status updated");
@@ -3961,6 +4006,19 @@ impl Store {
                             error.code, error.message
                         )
                     };
+                } else if error.code == "frame_too_large" {
+                    // Recoverable pre-send rejection: the frame (e.g. a large
+                    // inline turn input or paste) exceeded the 1 MB UI-protocol
+                    // cap. The connection + session are fine — surface an
+                    // actionable message rather than a raw "Error [...]" and do
+                    // NOT wedge the session in Error (mini5: a 1.1 MB inline send
+                    // left the session stuck in Error, unrecoverable). The
+                    // local-create attribution above runs first so the wizard's
+                    // pending-clear is preserved.
+                    self.state.status = format!(
+                        "Message too large — {}. Shorten it or attach as a file.",
+                        error.message
+                    );
                 } else if is_client_synth_error {
                     // Surfaced for the user but does NOT touch the
                     // local-create pending state.
@@ -3993,7 +4051,13 @@ impl Store {
                     )
                     .with_detail("app-ui error"),
                 );
-                self.state.set_run_state_error(error.message);
+                if error.code == "frame_too_large" {
+                    // Recoverable — keep the session usable (idle) instead of
+                    // wedging it in Error on an oversized inline send.
+                    self.state.set_run_state_idle();
+                } else {
+                    self.state.set_run_state_error(error.message);
+                }
                 None
             }
         };
@@ -4154,7 +4218,12 @@ impl Store {
         if let Some(messages) = projected_messages {
             if let Some(session) = self.find_session_mut(&session_id) {
                 session.messages = messages;
-                session.live_reply = None;
+                // codex P1: do NOT clear `live_reply` here. The hydrate result
+                // is COMMITTED history only; `live_reply` holds the turn that is
+                // still streaming. On a mid-turn reconnect, clearing it silently
+                // dropped the rest of that turn's deltas (the turn froze). Keep
+                // it — subsequent deltas keep appending and `TurnCompleted` still
+                // commits it normally.
             } else {
                 self.state.sessions.push(SessionView {
                     id: session_id.clone(),
@@ -4190,23 +4259,57 @@ impl Store {
                 });
         }
 
-        if let Some(turns) = result.turns.as_ref()
-            && self.state.turn_state_detail.active
-            && let Some(active_turn) = turns.last()
-        {
-            self.state
-                .turn_state_detail
-                .open(&octos_core::ui_protocol::TurnStateGetResult {
-                    session_id: session_id.clone(),
-                    turn_id: active_turn.turn_id.clone(),
-                    state: active_turn.state,
-                    context: result.context.clone(),
-                    context_state: result.context_state.clone(),
-                    started_at: active_turn.started_at,
-                    completed_at: active_turn.completed_at,
-                    thread_id: active_turn.thread_id.clone(),
-                    committed_seqs: Vec::new(),
-                });
+        if let Some(turns) = result.turns.as_ref() {
+            // GAP 1: orphan activity-chip self-heal on the rehydrate path. A
+            // client rehydrating a session whose turn is already TERMINAL
+            // (Completed/Errored/Interrupted) but that still carries a stranded
+            // running-status activity item (a `ToolStarted` whose `ToolCompleted`
+            // never arrived) would otherwise pin "Orchestrating…" forever after
+            // reconnect — the hydrate path never ran the terminal reconcile that
+            // the live `TurnCompleted`/`TurnError` chokepoint does. Reconcile each
+            // genuinely-terminal hydrated turn here, sharing the exact same sweep.
+            //
+            // NEVER reconcile the session's currently-active/live turn: its
+            // running work is legitimately in-flight. The local `live_reply` turn
+            // is the source of truth for "still streaming", so we skip it even if
+            // the snapshot were to mislabel it terminal.
+            let live_turn_id = self
+                .state
+                .sessions
+                .iter()
+                .find(|session| session.id == session_id)
+                .and_then(|session| session.live_reply.as_ref())
+                .map(|live_reply| live_reply.turn_id.clone());
+            for turn in turns {
+                let is_terminal = matches!(
+                    turn.state,
+                    TurnLifecycleState::Completed
+                        | TurnLifecycleState::Errored
+                        | TurnLifecycleState::Interrupted
+                );
+                if is_terminal && live_turn_id.as_ref() != Some(&turn.turn_id) {
+                    self.state
+                        .reconcile_terminal_turn_running_activity(&turn.turn_id);
+                }
+            }
+
+            if self.state.turn_state_detail.active
+                && let Some(active_turn) = turns.last()
+            {
+                self.state
+                    .turn_state_detail
+                    .open(&octos_core::ui_protocol::TurnStateGetResult {
+                        session_id: session_id.clone(),
+                        turn_id: active_turn.turn_id.clone(),
+                        state: active_turn.state,
+                        context: result.context.clone(),
+                        context_state: result.context_state.clone(),
+                        started_at: active_turn.started_at,
+                        completed_at: active_turn.completed_at,
+                        thread_id: active_turn.thread_id.clone(),
+                        committed_seqs: Vec::new(),
+                    });
+            }
         }
 
         if let Some(approvals) = result.pending_approvals {
@@ -4548,6 +4651,36 @@ impl Store {
     }
 
     fn apply_progress(&mut self, event: UiProgressEvent) -> Option<AppUiCommand> {
+        // Retain the latest cumulative usage (tokens + session cost) per session
+        // for the whole-job indicator. Merge so a partial update (only cost, or
+        // only tokens) doesn't wipe the other field.
+        if let Some(token_cost) = event.metadata.token_cost.as_ref() {
+            let entry = self
+                .state
+                .session_usage
+                .entry(event.session_id.clone())
+                .or_insert((None, None, None));
+            if token_cost.input_tokens.is_some() {
+                entry.0 = token_cost.input_tokens;
+            }
+            if token_cost.output_tokens.is_some() {
+                entry.1 = token_cost.output_tokens;
+            }
+            if token_cost.session_cost.is_some() {
+                entry.2 = token_cost.session_cost;
+            }
+        }
+        // Gap 2 fix #3: surface the `UiRetryBackoff` carried on
+        // `metadata.retry` (previously ignored) so the harness status row can
+        // render "retrying (attempt N)". A non-retry progress event clears the
+        // stale entry so a settled turn doesn't linger as "retrying".
+        if let Some(retry) = event.metadata.retry.as_ref() {
+            self.state
+                .session_retry
+                .insert(event.session_id.clone(), retry.clone());
+        } else {
+            self.state.session_retry.remove(&event.session_id);
+        }
         let status = progress_status(&event);
         let record_activity = should_record_progress_activity(&event);
         let diff_preview_request = event.metadata.file_mutation.as_ref().and_then(|notice| {
@@ -4677,11 +4810,34 @@ impl Store {
                 None
             }
             UiNotification::TurnStarted(event) => {
+                // A new turn for the active session starts a fresh live_reply
+                // UNCONDITIONALLY — server-INITIATED master-continuation turns
+                // (reason=child_completed / scatter_join_complete) carry no
+                // client-side handle, yet their assistant stream must render.
+                // If a prior turn's live_reply is still bound (its TurnCompleted
+                // was missed or this turn started before it committed), commit
+                // the prior answer first so it is neither lost nor merged.
+                // (No-op when the bound buffer is for the SAME turn — that case
+                // is the lazy-bind/replay race handled just below.)
+                self.commit_pending_live_reply_for_turn_switch(&event.session_id, &event.turn_id);
                 if let Some(session) = self.find_session_mut(&event.session_id) {
-                    session.live_reply = Some(LiveReply {
-                        turn_id: event.turn_id,
-                        text: String::new(),
-                    });
+                    // Out-of-order lifecycle (nit 1): a MessageDelta may have
+                    // already lazy-bound THIS turn before its TurnStarted was
+                    // delivered/replayed. Replacing the buffer unconditionally
+                    // would wipe the accumulated text, so preserve a buffer that
+                    // is already bound to the same turn; only bind a fresh empty
+                    // one when there is no buffer (the prior turn was committed/
+                    // dropped above for the different-turn case).
+                    let same_turn_already_bound = session
+                        .live_reply
+                        .as_ref()
+                        .is_some_and(|live_reply| live_reply.turn_id == event.turn_id);
+                    if !same_turn_already_bound {
+                        session.live_reply = Some(LiveReply {
+                            turn_id: event.turn_id,
+                            text: String::new(),
+                        });
+                    }
                     self.state.status = format!("Turn started in {}", session.title);
                     self.state.set_run_state_in_progress();
                 }
@@ -4694,14 +4850,36 @@ impl Store {
                 ..
             }) => {
                 let follow_tail = self.state.transcript_scroll == 0;
+                // Lazy-bind: a delta whose turn_id has no current live_reply
+                // binding (None, or a binding for an OLDER turn) must still be
+                // accumulated — never dropped. This covers continuation turns
+                // whose `TurnStarted` was not delivered to this connection, so
+                // the first frame the client sees for the turn is a delta. When
+                // switching to a new turn_id, commit/close the prior turn's
+                // live_reply first so its answer is preserved.
+                let needs_bind = self
+                    .find_session(&session_id)
+                    .and_then(|session| session.live_reply.as_ref())
+                    .map(|live_reply| live_reply.turn_id != turn_id)
+                    .unwrap_or(true);
+                if needs_bind {
+                    self.commit_pending_live_reply_for_turn_switch(&session_id, &turn_id);
+                }
                 let mut reset_scroll = false;
                 if let Some(session) = self.find_session_mut(&session_id) {
-                    if let Some(live_reply) = session.live_reply.as_mut() {
-                        if live_reply.turn_id == turn_id {
-                            live_reply.text.push_str(&text);
-                            reset_scroll = true;
-                        }
+                    let live_reply = session.live_reply.get_or_insert_with(|| LiveReply {
+                        turn_id: turn_id.clone(),
+                        text: String::new(),
+                    });
+                    if live_reply.turn_id == turn_id {
+                        live_reply.text.push_str(&text);
+                        reset_scroll = true;
                     }
+                }
+                if needs_bind && reset_scroll {
+                    // A delta-first continuation turn (its TurnStarted was not
+                    // delivered) is genuinely streaming — reflect the active run.
+                    self.state.set_run_state_in_progress();
                 }
                 if reset_scroll && follow_tail {
                     self.state.scroll_transcript_to_latest();
@@ -4899,11 +5077,25 @@ impl Store {
                 let status_label = event.agent.status.clone();
                 self.state
                     .upsert_session_agent(&event.session_id, event.agent.clone());
+                // Stuck-chip safety net: a spawn_only background task that
+                // outlives its spawning turn goes terminal only AFTER the
+                // per-turn task-progress channel was torn down, so the
+                // terminal `task/updated` never arrives and `session.tasks`
+                // stays "running" — pinning the chip on "Orchestrating…". The
+                // DURABLE terminal `agent/updated` (delivered via the ledger)
+                // carries `task_id` + a terminal status, so reconcile the
+                // matching task's state from the agent record. Only terminal
+                // statuses flip the task — a "running" record must never
+                // resurrect a task the client already saw go terminal.
+                self.reconcile_task_from_agent_record(&event.session_id, &event.agent);
                 self.state.push_activity(
-                    ActivityItem::new(ActivityKind::Progress, title.clone(), status_label)
+                    ActivityItem::new(ActivityKind::Progress, title, status_label)
                         .with_detail(detail),
                 );
-                self.state.status = format!("Agent status refreshed: {title}");
+                // Don't churn the status bar with "Agent status refreshed: …" on
+                // every agent-status event — during a multi-agent turn that floods
+                // the bottom line. The activity item above already surfaces it; the
+                // status bar is reserved for low-frequency, meaningful state.
                 None
             }
             UiNotification::AgentOutputDelta(event) => {
@@ -5051,6 +5243,50 @@ impl Store {
                     .apply_compaction(state, compaction);
                 self.state.status =
                     format!("Context compaction {compaction_id}: {compaction_status}");
+                // Codex-style surface: also leave a PERSISTENT activity row so
+                // the user actually sees that context was compacted. The
+                // `status` line above is a shared single-line string that the
+                // per-turn `context/normalization_reported` (and the next user
+                // action) immediately overwrites, so on its own it is
+                // effectively invisible. A successful compaction is an
+                // infrequent, notable event worth a durable notice.
+                if event.compaction.error.is_none() {
+                    let before = event.compaction.token_estimate_before;
+                    let after = event.compaction.token_estimate_after.unwrap_or(before);
+                    // codex P2: stamp the notice with the session's in-flight
+                    // turn. Compaction is reported DURING the turn that
+                    // triggered it (after `TurnStarted` set `live_reply`), and
+                    // the renderer suppresses turnless activities while a turn
+                    // is active + `capture_completed_turn_activity` only
+                    // archives turn-scoped items. A turnless notice would be
+                    // hidden exactly when it fires and never persisted; attach
+                    // it to the live turn so it shows and is archived with the
+                    // turn. (Falls back to turnless only if no turn is live —
+                    // e.g. the connection-independent drain.)
+                    let turn_id = self.find_session_mut(&session_id).and_then(|session| {
+                        session.live_reply.as_ref().map(|live| live.turn_id.clone())
+                    });
+                    let mut notice = ActivityItem::new(
+                        ActivityKind::Progress,
+                        "context compacted",
+                        format!(
+                            "{} → {} tokens",
+                            humanize_token_count(before),
+                            humanize_token_count(after)
+                        ),
+                    );
+                    notice.detail = Some(format!(
+                        "kept {} message(s), dropped {} (trigger: {})",
+                        event.compaction.retained_count,
+                        event.compaction.dropped_count,
+                        event.compaction.trigger,
+                    ));
+                    notice.success = Some(true);
+                    if let Some(turn_id) = turn_id {
+                        notice = notice.with_turn(turn_id);
+                    }
+                    self.state.push_activity(notice);
+                }
                 None
             }
             UiNotification::ContextNormalizationReported(event) => {
@@ -5076,11 +5312,32 @@ impl Store {
                     synthetic_count: event.normalization.synthetic_count,
                     truncated_count: event.normalization.truncated_count,
                 };
-                let prompt_count = event.normalization.prompt_message_count;
                 self.state
                     .context_lifecycle_mut(&session_id)
                     .apply_normalization(state, normalization);
-                self.state.status = format!("Context normalized: {prompt_count} prompt messages");
+                // Gap 2 fix #4: do NOT write the shared status line here.
+                // Normalization is a background lifecycle signal that fires
+                // every turn; clobbering `status` overwrote meaningful state
+                // (e.g. "compacting…"). The report still lands in the
+                // per-session lifecycle ledger above for the inspector.
+                None
+            }
+            UiNotification::SessionOrchestration(event) => {
+                // Whole-job status for the composer top-border indicator. Keep
+                // it only while active; drop on the terminal active:false so the
+                // indicator hides when the job (turn + sub-agents +
+                // continuations) is fully done.
+                if event.active {
+                    self.state
+                        .orchestration
+                        .insert(event.session_id.clone(), event);
+                } else {
+                    // Blocking bug 2 (belt-and-suspenders): the whole job is
+                    // done — drop the indicator AND any stale retry so it cannot
+                    // linger across the terminal orchestration boundary.
+                    self.state.orchestration.remove(&event.session_id);
+                    self.state.session_retry.remove(&event.session_id);
+                }
                 None
             }
         }
@@ -5108,24 +5365,31 @@ impl Store {
                         session.messages.push(message);
                     }
                 }
-                self.state.status = format!("User message projected for {thread_id}");
+                // Envelope projection is internal bookkeeping — don't leak the
+                // thread_id into the status bar on every projected message (it
+                // churned "… projected for <thread_id>" at the bottom of the
+                // composer). The transcript already reflects the message.
                 None
             }
             Payload::AssistantDelta { text } => {
                 self.upsert_envelope_assistant_message(&session_id, &thread_id, text, false);
-                self.state.status = format!("Assistant delta projected for {thread_id}");
+                // Streaming deltas arrive many times per second; writing the
+                // status bar each time flooded the bottom line with "Assistant
+                // delta projected for <thread_id>". The streamed text is already
+                // visible in the transcript — leave the status line stable.
                 None
             }
             Payload::AssistantPersisted { text, .. } => {
                 self.upsert_envelope_assistant_message(&session_id, &thread_id, text, true);
-                self.state.status = format!("Assistant message persisted for {thread_id}");
+                // Same as AssistantDelta: internal projection, not status-bar news.
                 None
             }
             Payload::ToolStart { tool_call_id, name } => {
                 self.state.push_activity(
                     ActivityItem::new(ActivityKind::Tool, name.clone(), "running")
                         .with_tool_call(tool_call_id.clone())
-                        .with_detail(format!("thread {thread_id}")),
+                        .with_session(session_id.clone())
+                        .with_detail(AppState::envelope_tool_detail_for_thread(&thread_id)),
                 );
                 self.state.set_run_state_in_progress();
                 self.state.status = format!("Tool started: {name} ({tool_call_id})");
@@ -5184,6 +5448,15 @@ impl Store {
                 None
             }
             Payload::TurnCompleted { .. } => {
+                // GAP 2: this envelope is a hard terminal barrier for this
+                // session's thread. Heal any stranded running tool item the
+                // envelope path started for this session+thread (a `ToolStart`
+                // whose `ToolEnd` never arrived) so it can no longer pin a
+                // turn-less "Orchestrating…" chip. Scoped to `session_id` so a
+                // thread_id shared with another session cannot suppress that
+                // sibling's genuinely-active chip.
+                self.state
+                    .reconcile_envelope_thread_running_activity(&session_id, &thread_id);
                 self.state.status = format!("Turn completed for {thread_id}");
                 self.state.set_run_state_success();
                 self.submit_next_pending_if_idle()
@@ -5357,6 +5630,37 @@ impl Store {
         None
     }
 
+    /// Reconcile a `session.tasks` entry's lifecycle state from a durable
+    /// `agent/updated` record. See the call site in the `AgentUpdated` arm for
+    /// why this exists (terminal flip for a task whose per-turn task-progress
+    /// channel was already gone). Only TERMINAL agent statuses flip a task that
+    /// is still pending/running — a non-terminal record never overwrites a task
+    /// the client already saw settle, and a record with no `task_id` is a no-op.
+    fn reconcile_task_from_agent_record(
+        &mut self,
+        session_id: &SessionKey,
+        agent: &octos_core::ui_protocol::UiAgentRecord,
+    ) {
+        let Some(terminal_state) = terminal_task_state_from_agent_status(&agent.status) else {
+            return;
+        };
+        let Some(task_id) = agent
+            .task_id
+            .as_deref()
+            .and_then(|id| id.parse::<TaskId>().ok())
+        else {
+            return;
+        };
+        let Some(session) = self.find_session_mut(session_id) else {
+            return;
+        };
+        if let Some(task) = session.tasks.iter_mut().find(|task| task.id == task_id) {
+            if matches!(task_state_label(task.state), "pending" | "running") {
+                task.state = terminal_state;
+            }
+        }
+    }
+
     fn apply_task_update(&mut self, event: TaskUpdatedEvent) {
         let Some(session) = self.find_session_mut(&event.session_id) else {
             return;
@@ -5369,6 +5673,12 @@ impl Store {
         {
             task.state = event.state;
             task.runtime_detail = event.runtime_detail;
+            // C5: keep the originating turn so the chip can attribute this task
+            // per-turn. Never clobber a known turn with a later turn-less update
+            // (synthetic / replay emitters send `turn_id: None`).
+            if event.turn_id.is_some() {
+                task.turn_id = event.turn_id;
+            }
         } else {
             session.tasks.push(TaskView {
                 id: event.task_id,
@@ -5376,6 +5686,7 @@ impl Store {
                 state: event.state,
                 runtime_detail: event.runtime_detail,
                 output_tail: String::new(),
+                turn_id: event.turn_id,
             });
         }
     }
@@ -5411,6 +5722,20 @@ impl Store {
     }
 
     fn commit_live_reply(&mut self, event: TurnCompletedEvent) -> Option<AppUiCommand> {
+        // Idempotence vs a turn-switch: if this turn was ALREADY finalized
+        // (committed or dropped) by `commit_pending_live_reply_for_turn_switch`,
+        // its late terminal is a no-op. Without this the late terminal would hit
+        // the `None` arm (when its successor already completed) and emit a FALSE
+        // "did not receive a final assistant answer" fallback for a turn that
+        // committed cleanly, or be swallowed by the `Some(mismatched)` arm —
+        // either way mishandling the already-closed turn. Consume the marker so
+        // a genuine future terminal for the same turn id is unaffected.
+        if self
+            .state
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id)
+        {
+            return None;
+        }
         let seq = event.cursor.map(|cursor| cursor.seq).unwrap_or(0);
         let follow_tail = self.state.transcript_scroll == 0;
         let complete_live_plan = self.turn_had_completion_activity(&event.turn_id);
@@ -5424,20 +5749,12 @@ impl Store {
             let title = session.title.clone();
             match session.live_reply.take() {
                 Some(live_reply) if live_reply.turn_id == event.turn_id => {
-                    let text = if live_reply.text.trim().is_empty() {
-                        fallback_summary
-                    } else if complete_live_plan && looks_like_partial_live_answer(&live_reply.text)
-                    {
-                        format!(
-                            "{}\n\n{}",
-                            live_reply.text.trim_end(),
-                            partial_fallback_summary
-                        )
-                    } else if complete_live_plan {
-                        complete_plan_steps_in_text(&live_reply.text)
-                    } else {
-                        live_reply.text
-                    };
+                    let text = finalize_live_reply_text(
+                        live_reply.text,
+                        complete_live_plan,
+                        &fallback_summary,
+                        &partial_fallback_summary,
+                    );
                     session.messages.push(Message::assistant(text));
                     (
                         format!("Turn completed in {title} at seq {seq}"),
@@ -5472,6 +5789,16 @@ impl Store {
         }
         self.state.status = status;
         if completed_current_turn {
+            // Blocking bug 2: terminal completion clears any stale retry/backoff
+            // for the session. `session_retry` was only cleared on the next
+            // non-retry PROGRESS event, so a retry immediately followed by
+            // `TurnCompleted` left a stale entry that could render "retrying" on
+            // a LATER active orchestration. Terminal = no retry in flight.
+            //
+            // Over-clear fix: only clear when this terminal applies to the LIVE
+            // turn. A STALE `TurnCompleted` (mismatched turn_id) preserves the
+            // live reply above, so it must also preserve the live turn's retry.
+            self.state.session_retry.remove(&event.session_id);
             self.state
                 .capture_completed_turn_activity(&event.session_id, &event.turn_id);
             self.state.set_run_state_success();
@@ -5480,6 +5807,22 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // Idempotence vs a turn-switch (see `commit_live_reply`): the
+        // finalized-by-switch marker suppresses only a false COMPLETION
+        // fallback — it must NEVER hide a real ERROR. A turn finalized at a
+        // switch boundary (its text already committed, or it was an empty turn
+        // that was dropped) can still genuinely ERROR afterwards, and that
+        // failure must be surfaced (failure card + run-state Error), even though
+        // its partial text may already stand. So we CONSUME the marker for
+        // cleanup (so it cannot leak and mishandle a later same-id event) but
+        // then FALL THROUGH to the normal fail-path arms rather than
+        // early-returning `None`. Both orderings are handled below: B already
+        // completed (live_reply == None → the `None` arm pushes the failure
+        // card) and B still live (the `Some(mismatched)` arm preserves B's
+        // live_reply but still surfaces A's failure via the run-state error).
+        let was_finalized_by_switch = self
+            .state
+            .take_turn_finalized_by_switch(&event.session_id, &event.turn_id);
         let follow_tail = self.state.transcript_scroll == 0;
         let fallback_summary =
             self.turn_error_fallback_message(&event.turn_id, &event.code, &event.message);
@@ -5487,7 +5830,13 @@ impl Store {
             return None;
         };
         let title = session.title.clone();
-        let (status, failed_current_turn) = match session.live_reply.take() {
+        // `failed_current_turn`: this error terminates the LIVE turn — it owns
+        // the retry-clear and the live-turn run-state transition.
+        // `surfaced_failure`: a failure card was pushed for this error. These
+        // coincide except for a switch-finalized turn whose error arrives while
+        // a DIFFERENT successor turn is still live: there we surface the failure
+        // (card + error run-state) without disturbing the live successor.
+        let (status, failed_current_turn, surfaced_failure) = match session.live_reply.take() {
             Some(live_reply) if live_reply.turn_id == event.turn_id => {
                 let partial = compact_first_line(&live_reply.text, 120);
                 let text = if partial.is_empty() {
@@ -5499,12 +5848,29 @@ impl Store {
                 (
                     format!("Turn error {}: {}", event.code, event.message),
                     true,
+                    true,
+                )
+            }
+            Some(live_reply) if was_finalized_by_switch => {
+                // A switch-finalized turn (A) errors while a different successor
+                // turn (B) is still live: surface A's failure card but PRESERVE
+                // B's in-flight live_reply untouched — the error is A's, not B's.
+                // A's (partial) text was already committed at switch time, so
+                // the card is the bare error summary (no partial-response tail
+                // here; that tail belongs to the live-turn arm above).
+                session.messages.push(Message::assistant(fallback_summary));
+                session.live_reply = Some(live_reply);
+                (
+                    format!("Turn error {}: {}", event.code, event.message),
+                    false,
+                    true,
                 )
             }
             Some(live_reply) => {
                 session.live_reply = Some(live_reply);
                 (
                     format!("Ignored stale turn error in {title}: {}", event.code),
+                    false,
                     false,
                 )
             }
@@ -5513,10 +5879,11 @@ impl Store {
                 (
                     format!("Turn error {}: {}", event.code, event.message),
                     true,
+                    true,
                 )
             }
         };
-        if failed_current_turn {
+        if surfaced_failure {
             if follow_tail {
                 self.state.scroll_transcript_to_latest();
             } else {
@@ -5527,6 +5894,19 @@ impl Store {
         }
         self.state.status = status;
         if failed_current_turn {
+            // Blocking bug 2: terminal error also clears any stale retry/backoff
+            // for the session (see `commit_live_reply`) so it can never linger
+            // and render on a later orchestration.
+            //
+            // Over-clear fix: only clear when this terminal applies to the LIVE
+            // turn. A STALE `TurnError` (mismatched turn_id) preserves the live
+            // reply above, so it must also preserve the live turn's retry. A
+            // switch-finalized turn's late error that surfaces while a different
+            // turn is live (`!failed_current_turn`) likewise leaves the live
+            // turn's retry alone.
+            self.state.session_retry.remove(&event.session_id);
+        }
+        if surfaced_failure {
             self.state
                 .set_run_state_error(format!("{}: {}", event.code, event.message));
         }
@@ -5554,6 +5934,99 @@ impl Store {
             .sessions
             .iter_mut()
             .find(|session| &session.id == session_id)
+    }
+
+    fn find_session(&self, session_id: &octos_core::SessionKey) -> Option<&SessionView> {
+        self.state
+            .sessions
+            .iter()
+            .find(|session| &session.id == session_id)
+    }
+
+    /// Before binding a fresh `live_reply` for `new_turn`, commit any currently
+    /// bound live_reply that belongs to a DIFFERENT turn. This is the
+    /// turn-switch boundary for the lazy-bind path: when a session's turns run
+    /// sequentially (an original user turn followed by server-initiated
+    /// master-continuation turns), each turn must produce its OWN assistant
+    /// message — the prior turn's accumulated answer is neither lost nor merged
+    /// into the next turn. A prior turn that streamed NO text is dropped
+    /// silently (its eventual `TurnCompleted`, if any, is handled by the
+    /// fallback path); we only persist a prior turn that actually produced a
+    /// visible answer.
+    ///
+    /// Activity vs. assistant-message decision (DO-NOT-SHIP #2): the assistant
+    /// MESSAGE and the tool ACTIVITY are two independent artifacts. A
+    /// switch-dropped EMPTY continuation turn produces NO assistant message and
+    /// NO "did not receive a final assistant answer" fallback card by design (it
+    /// was superseded by `new_turn`). But its tool activity must NOT be lost: we
+    /// capture it into `turn_activity_logs` (the chip source) on BOTH the
+    /// non-empty and the empty-drop path, identically to the live commit path.
+    /// `capture_completed_turn_activity` archives the turn's items out of the
+    /// live `activity` flow (which is filtered to the *active* turn, so once
+    /// `new_turn` is live the prior turn's items would otherwise be orphaned —
+    /// invisible — until a late terminal that, being a no-op for a marked turn,
+    /// never captures them). Capturing here keeps the dropped-empty turn's
+    /// activity chip visible without re-introducing the false-completion card.
+    fn commit_pending_live_reply_for_turn_switch(
+        &mut self,
+        session_id: &octos_core::SessionKey,
+        new_turn: &TurnId,
+    ) {
+        let prior_turn = match self.find_session(session_id).and_then(|session| {
+            session
+                .live_reply
+                .as_ref()
+                .filter(|live_reply| &live_reply.turn_id != new_turn)
+                .map(|live_reply| live_reply.turn_id.clone())
+        }) {
+            Some(turn_id) => turn_id,
+            None => return,
+        };
+        // The switch finalizes the prior turn here (committed if non-empty,
+        // dropped if empty). Record it so its OWN late `TurnCompleted`/
+        // `TurnError` — which may still arrive on an out-of-order stream — is
+        // recognized as already-handled and no-ops instead of emitting a false
+        // fallback card or mishandling the dropped-empty case.
+        self.state
+            .mark_turn_finalized_by_switch(session_id, &prior_turn);
+        let complete_live_plan = self.turn_had_completion_activity(&prior_turn);
+        let fallback_summary = self.turn_completion_fallback_message(&prior_turn);
+        let partial_fallback_summary = self.turn_partial_completion_fallback_message(&prior_turn);
+        let follow_tail = self.state.transcript_scroll == 0;
+        let mut committed = false;
+        if let Some(session) = self.find_session_mut(session_id) {
+            // Drop a prior turn that streamed NO visible text: its eventual
+            // terminal event (if it arrives) handles the empty/fallback case;
+            // only persist a prior turn that produced a real answer.
+            if let Some(live_reply) = session
+                .live_reply
+                .take()
+                .filter(|live_reply| !live_reply.text.trim().is_empty())
+            {
+                let text = finalize_live_reply_text(
+                    live_reply.text,
+                    complete_live_plan,
+                    &fallback_summary,
+                    &partial_fallback_summary,
+                );
+                session.messages.push(Message::assistant(text));
+                committed = true;
+            }
+        }
+        // Capture the prior turn's tool activity on BOTH paths (committed
+        // non-empty AND dropped empty) so a switch-dropped empty turn's chip
+        // stays visible — see the method doc. This is a no-op when the turn ran
+        // no activity (`capture_completed_turn_activity` returns early), so the
+        // genuinely-empty no-activity case is unaffected.
+        self.state
+            .capture_completed_turn_activity(session_id, &prior_turn);
+        if committed {
+            if follow_tail {
+                self.state.scroll_transcript_to_latest();
+            } else {
+                self.state.preserve_transcript_position_after_append(3);
+            }
+        }
     }
 
     fn turn_completion_fallback_message(&self, turn_id: &TurnId) -> String {
@@ -5587,9 +6060,23 @@ impl Store {
 
     fn summarize_turn_activity(&self, turn_id: &TurnId) -> TurnActivitySummary {
         let mut summary = TurnActivitySummary::default();
-        for activity in self
+        // Count from where the turn's items actually live. A switch-finalized
+        // turn has ALREADY had `capture_completed_turn_activity` move its items
+        // out of the live `state.activity` into `turn_activity_logs`, so the
+        // live set is empty for it — summarizing live would report "0 action(s)"
+        // for a turn that genuinely ran N. Prefer the archived log when present;
+        // otherwise fall back to live activity (the normal in-turn path, whose
+        // items have NOT yet been archived, is therefore unchanged).
+        let archived = self
             .state
-            .activity
+            .turn_activity_logs
+            .iter()
+            .find(|log| &log.turn_id == turn_id);
+        let items: &[ActivityItem] = match archived {
+            Some(log) => &log.items,
+            None => &self.state.activity,
+        };
+        for activity in items
             .iter()
             .filter(|activity| activity.turn_id.as_ref() == Some(turn_id))
         {
@@ -6149,6 +6636,7 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
     let mut projections = rows
         .iter()
         .filter(|row| !hydrated_row_is_covered_by_envelope(row, envelopes, &envelope_message_ids))
+        .filter(|row| hydrated_row_is_displayable(row))
         .cloned()
         .map(HydratedProjection::Message)
         .collect::<Vec<_>>();
@@ -6168,6 +6656,21 @@ fn hydrated_projection_messages(result: &SessionHydrateResult) -> Option<Vec<Mes
             })
             .collect(),
     )
+}
+
+/// Whether a hydrated message row should render as a transcript bubble. The
+/// live transcript only commits user + assistant *answer* messages; the
+/// intermediate turn machinery — tool-result rows and tool-call-only assistant
+/// rows (empty text) — is surfaced as activity chips, not chat bubbles. Hydrate
+/// must match, otherwise a reconnect double-renders the turn (e.g. a tool's raw
+/// output bubble AND the assistant's formatted answer — the "repeat" bug seen on
+/// the mini5 soak: a tool turn went 2 live msgs -> 4 on reconnect).
+fn hydrated_row_is_displayable(row: &HydratedMessage) -> bool {
+    match row.role.as_str() {
+        "tool" => false,
+        "assistant" => !row.content.trim().is_empty(),
+        _ => true,
+    }
 }
 
 fn hydrated_row_is_covered_by_envelope(
@@ -6497,7 +7000,13 @@ fn is_low_value_progress_name(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
     matches!(
         normalized.as_str(),
-        "thinking"
+        // Persona spinner words (`progress/updated{kind:"status_word"}`,
+        // octos-core progress_kinds::STATUS_WORD) belong in the status line, not
+        // the activity log. The words themselves are dynamic (LLM-generated), so
+        // filter on the stable `kind`, never the word — otherwise the chip counts
+        // "Composing/Contemplating/…" as fake "active actions" with no real work.
+        "status_word"
+            | "thinking"
             | "response"
             | "stream_start"
             | "stream_end"
@@ -6530,8 +7039,9 @@ mod tests {
         EnvelopeNotification, HydratedMessage, HydratedTurn, OutputCursor, Payload, PreviewId,
         ReplayLossyEvent, SessionHydrateResult, TaskRuntimeState, ThreadGraphEntry,
         ToolCompletedEvent, ToolStartedEvent, TurnId, TurnLifecycleState, TurnSpawnCompleteEvent,
-        UiContextState, UiCursor, UiFileMutationNotice, UiProgressMetadata, UiProtocolCapabilities,
-        UiTokenCostUpdate, approval_kinds, approval_scopes, methods, progress_kinds,
+        TurnStartedEvent, UiContextState, UiCursor, UiFileMutationNotice, UiProgressMetadata,
+        UiProtocolCapabilities, UiTokenCostUpdate, approval_kinds, approval_scopes, methods,
+        progress_kinds,
     };
 
     fn store_with_live_reply(turn_id: TurnId, text: impl Into<String>) -> Store {
@@ -6563,6 +7073,7 @@ mod tests {
                 state: TaskRuntimeState::Running,
                 runtime_detail: None,
                 output_tail: String::new(),
+                turn_id: None,
             }],
             live_reply: None,
         };
@@ -6582,6 +7093,26 @@ mod tests {
         };
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        }
+    }
+
+    fn store_with_two_sessions(first: &str, second: &str) -> Store {
+        let make = |id: &str| SessionView {
+            id: SessionKey(id.into()),
+            title: id.into(),
+            profile_id: Some("coding".into()),
+            messages: vec![],
+            tasks: vec![],
+            live_reply: None,
+        };
+        Store {
+            state: AppState::new(
+                vec![make(first), make(second)],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
         }
     }
 
@@ -7517,6 +8048,40 @@ mod tests {
                 .is_none()
         );
         assert!(store.state.onboarding.local_profile_recovery.is_none());
+    }
+
+    /// A `frame_too_large` pre-send rejection (an oversized inline turn input
+    /// or paste over the 1 MB UI-protocol cap) must be RECOVERABLE: surface an
+    /// actionable message and keep the session usable, NOT wedge it in Error
+    /// (mini5: a 1.1 MB inline send left the session stuck in Error).
+    #[test]
+    fn frame_too_large_does_not_wedge_session_in_error() {
+        use octos_core::app_ui::AppUiError;
+
+        let mut store = store_with_empty_session();
+        store.state.set_run_state_in_progress();
+        store.apply_event(AppUiEvent::Error(AppUiError {
+            code: "frame_too_large".into(),
+            message: "UI protocol frame is 1106897 bytes; max is 1048576".into(),
+        }));
+
+        assert!(
+            !matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Error { .. }
+            ),
+            "frame_too_large must not wedge the session in Error, got {:?}",
+            store.state.run_state
+        );
+        assert!(
+            store
+                .state
+                .status
+                .to_ascii_lowercase()
+                .contains("too large"),
+            "status should be actionable: {}",
+            store.state.status
+        );
     }
 
     /// M22-B: a pre-send rejection (e.g. `frame_too_large`) for the
@@ -9755,6 +10320,240 @@ mod tests {
     }
 
     #[test]
+    fn server_initiated_continuation_turn_with_turn_started_renders_its_answer() {
+        // Live-rendering bug (mini5): a single user prompt expanded into
+        // server-INITIATED master-continuation turns (reason=child_completed /
+        // scatter_join_complete). When the continuation turn's TurnStarted IS
+        // delivered, its deltas must accumulate and commit as a real assistant
+        // message — never the "did not receive a final assistant answer"
+        // fallback card.
+        let original_turn = TurnId::new();
+        let continuation = TurnId::new();
+        let mut store = store_with_live_reply(original_turn.clone(), "original answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Original user turn completes first and clears live_reply.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: original_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        // Server-initiated continuation turn: TurnStarted delivered, then deltas.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: continuation.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        for chunk in ["the ", "answer"] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+                MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: continuation.clone(),
+                    text: chunk.into(),
+                },
+            )));
+        }
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: continuation,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let contents: Vec<&str> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("the answer")),
+            "continuation answer must render: {contents:?}"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "continuation turn with deltas must NOT show the fallback card: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_turn_without_turn_started_lazy_binds_and_renders_answer() {
+        // Decisive sub-case: the continuation turn's TurnStarted is NOT delivered
+        // to this connection, so deltas arrive against `live_reply == None`. They
+        // must LAZY-BIND a fresh live_reply for the turn and accumulate, so the
+        // turn commits its real answer instead of the fallback card.
+        let original_turn = TurnId::new();
+        let continuation = TurnId::new();
+        let mut store = store_with_live_reply(original_turn.clone(), "original answer");
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: original_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(store.state.sessions[0].live_reply.is_none());
+
+        // No TurnStarted for the continuation: deltas arrive first.
+        for chunk in ["the ", "answer"] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+                MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: continuation.clone(),
+                    text: chunk.into(),
+                },
+            )));
+        }
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: continuation,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let contents: Vec<&str> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("the answer")),
+            "lazy-bound continuation answer must render: {contents:?}"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "lazy-bound continuation must NOT show the fallback card: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_turn_with_no_deltas_keeps_fallback_summary() {
+        // Regression guard: a turn that genuinely produces NO assistant deltas
+        // must still yield the fallback "did not receive a final assistant
+        // answer" summary — lazy-binding must not swallow the legitimate
+        // empty-turn case.
+        let continuation = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: continuation.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: continuation,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let message = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("fallback assistant message for empty turn");
+        assert!(
+            message
+                .content
+                .contains("did not receive a final assistant answer"),
+            "empty turn must keep its fallback card: {}",
+            message.content
+        );
+    }
+
+    #[test]
+    fn two_sequential_continuation_turns_each_render_their_own_answer() {
+        // Two server-initiated continuation turns (e.g. child_completed then
+        // scatter_join_complete), each streaming its own deltas, must each
+        // commit a DISTINCT assistant message — neither overwritten nor lost.
+        let first = TurnId::new();
+        let second = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        for (turn, body) in [(&first, "first reply"), (&second, "second reply")] {
+            store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+                MessageDeltaEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn.clone(),
+                    text: body.into(),
+                },
+            )));
+            store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+                TurnCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn.clone(),
+                    cursor: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    session_result: None,
+                },
+            )));
+        }
+
+        let contents: Vec<&str> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert!(
+            contents.iter().any(|c| c.contains("first reply")),
+            "first continuation answer lost: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains("second reply")),
+            "second continuation answer lost: {contents:?}"
+        );
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "sequential continuations must not fall back: {contents:?}"
+        );
+    }
+
+    #[test]
     fn turn_completed_captures_activity_log_for_transcript_and_clears_live_buffer() {
         let turn_id = TurnId::new();
         let mut store = store_with_live_reply(turn_id.clone(), "done");
@@ -9798,6 +10597,107 @@ mod tests {
             .expect("turn activity log");
         assert_eq!(log.request.as_deref(), Some("build the site"));
         assert_eq!(log.items.len(), 1);
+    }
+
+    #[test]
+    fn turn_completed_reconciles_leaked_running_activity_item() {
+        // Orphan activity-chip self-heal: a `ToolStarted` whose matching
+        // `ToolCompleted` never arrived (a leaked spawn_only chip / any future
+        // uncovered path) leaves a "running"-status item bound to the turn. When
+        // the turn reaches its terminal state (`TurnCompleted`) WITHOUT a
+        // completing event for that item, capturing the turn's activity must
+        // reconcile the stranded running item to a terminal display status so it
+        // can no longer count as in-flight ("Orchestrating…").
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "done");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "run job".into(),
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_id.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn activity log");
+        let leaked = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked item retained in log");
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "the leaked running item must be reconciled SPECIFICALLY to interrupted \
+             (not a false complete/failed), so it renders neutrally and reads as not-running"
+        );
+    }
+
+    #[test]
+    fn turn_error_reconciles_leaked_running_activity_item() {
+        // Same self-heal on the error terminal path: a stranded running item
+        // must be reconciled when the turn fails too.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "partial");
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.record_submitted_user_prompt(
+            session_id.clone(),
+            turn_id.clone(),
+            "run job".into(),
+        );
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_id.clone(),
+                code: "internal".into(),
+                message: "boom".into(),
+            },
+        )));
+
+        let log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_id)
+            .expect("turn activity log");
+        let leaked = log
+            .items
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked item retained in log");
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "the leaked running item must be reconciled SPECIFICALLY to interrupted on turn error \
+             (not a false complete/failed)"
+        );
     }
 
     #[test]
@@ -9936,8 +10836,15 @@ mod tests {
     }
 
     #[test]
-    fn message_delta_ignores_mismatched_turn() {
+    fn message_delta_for_new_turn_commits_prior_and_lazy_binds() {
+        // A delta whose turn_id differs from the bound live_reply is NOT a
+        // stale frame to drop — on the ordered WS stream it marks the next
+        // (e.g. server-initiated continuation) turn. The prior turn's answer is
+        // committed as its own assistant message, and a fresh live_reply binds
+        // to the new turn so its text is never lost. (Previously this delta was
+        // silently dropped — the live-rendering bug.)
         let live_turn_id = TurnId::new();
+        let next_turn_id = TurnId::new();
         let mut store = store_with_live_reply(live_turn_id, "hello");
         let session_id = store.state.sessions[0].id.clone();
 
@@ -9945,16 +10852,664 @@ mod tests {
             MessageDeltaEvent {
                 session_id,
                 topic: None,
-                turn_id: TurnId::new(),
-                text: " stale".into(),
+                turn_id: next_turn_id.clone(),
+                text: "next answer".into(),
             },
         )));
 
+        assert_eq!(
+            store.state.sessions[0]
+                .messages
+                .last()
+                .map(|m| m.content.as_str()),
+            Some("hello"),
+            "prior turn's streamed answer must be committed before the switch"
+        );
         let live_reply = store.state.sessions[0]
             .live_reply
             .as_ref()
-            .expect("live reply remains active");
-        assert_eq!(live_reply.text, "hello");
+            .expect("a fresh live reply binds to the new turn");
+        assert_eq!(live_reply.turn_id, next_turn_id);
+        assert_eq!(live_reply.text, "next answer");
+    }
+
+    #[test]
+    fn late_prior_terminal_after_switch_does_not_emit_false_fallback() {
+        // Out-of-order lifecycle: deltas lazy-bind turn A (non-empty), then a
+        // delta for turn B switches turns — A is committed by the switch — then
+        // B completes (live_reply == None). A LATE `TurnCompleted{A}` then
+        // arrives. Because A was already finalized at switch time, the late
+        // terminal must be a NO-OP: no spurious "did not receive a final
+        // assistant answer" fallback card (which the `None` arm would otherwise
+        // emit), and no duplicate commit of A's answer.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Deltas lazy-bind turn A (non-empty).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        // A delta for turn B switches turns: A is committed at the switch.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let before: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // A's committed answer is present (one copy).
+        assert_eq!(
+            before.iter().filter(|c| c.contains("answer A")).count(),
+            1,
+            "turn A must be committed exactly once before the late terminal: {before:?}"
+        );
+
+        // LATE TurnCompleted{A} arrives after B already committed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let after: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(
+            !after
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "late prior terminal after switch must NOT emit a false fallback card: {after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "late prior terminal after switch must be a no-op (no new/duplicated messages)"
+        );
+    }
+
+    #[test]
+    fn empty_prior_dropped_on_switch_late_terminal_is_noop() {
+        // Empty turn A is bound (TurnStarted, no deltas), then a delta for turn
+        // B switches turns: the empty A is DROPPED at the switch and marked as
+        // finalized-by-switch. Turn B then completes (live_reply == None). A
+        // LATE `TurnCompleted{A}` then arrives. Intended behavior: the late
+        // terminal is a NO-OP — the empty turn was already handled (dropped) at
+        // switch time. Pre-fix, this hit the `None` arm and emitted a spurious
+        // "did not receive a final assistant answer" fallback for a turn that
+        // was intentionally dropped; the finalized-by-switch marker suppresses
+        // that.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Empty turn A: TurnStarted, no deltas.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        // Switch to turn B via a delta — empty A is dropped at the switch.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // Turn B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let before: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // B committed its own answer exactly once; no fallback so far.
+        assert_eq!(
+            before.iter().filter(|c| c.contains("answer B")).count(),
+            1,
+            "turn B must commit its own answer exactly once: {before:?}"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "no fallback should exist before the late terminal: {before:?}"
+        );
+
+        // LATE TurnCompleted{A} arrives after B has completed (live_reply None).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let after: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // No spurious/duplicate fallback for the dropped empty turn.
+        assert!(
+            !after
+                .iter()
+                .any(|c| c.contains("did not receive a final assistant answer")),
+            "dropped-empty prior turn's late terminal must NOT emit a fallback card: {after:?}"
+        );
+        assert_eq!(
+            after, before,
+            "late terminal for a dropped-empty prior turn must be a no-op"
+        );
+    }
+
+    #[test]
+    fn late_turn_error_after_switch_surfaces_failure_not_swallowed() {
+        // The finalized-by-switch marker must suppress only a false COMPLETION
+        // fallback — never hide a real ERROR. Turn A streams non-empty text, a
+        // delta for turn B switches turns (A is committed + marked at the
+        // switch), B completes (live_reply == None), and then a LATE
+        // `TurnError{A}` arrives. A switch-finalized turn that genuinely errored
+        // MUST surface its failure (its committed text already stands), so the
+        // late error is NOT a no-op: it commits a failure card AND flips the
+        // session run-state to Error.
+        //
+        // Pre-fix RED: `fail_live_reply` consumed the marker and early-returned
+        // `None`, swallowing the error entirely — no failure card, run-state
+        // never went to Error.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Deltas lazy-bind turn A (non-empty).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        // A delta for turn B switches turns: A is committed + marked at switch.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let committed_a_before = store.state.sessions[0]
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("answer A"))
+            .count();
+        assert_eq!(
+            committed_a_before, 1,
+            "turn A must be committed once before the late error"
+        );
+
+        // LATE TurnError{A} arrives after B already completed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                code: "provider_error".into(),
+                message: "upstream 500 on turn A".into(),
+            },
+        )));
+
+        let messages: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        // Failure IS surfaced (not swallowed): a failure card for A's error.
+        assert!(
+            messages.iter().any(
+                |c| c.contains("Turn failed before producing a final answer")
+                    && c.contains("provider_error: upstream 500 on turn A")
+            ),
+            "late error for a switch-finalized turn must surface a failure card: {messages:?}"
+        );
+        // A's already-committed text still stands.
+        assert_eq!(
+            messages.iter().filter(|c| c.contains("answer A")).count(),
+            1,
+            "A's committed text must remain after its late error: {messages:?}"
+        );
+        // Run-state reflects the error.
+        assert!(
+            matches!(
+                store.state.run_state,
+                crate::model::SessionRunState::Error { .. }
+            ),
+            "late error must drive run-state to Error, got {:?}",
+            store.state.run_state
+        );
+    }
+
+    #[test]
+    fn late_turn_error_after_switch_surfaces_failure_with_b_still_live() {
+        // Same as above but the successor turn B is STILL streaming (live_reply
+        // bound to B) when the late `TurnError{A}` arrives. The error for the
+        // switch-finalized turn A must still be surfaced, and B's in-flight
+        // live_reply must be preserved untouched (the error is for A, not B).
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "answer A".into(),
+            },
+        )));
+        // Switch to B (A committed + marked); B keeps streaming (still live).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B in progress".into(),
+            },
+        )));
+
+        // LATE TurnError{A} arrives while B is still live.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                code: "provider_error".into(),
+                message: "upstream 500 on turn A".into(),
+            },
+        )));
+
+        let messages: Vec<String> = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+        assert!(
+            messages.iter().any(
+                |c| c.contains("Turn failed before producing a final answer")
+                    && c.contains("provider_error: upstream 500 on turn A")
+            ),
+            "late error for A must surface even while B is still live: {messages:?}"
+        );
+        // B's in-flight live_reply is preserved (untouched by A's error).
+        let live = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("B's live_reply must remain bound");
+        assert_eq!(live.turn_id, turn_b, "B must remain the live turn");
+        assert_eq!(
+            live.text, "answer B in progress",
+            "B's streamed text must be preserved"
+        );
+    }
+
+    #[test]
+    fn switch_dropped_empty_turn_with_activity_keeps_activity_visible() {
+        // An empty (no assistant deltas) turn A that nevertheless DID run tool
+        // activity is switched away from to turn B. The empty live_reply text is
+        // dropped at the switch (no assistant message, no "did not receive
+        // answer" card — A was superseded). But A's tool ACTIVITY must NOT be
+        // lost: it must be captured into `turn_activity_logs` (the chip source)
+        // so it stays visible, exactly as the non-empty commit path captures it.
+        //
+        // Pre-fix RED: the empty-drop path skipped `capture_completed_turn_
+        // activity`, so A's tool items were left orphaned in `state.activity`
+        // (filtered out of the live flow once B is the active turn) and never
+        // archived to a log — invisible after the switch.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Turn A starts and runs a tool, but streams NO assistant deltas.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+            ToolStartedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                tool_call_id: "call-A".into(),
+                tool_name: "shell".into(),
+                arguments: Some(serde_json::json!({"command": "ls"})),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
+            ToolCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                tool_call_id: "call-A".into(),
+                tool_name: "shell".into(),
+                success: Some(true),
+                output_preview: Some("files".into()),
+                duration_ms: Some(10),
+            },
+        )));
+
+        // A delta for turn B switches turns: empty A's text is dropped.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+
+        // A produced no assistant message (it was an empty, superseded turn).
+        let has_a_message = store.state.sessions[0]
+            .messages
+            .iter()
+            .any(|m| m.role.as_str() == "assistant");
+        assert!(
+            !has_a_message,
+            "empty switch-dropped turn A must not produce an assistant message"
+        );
+
+        // A's tool activity is preserved in the chip source (turn_activity_logs)
+        // — not lost. The non-empty path would capture it the same way.
+        let a_log = store
+            .state
+            .turn_activity_logs
+            .iter()
+            .find(|log| log.turn_id == turn_a);
+        assert!(
+            a_log.is_some(),
+            "empty switch-dropped turn A's activity must be captured to turn_activity_logs"
+        );
+        assert!(
+            a_log
+                .unwrap()
+                .items
+                .iter()
+                .any(|item| item.title == "shell"),
+            "turn A's shell tool activity must be represented in its captured log"
+        );
+
+        // A's late terminal (a COMPLETION) is still a no-op (marker consumed) —
+        // it does not double-capture or emit a fallback card.
+        let logs_before = store.state.turn_activity_logs.len();
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+        assert!(
+            !store.state.sessions[0].messages.iter().any(|m| m
+                .content
+                .contains("did not receive a final assistant answer")),
+            "late COMPLETION for the dropped-empty turn must remain a no-op (no fallback card)"
+        );
+        assert_eq!(
+            store.state.turn_activity_logs.len(),
+            logs_before,
+            "late COMPLETION for the dropped-empty turn must not change captured logs"
+        );
+    }
+
+    #[test]
+    fn late_error_card_for_switch_finalized_turn_reports_real_action_count() {
+        // Count-honesty nit: a late `TurnError` for a SWITCH-FINALIZED turn must
+        // report the turn's TRUE action count on its failure card, not 0. Turn A
+        // runs N (5) tools, then a delta for turn B switches turns — which
+        // ARCHIVES A's activity into `turn_activity_logs` and removes it from the
+        // live `state.activity`. B completes, then a LATE `TurnError{A}` surfaces
+        // A's failure card. The card's "Activity: N action(s)" must read the
+        // archived log (where A's items now live), not the empty live set.
+        //
+        // Pre-fix RED: `turn_error_fallback_message` summarized only the live
+        // `state.activity`, which no longer holds A's items, so the card reported
+        // "Activity: 0 action(s) recorded." even though A really ran 5 tools.
+        const N: usize = 5;
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        // Turn A starts and runs N completed tools (no assistant deltas).
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        for i in 0..N {
+            let call_id = format!("call-A-{i}");
+            store.apply_event(AppUiEvent::Protocol(UiNotification::ToolStarted(
+                ToolStartedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_a.clone(),
+                    tool_call_id: call_id.clone(),
+                    tool_name: "shell".into(),
+                    arguments: Some(serde_json::json!({"command": "ls"})),
+                },
+            )));
+            store.apply_event(AppUiEvent::Protocol(UiNotification::ToolCompleted(
+                ToolCompletedEvent {
+                    session_id: session_id.clone(),
+                    topic: None,
+                    turn_id: turn_a.clone(),
+                    tool_call_id: call_id,
+                    tool_name: "shell".into(),
+                    success: Some(true),
+                    output_preview: Some("files".into()),
+                    duration_ms: Some(10),
+                },
+            )));
+        }
+
+        // A delta for turn B switches turns: A is finalized + its activity is
+        // archived to turn_activity_logs and removed from live state.activity.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                text: "answer B".into(),
+            },
+        )));
+        // Sanity: A's items are no longer in the live activity (archived).
+        assert!(
+            !store
+                .state
+                .activity
+                .iter()
+                .any(|item| item.turn_id.as_ref() == Some(&turn_a)),
+            "turn A's activity must have been archived out of live state.activity"
+        );
+        // B completes — live_reply is now None.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_b.clone(),
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        // LATE TurnError{A} arrives after B already completed.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a.clone(),
+                code: "provider_error".into(),
+                message: "upstream 500 on turn A".into(),
+            },
+        )));
+
+        let card = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .find(|c| c.contains("Turn failed before producing a final answer"))
+            .expect("a failure card for A's late error must be surfaced");
+        // The count must reflect A's TRUE action count from the archived log.
+        assert!(
+            card.contains(&format!("Activity: {N} action(s) recorded.")),
+            "switch-finalized turn's failure card must report its real action \
+             count ({N}), not 0: {card:?}"
+        );
+        assert!(
+            !card.contains("Activity: 0 action(s) recorded."),
+            "switch-finalized turn's failure card must NOT report 0 actions: {card:?}"
+        );
+    }
+
+    #[test]
+    fn turn_started_after_delta_preserves_same_turn_buffer() {
+        // nit 1: a MessageDelta lazy-binds turn A with "partial ", then a
+        // TurnStarted for the SAME turn A is delivered/replayed. The previously
+        // accumulated text must be PRESERVED (not wiped), so a subsequent delta
+        // appends and the committed assistant message is the full "partial rest".
+        let turn_a = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "partial ".into(),
+            },
+        )));
+        // Same-turn TurnStarted arrives AFTER the lazy-bound delta.
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnStarted(
+            TurnStartedEvent {
+                session_id: session_id.clone(),
+                turn_id: turn_a.clone(),
+                timestamp: chrono::Utc::now(),
+                topic: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::MessageDelta(
+            MessageDeltaEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: turn_a.clone(),
+                text: "rest".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id,
+                topic: None,
+                turn_id: turn_a,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        let committed = store.state.sessions[0]
+            .messages
+            .last()
+            .expect("turn A commits an assistant message")
+            .content
+            .clone();
+        assert!(
+            committed.contains("partial rest"),
+            "same-turn TurnStarted must preserve the lazy-bound buffer (got: {committed:?})"
+        );
     }
 
     fn envelope_notification(session_id: SessionKey, seq: u64, payload: Payload) -> UiNotification {
@@ -9998,6 +11553,35 @@ mod tests {
     }
 
     #[test]
+    fn envelope_assistant_delta_does_not_churn_status_bar() {
+        // mini5 soak UX: streaming deltas arrive many times/sec and used to
+        // overwrite the status bar with "Assistant delta projected for
+        // <thread_id>", churning the bottom-of-composer line. The projection is
+        // internal bookkeeping — it must NOT touch the status bar (the streamed
+        // text is already visible in the transcript).
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.status = "Working".into();
+
+        for seq in 1..=3 {
+            store.apply_event(AppUiEvent::Protocol(envelope_notification(
+                session_id.clone(),
+                seq,
+                Payload::AssistantDelta {
+                    text: "tok ".into(),
+                },
+            )));
+        }
+
+        assert_eq!(
+            store.state.status, "Working",
+            "assistant-delta projection must not overwrite the status bar"
+        );
+        // The delta still projects into the transcript — only the status churn is gone.
+        assert_eq!(store.state.sessions[0].messages.len(), 1);
+    }
+
+    #[test]
     fn envelope_assistant_persisted_replaces_streamed_text() {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
@@ -10027,6 +11611,489 @@ mod tests {
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].thread_id.as_deref(), Some("thread-1"));
         assert_eq!(messages[0].content, "final answer");
+    }
+
+    #[test]
+    fn envelope_turn_completed_reconciles_stranded_running_tool_item() {
+        // GAP 2: the M9-γ projection-envelope path creates tool activity with NO
+        // turn_id (the envelope is keyed on thread_id/seq — there is no turn
+        // identity on the wire). A `ToolStart` whose `ToolEnd` never arrived
+        // leaves a turn-less "running" Tool item. When `Payload::TurnCompleted`
+        // closes the thread (a hard terminal barrier), that stranded running item
+        // must be reconciled so it can no longer pin a turn-less "Orchestrating…"
+        // chip.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-leaked".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+        // Terminal barrier for the thread — no ToolEnd ever came for call-leaked.
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            2,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let leaked = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked envelope tool item retained");
+        assert!(
+            !crate::model::activity_status_is_running(&leaked.status),
+            "an envelope TurnCompleted must leave no running-status chip pinned, got {:?}",
+            leaked.status
+        );
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "the stranded envelope tool item must be reconciled to interrupted"
+        );
+    }
+
+    #[test]
+    fn envelope_turn_completed_does_not_touch_settled_tool_item() {
+        // GAP 2 guard: a tool that DID complete (ToolEnd arrived) must keep its
+        // settled status across a TurnCompleted barrier — the reconcile only
+        // sweeps still-running items.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-done".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id.clone(),
+            2,
+            Payload::ToolEnd {
+                tool_call_id: "call-done".into(),
+                status: EnvelopeToolEndStatus::Complete,
+                error: None,
+                reason: None,
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            3,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let done = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-done"))
+            .expect("settled envelope tool item retained");
+        assert_eq!(
+            done.status, "complete",
+            "a settled envelope tool item must keep its terminal status across TurnCompleted"
+        );
+    }
+
+    #[test]
+    fn envelope_turn_completed_does_not_suppress_other_session_same_thread() {
+        // GAP 2 over-suppression guard: two sessions can each be running an
+        // envelope tool under the SAME thread_id (thread_id is NOT globally
+        // unique — it is scoped to a session's projection). A `TurnCompleted`
+        // for session A's thread must heal ONLY session A's stranded running
+        // envelope tool item; session B's genuinely-active chip on the same
+        // thread_id must stay running.
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        let session_b = store.state.sessions[1].id.clone();
+        assert_eq!(session_a, SessionKey("local:a".into()));
+        assert_eq!(session_b, SessionKey("local:b".into()));
+
+        // Both sessions start a turn-less running envelope tool on "thread-1"
+        // (envelope_notification hardcodes thread_id = "thread-1").
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_a.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-a".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_b.clone(),
+            1,
+            Payload::ToolStart {
+                tool_call_id: "call-b".into(),
+                name: "run_pipeline".into(),
+            },
+        )));
+
+        // Terminal barrier for session A's thread only.
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_a,
+            2,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let item_a = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-a"))
+            .expect("session A envelope tool item retained");
+        assert_eq!(
+            item_a.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "session A's stranded envelope tool item must be reconciled"
+        );
+
+        let item_b = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-b"))
+            .expect("session B envelope tool item retained");
+        assert!(
+            crate::model::activity_status_is_running(&item_b.status),
+            "session B's genuinely-active envelope tool item must NOT be suppressed \
+             by session A's TurnCompleted on the same thread_id, got {:?}",
+            item_b.status
+        );
+    }
+
+    /// Build the FLATTENED `projection/envelope` wire `params` the
+    /// server now emits (feat(envelope-wire-routing)): bare Envelope
+    /// fields at the top level PLUS `session_id` + optional `topic`.
+    fn envelope_wire_params(
+        session_id: &str,
+        thread_id: &str,
+        seq: u64,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "session_id": session_id,
+            "thread_id": thread_id,
+            "seq": seq,
+            "payload": payload,
+        })
+    }
+
+    /// Decode a wire `projection/envelope` frame through the SAME
+    /// `from_method_and_params` path the transport uses, then apply it.
+    /// This exercises the real DECODE — not a directly-constructed
+    /// `EnvelopeNotification` — so the wire-routing contract is under
+    /// test end-to-end.
+    fn apply_envelope_wire_frame(store: &mut Store, params: serde_json::Value) {
+        let notif = UiNotification::from_method_and_params(
+            octos_core::ui_protocol::methods::PROJECTION_ENVELOPE,
+            params,
+        )
+        .expect("wire envelope frame must decode");
+        store.apply_event(AppUiEvent::Protocol(notif));
+    }
+
+    /// feat(envelope-wire-routing) — THE full-decode-path guard codex
+    /// asked for. Two sessions share `thread_id = "thread-1"`. We drive
+    /// the REAL wire path (build flattened `projection/envelope` params
+    /// → `from_method_and_params` → `apply_envelope`) and assert:
+    ///   (a) each session's envelope routes to the CORRECT session — not
+    ///       dropped on an empty `session_id` key, and
+    ///   (b) session A's `TurnCompleted` reconciles A's stranded chip but
+    ///       NOT session B's genuinely-running chip on the same thread.
+    ///
+    /// RED on the pre-change core: the wire stripped `session_id`, so
+    /// every decoded envelope arrived with an EMPTY `SessionKey`,
+    /// `find_session_mut` failed, messages were dropped, and the
+    /// session-scoped reconcile could not distinguish A from B.
+    #[test]
+    fn envelope_wire_decode_routes_to_correct_session_and_scopes_reconcile() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        let session_b = store.state.sessions[1].id.clone();
+        assert_eq!(session_a, SessionKey("local:a".into()));
+        assert_eq!(session_b, SessionKey("local:b".into()));
+
+        // (a) Route a user_message to each session via the wire decode.
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:a",
+                "thread-1",
+                1,
+                serde_json::json!({
+                    "type": "user_message",
+                    "data": { "text": "hello from A", "files": [] }
+                }),
+            ),
+        );
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:b",
+                "thread-1",
+                1,
+                serde_json::json!({
+                    "type": "user_message",
+                    "data": { "text": "hello from B", "files": [] }
+                }),
+            ),
+        );
+
+        // Each message landed in its OWN session (would be dropped on an
+        // empty session_id on the pre-change wire).
+        let a_msgs = &store.state.sessions[0].messages;
+        let b_msgs = &store.state.sessions[1].messages;
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "session A must receive exactly its message"
+        );
+        assert_eq!(a_msgs[0].content, "hello from A");
+        assert_eq!(
+            b_msgs.len(),
+            1,
+            "session B must receive exactly its message"
+        );
+        assert_eq!(b_msgs[0].content, "hello from B");
+
+        // Both sessions start a turn-less running envelope tool on the
+        // SHARED thread-1, routed via the wire decode.
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:a",
+                "thread-1",
+                2,
+                serde_json::json!({
+                    "type": "tool_start",
+                    "data": { "tool_call_id": "call-a", "name": "run_pipeline" }
+                }),
+            ),
+        );
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:b",
+                "thread-1",
+                2,
+                serde_json::json!({
+                    "type": "tool_start",
+                    "data": { "tool_call_id": "call-b", "name": "run_pipeline" }
+                }),
+            ),
+        );
+
+        // (b) TurnCompleted for session A's thread ONLY — routed by the
+        // decoded session_id.
+        apply_envelope_wire_frame(
+            &mut store,
+            envelope_wire_params(
+                "local:a",
+                "thread-1",
+                3,
+                serde_json::json!({
+                    "type": "turn_completed",
+                    "data": { "token_usage": {} }
+                }),
+            ),
+        );
+
+        let item_a = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-a"))
+            .expect("session A envelope tool item retained");
+        assert_eq!(
+            item_a.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "session A's stranded chip must reconcile via the decoded session_id",
+        );
+
+        let item_b = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-b"))
+            .expect("session B envelope tool item retained");
+        assert!(
+            crate::model::activity_status_is_running(&item_b.status),
+            "session B's chip on the SAME thread must NOT be suppressed by \
+             session A's TurnCompleted; got {:?}",
+            item_b.status
+        );
+    }
+
+    /// Build the wire `projection/envelope` `params` the SERVER actually
+    /// emits when the turn is TOPIC-scoped: the emitting
+    /// `EnvelopeNotification.session_id` carries the `"base#topic"`
+    /// composite key (`turn/start` folds the topic in). Driving it
+    /// through the REAL `into_rpc_notification` boundary exercises the
+    /// core wire-normalization (session_id → bare base, topic preserved),
+    /// so this guard fails if that normalization regresses.
+    fn topic_folded_envelope_wire_params(
+        base_topic_session_id: &str,
+        thread_id: &str,
+        seq: u64,
+        payload: Payload,
+    ) -> serde_json::Value {
+        let notif = UiNotification::Envelope(EnvelopeNotification {
+            session_id: SessionKey(base_topic_session_id.into()),
+            topic: None,
+            envelope: Envelope {
+                thread_id: thread_id.into(),
+                seq,
+                client_message_id: None,
+                payload,
+            },
+        });
+        notif
+            .into_rpc_notification()
+            .expect("topic-folded envelope serializes to the wire")
+            .params
+    }
+
+    /// feat(envelope-wire-routing) — codex BLOCKER, TUI decode-path guard.
+    /// On a TOPIC turn the server's `EnvelopeNotification.session_id` is
+    /// the composite `"local:a#research"` key. The TUI knows only the
+    /// BARE base session `"local:a"`, so it must route by the base key.
+    /// We drive the FULL real path: build the wire from the topic-folded
+    /// notification → `into_rpc_notification` (core normalizes the wire
+    /// session_id to the base) → `from_method_and_params` →
+    /// `apply_envelope`, and assert:
+    ///   (a) the message lands in the BARE `"local:a"` session
+    ///       (`find_session_mut` succeeds), and
+    ///   (b) the topic-turn's `TurnCompleted` reconcile scopes to the
+    ///       BARE `"local:a"` session — healing its own stranded chip
+    ///       without touching a sibling.
+    ///
+    /// RED before the core fix: the wire carried `"local:a#research"`, so
+    /// `find_session_mut` and the reconcile both searched the composite
+    /// key, missing the real `"local:a"` session → message dropped and
+    /// the self-heal scoped to the wrong key.
+    #[test]
+    fn topic_folded_envelope_wire_routes_to_base_session_and_scopes_reconcile() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        let session_a = store.state.sessions[0].id.clone();
+        assert_eq!(session_a, SessionKey("local:a".into()));
+
+        // (a) A topic-scoped user_message for session A's research topic.
+        apply_envelope_wire_frame(
+            &mut store,
+            topic_folded_envelope_wire_params(
+                "local:a#research",
+                "thread-topic",
+                1,
+                Payload::UserMessage {
+                    text: "topic msg for A".into(),
+                    files: vec![],
+                },
+            ),
+        );
+        let a_msgs = &store.state.sessions[0].messages;
+        assert_eq!(
+            a_msgs.len(),
+            1,
+            "topic-scoped message must route to the BARE base session, \
+             not a composite base#topic key",
+        );
+        assert_eq!(a_msgs[0].content, "topic msg for A");
+        assert!(
+            store.state.sessions[1].messages.is_empty(),
+            "session B must not receive session A's topic message",
+        );
+
+        // A turn-less running tool on session A's topic thread.
+        apply_envelope_wire_frame(
+            &mut store,
+            topic_folded_envelope_wire_params(
+                "local:a#research",
+                "thread-topic",
+                2,
+                Payload::ToolStart {
+                    tool_call_id: "call-topic".into(),
+                    name: "run_pipeline".into(),
+                },
+            ),
+        );
+
+        // The chip must be tagged with the BARE base session key so the
+        // session-scoped reconcile (which matches on the base key) finds
+        // it. RED on the pre-fix wire (tagged "local:a#research").
+        let chip = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-topic"))
+            .expect("topic envelope tool item retained");
+        assert_eq!(
+            chip.session_id.as_ref(),
+            Some(&SessionKey("local:a".into())),
+            "chip must be scoped to the bare base session key",
+        );
+
+        // (b) The topic turn's TurnCompleted reconciles A's stranded chip
+        // via the BARE base key.
+        apply_envelope_wire_frame(
+            &mut store,
+            topic_folded_envelope_wire_params(
+                "local:a#research",
+                "thread-topic",
+                3,
+                Payload::TurnCompleted {
+                    token_usage: Default::default(),
+                },
+            ),
+        );
+        let chip = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-topic"))
+            .expect("topic envelope tool item retained after turn complete");
+        assert_eq!(
+            chip.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "topic turn's TurnCompleted must reconcile the chip scoped to \
+             the bare base session key",
+        );
+    }
+
+    /// feat(envelope-wire-routing) backward-compat at the consumer: an
+    /// OLD bare-envelope wire frame (no `session_id`) still decodes
+    /// without error through the transport path. The routing key is
+    /// empty so it cannot match a session — but it must NOT crash the
+    /// decode (it is silently un-routed, the legacy behaviour).
+    #[test]
+    fn legacy_bare_envelope_wire_frame_decodes_without_routing() {
+        let mut store = store_with_two_sessions("local:a", "local:b");
+        // No session_id key — the pre-change wire shape.
+        let legacy = serde_json::json!({
+            "thread_id": "thread-1",
+            "seq": 1,
+            "payload": {
+                "type": "assistant_delta",
+                "data": { "text": "orphaned delta" }
+            }
+        });
+        apply_envelope_wire_frame(&mut store, legacy);
+        // Un-routed (empty session_id matches no session) — neither
+        // session gains a message, and nothing panicked.
+        assert!(store.state.sessions[0].messages.is_empty());
+        assert!(store.state.sessions[1].messages.is_empty());
     }
 
     #[test]
@@ -11109,6 +13176,26 @@ mod tests {
     }
 
     #[test]
+    fn status_word_persona_spinner_updates_status_without_activity() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        // Persona spinner: kind="status_word", dynamic label (LLM-generated). It
+        // must update the status line but NOT pile up as counted activity actions
+        // (otherwise the agent-task chip shows "N active" with no real work).
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id,
+            Some(TurnId::new()),
+            UiProgressMetadata::new(progress_kinds::STATUS_WORD).with_message("Composing"),
+        )));
+
+        assert_eq!(store.state.status, "Composing");
+        assert!(
+            store.state.activity.is_empty(),
+            "status_word spinner must not be recorded as activity"
+        );
+    }
+
+    #[test]
     fn low_value_progress_updates_status_without_activity() {
         let mut store = store_with_empty_session();
         let session_id = store.state.sessions[0].id.clone();
@@ -11316,6 +13403,112 @@ mod tests {
         );
     }
 
+    /// Codex-style surface (mini5 soak follow-up): a real context compaction
+    /// must leave a PERSISTENT, visible activity row — not just the shared
+    /// one-line `status` string that the per-turn
+    /// `context/normalization_reported` (and the next user action) immediately
+    /// overwrites — so the user actually sees that the context was compacted.
+    #[test]
+    fn context_compaction_pushes_persistent_activity_notice() {
+        use octos_core::ui_protocol::{
+            ContextCompactionCompletedEvent, UiContextCompactionRecord, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        // Compaction is reported DURING a turn: give the session a live reply
+        // so the notice must be stamped with that turn (codex P2) — otherwise
+        // a turnless notice is suppressed mid-turn and never archived.
+        let turn_id = TurnId::new();
+        let session = SessionView {
+            id: session_id.clone(),
+            title: "test".into(),
+            profile_id: None,
+            messages: vec![],
+            tasks: vec![],
+            live_reply: Some(crate::model::LiveReply {
+                turn_id: turn_id.clone(),
+                text: String::new(),
+            }),
+        };
+        let mut store = Store {
+            state: AppState::new(vec![session], 0, "ready".into(), None, false),
+        };
+
+        assert!(store.state.activity.is_empty());
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextCompactionCompleted(ContextCompactionCompletedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 4,
+                    transcript_hash: "abc123".into(),
+                    item_count: 42,
+                    token_estimate: 9100,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: Some("comp-001".into()),
+                },
+                compaction: UiContextCompactionRecord {
+                    compaction_id: "comp-001".into(),
+                    checkpoint_id: "chk-001".into(),
+                    status: "applied".into(),
+                    policy_id: "default".into(),
+                    trigger: "token_budget".into(),
+                    input_generation: 3,
+                    output_generation: Some(4),
+                    input_transcript_hash: "input-h".into(),
+                    replacement_transcript_hash: Some("abc123".into()),
+                    installed_transcript_hash: Some("abc123".into()),
+                    input_item_count: 130,
+                    retained_count: 42,
+                    dropped_count: 88,
+                    summary_item_id: Some("sum-1".into()),
+                    token_estimate_before: 31200,
+                    token_estimate_after: Some(9100),
+                    error: None,
+                },
+            }),
+        ));
+
+        let notice = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.title.eq_ignore_ascii_case("context compacted"))
+            .expect("a persistent compaction activity row must be pushed");
+        // Must read as a completed notice, not a perpetual spinner.
+        assert!(
+            !matches!(
+                notice.status.trim().to_ascii_lowercase().as_str(),
+                "running" | "active" | "pending" | "queued" | "streaming" | "in_progress"
+            ),
+            "compaction notice must not render as a running spinner: {}",
+            notice.status
+        );
+        // Surfaces the token reduction so the user sees what happened.
+        assert!(
+            notice.status.contains('→') || notice.status.to_ascii_lowercase().contains("token"),
+            "status should show the token delta: {}",
+            notice.status
+        );
+        // The detail line carries kept/dropped counts + the trigger.
+        let detail = notice.detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("88") && detail.contains("token_budget"),
+            "detail should show dropped count + trigger: {detail}"
+        );
+        assert_eq!(notice.success, Some(true));
+        // codex P2: stamped with the in-flight turn so the renderer shows it
+        // mid-turn and `capture_completed_turn_activity` archives it.
+        assert_eq!(
+            notice.turn_id.as_ref(),
+            Some(&turn_id),
+            "compaction notice must be stamped with the session's live turn"
+        );
+    }
+
     /// M16-G2 wiring guard: `context/normalization_reported` events
     /// must update the same per-session ledger without trashing prior
     /// compaction state (so the status surface can render both at once).
@@ -11407,6 +13600,252 @@ mod tests {
         assert_eq!(
             ledger.last_normalization.as_ref().unwrap().repaired_count,
             1
+        );
+    }
+
+    /// Gap 2 fix #4: `context/normalization_reported` must NOT clobber a
+    /// pre-set shared status line (e.g. a "compacting…"/meaningful status).
+    /// Normalization is a background lifecycle signal — it churns every turn
+    /// and previously overwrote the user-visible status string.
+    #[test]
+    fn context_normalization_event_does_not_overwrite_status_line() {
+        use octos_core::ui_protocol::{
+            ContextNormalizationReportedEvent, UiContextNormalizationReport, UiContextState,
+        };
+
+        let session_id = SessionKey("local:test".into());
+        let mut store = store_with_empty_session();
+        store.state.status = "compacting…".into();
+
+        store.apply_event(AppUiEvent::Protocol(
+            UiNotification::ContextNormalizationReported(ContextNormalizationReportedEvent {
+                session_id: session_id.clone(),
+                context_state: UiContextState {
+                    session_id: session_id.clone(),
+                    thread_id: None,
+                    generation: 7,
+                    transcript_hash: "h".into(),
+                    item_count: 12,
+                    token_estimate: 5000,
+                    recovery_state: "healthy".into(),
+                    last_checkpoint_id: None,
+                    last_compaction_id: None,
+                },
+                normalization: UiContextNormalizationReport {
+                    generation: 7,
+                    input_transcript_hash: "h".into(),
+                    output_prompt_hash: "out".into(),
+                    model_capability_id: "anthropic/sonnet-4.7".into(),
+                    prompt_message_count: 12,
+                    token_estimate: 5000,
+                    repaired_count: 0,
+                    dropped_count: 0,
+                    synthetic_count: 0,
+                    truncated_count: 0,
+                },
+            }),
+        ));
+
+        // The ledger still records the normalization (surfaced in the
+        // inspector / lifecycle pane), but the shared status line is intact.
+        assert!(
+            store
+                .state
+                .context_lifecycle_for(&session_id)
+                .and_then(|l| l.last_normalization.as_ref())
+                .is_some(),
+            "normalization still stored in the lifecycle ledger"
+        );
+        assert_eq!(
+            store.state.status, "compacting…",
+            "normalization must not churn the shared status line"
+        );
+    }
+
+    /// Gap 2 fix #3: a progress event carrying `metadata.retry`
+    /// (`UiRetryBackoff`) must populate `AppState.session_retry` so the
+    /// harness status row can render "retrying (attempt N)". The info was on
+    /// the wire but previously ignored.
+    #[test]
+    fn progress_retry_metadata_populates_session_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(5);
+        retry.reason = Some("rate_limited".into());
+
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            UiProgressMetadata::retry_backoff(retry),
+        )));
+
+        let stored = store
+            .state
+            .session_retry
+            .get(&session_id)
+            .expect("retry recorded for session");
+        assert_eq!(stored.attempt, Some(2));
+        assert_eq!(stored.max_attempts, Some(5));
+
+        // A subsequent non-retry progress event clears the stale retry so a
+        // settled turn doesn't linger as "retrying".
+        store.apply_event(AppUiEvent::Progress(UiProgressEvent::new(
+            session_id.clone(),
+            Some(TurnId::new()),
+            UiProgressMetadata::new(progress_kinds::STREAM_END).with_message("stream closed"),
+        )));
+        assert!(
+            !store.state.session_retry.contains_key(&session_id),
+            "non-retry progress clears the retry entry"
+        );
+    }
+
+    /// Blocking bug 2: `session_retry` was only cleared on the next NON-retry
+    /// progress event. A retry immediately followed by terminal
+    /// `TurnCompleted` left stale retry that could render "retrying" on a LATER
+    /// active orchestration. Terminal completion must clear it. (RED on
+    /// f588b6f.)
+    #[test]
+    fn turn_completed_clears_stale_session_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(5);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        assert!(
+            !store.state.session_retry.contains_key(&session_id),
+            "TurnCompleted must clear the stale retry so it cannot render later"
+        );
+    }
+
+    /// Blocking bug 2: terminal `TurnError` must also clear `session_retry`.
+    /// (RED on f588b6f.)
+    #[test]
+    fn turn_error_clears_stale_session_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(1);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id,
+                code: "provider_error".into(),
+                message: "upstream 500".into(),
+            },
+        )));
+
+        assert!(
+            !store.state.session_retry.contains_key(&session_id),
+            "TurnError must clear the stale retry so it cannot render later"
+        );
+    }
+
+    /// Over-clear fix: a STALE `TurnCompleted` (for an OLD turn, not the live
+    /// one) must NOT wipe the live turn's retry indicator. `commit_live_reply`
+    /// preserves the live reply on a turn_id mismatch, but previously the
+    /// retry clear ran unconditionally and wrongly erased the active retry.
+    /// (RED on 4022a7c.)
+    #[test]
+    fn stale_terminal_does_not_clear_live_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let live_turn = TurnId::new();
+        let stale_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(2);
+        retry.max_attempts = Some(5);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnCompleted(
+            TurnCompletedEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: stale_turn,
+                cursor: None,
+                tokens_in: None,
+                tokens_out: None,
+                session_result: None,
+            },
+        )));
+
+        assert!(
+            store.state.session_retry.contains_key(&session_id),
+            "stale TurnCompleted (mismatched turn) must NOT clear the live turn's retry"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_some(),
+            "stale TurnCompleted preserves the live reply"
+        );
+    }
+
+    /// Over-clear fix (error path): a STALE `TurnError` (for an OLD turn) must
+    /// NOT wipe the live turn's retry indicator. `fail_live_reply` keeps the
+    /// live reply on a turn_id mismatch, but the retry clear previously ran
+    /// regardless. (RED on 4022a7c.)
+    #[test]
+    fn stale_terminal_error_does_not_clear_live_retry() {
+        use octos_core::ui_protocol::UiRetryBackoff;
+
+        let live_turn = TurnId::new();
+        let stale_turn = TurnId::new();
+        let mut store = store_with_live_reply(live_turn.clone(), "hello");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(1);
+        store.state.session_retry.insert(session_id.clone(), retry);
+
+        store.apply_event(AppUiEvent::Protocol(UiNotification::TurnError(
+            TurnErrorEvent {
+                session_id: session_id.clone(),
+                topic: None,
+                turn_id: stale_turn,
+                code: "provider_error".into(),
+                message: "upstream 500".into(),
+            },
+        )));
+
+        assert!(
+            store.state.session_retry.contains_key(&session_id),
+            "stale TurnError (mismatched turn) must NOT clear the live turn's retry"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_some(),
+            "stale TurnError preserves the live reply"
         );
     }
 
@@ -12471,6 +14910,83 @@ mod tests {
         assert_eq!(mirror.agents[0].status, "running");
     }
 
+    /// Stuck-chip safety net: a spawn_only background task that outlives its
+    /// spawning turn only goes terminal AFTER the per-turn task-progress
+    /// channel was torn down, so the terminal `task/updated` never reaches the
+    /// client and `session.tasks` stays "running" — pinning the chip on
+    /// "Orchestrating…". The DURABLE terminal `agent/updated` (which now does
+    /// reach the client via the ledger) carries `task_id` + a terminal
+    /// `status`; the store reconciles the matching task to its terminal state
+    /// so the chip flips. This pins that reconcile.
+    #[test]
+    fn terminal_agent_update_reconciles_stuck_running_task() {
+        use octos_core::ui_protocol::{AgentUpdatedEvent, TaskRuntimeState, UiAgentRecord};
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        let task_id: TaskId = "01900000-0000-7000-8000-0000000000fc"
+            .parse()
+            .expect("valid task id");
+
+        // Seed a running spawn_only task — the chip currently reads this as
+        // "running" and stays on "Orchestrating…".
+        if let Some(session) = store.find_session_mut(&session_id) {
+            session.tasks.push(TaskView {
+                id: task_id.clone(),
+                title: "octos-code-review-retry".into(),
+                state: TaskRuntimeState::Running,
+                runtime_detail: None,
+                output_tail: String::new(),
+                turn_id: None,
+            });
+        }
+
+        let agent = UiAgentRecord {
+            agent_id: "task-01900000-0000-7000-8000-0000000000fc".into(),
+            parent_agent_id: Some("master".into()),
+            session_id: session_id.clone(),
+            task_id: Some(task_id.to_string()),
+            path: "master/task-fc".into(),
+            role: "background_task".into(),
+            nickname: "spawn".into(),
+            title: None,
+            backend_kind: "task_supervisor:spawn".into(),
+            status: "failed".into(),
+            last_task: Some("spawn_only failure".into()),
+            summary: None,
+            output_tail: None,
+            cwd: None,
+            profile_id: "coding".into(),
+            runtime_policy_stamp: None,
+            artifact_count: 0,
+            artifacts: vec![],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+        store.apply_event(AppUiEvent::Protocol(UiNotification::AgentUpdated(
+            AgentUpdatedEvent {
+                session_id: session_id.clone(),
+                agent,
+            },
+        )));
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .expect("session present");
+        let task = session
+            .tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .expect("seeded task present");
+        assert_eq!(
+            task.state,
+            TaskRuntimeState::Failed,
+            "the terminal agent/updated must reconcile the stuck running task to its terminal state so the chip flips off Orchestrating…",
+        );
+    }
+
     #[test]
     fn agent_output_delta_appends_to_session_mirror() {
         use octos_core::ui_protocol::AgentOutputDeltaEvent;
@@ -12894,6 +15410,92 @@ mod tests {
     }
 
     #[test]
+    fn hydrated_row_filter_drops_tool_and_empty_assistant_rows() {
+        // mini5 soak: hydrate must render only the chat bubbles the live
+        // transcript shows (user + assistant answers). Tool-result rows and
+        // tool-call-only assistant rows (empty text) are activity, not bubbles —
+        // rendering them double-shows a turn on reconnect (the "repeat" bug:
+        // a tool turn went 2 live msgs -> 4 on hydrate before this filter).
+        let now = chrono::Utc::now();
+        let row = |role: &str, content: &str| HydratedMessage {
+            seq: 1,
+            role: role.into(),
+            content: content.into(),
+            turn_id: None,
+            thread_id: None,
+            client_message_id: None,
+            persisted_at: now,
+            message_id: None,
+            source: None,
+            media: Vec::new(),
+        };
+        assert!(hydrated_row_is_displayable(&row(
+            "user",
+            "search beijing weather"
+        )));
+        assert!(hydrated_row_is_displayable(&row(
+            "assistant",
+            "Here's the forecast"
+        )));
+        assert!(
+            !hydrated_row_is_displayable(&row("tool", "Beijing — 7-day forecast ...")),
+            "tool rows surface as activity chips, not transcript bubbles"
+        );
+        assert!(
+            !hydrated_row_is_displayable(&row("assistant", "   ")),
+            "tool-call-only assistant rows (empty text) are not bubbles"
+        );
+    }
+
+    #[test]
+    fn hydrate_preserves_an_in_flight_live_reply() {
+        use crate::client_event::ClientEvent;
+        // codex P1: a hydrate that lands MID-TURN must not drop the streaming
+        // turn. `live_reply` (the in-flight, not-yet-committed turn) must survive
+        // so its remaining deltas keep appending instead of freezing.
+        let turn_id = TurnId::new();
+        let mut store = store_with_live_reply(turn_id.clone(), "streaming so far");
+        let session_id = store.state.sessions[0].id.clone();
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: Some(vec![HydratedMessage {
+                seq: 1,
+                role: "user".into(),
+                content: "earlier committed prompt".into(),
+                turn_id: None,
+                thread_id: None,
+                client_message_id: None,
+                persisted_at: chrono::Utc::now(),
+                message_id: None,
+                source: None,
+                media: Vec::new(),
+            }]),
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let live_reply = store.state.sessions[0]
+            .live_reply
+            .as_ref()
+            .expect("in-flight live_reply must survive a hydrate");
+        assert_eq!(
+            live_reply.turn_id, turn_id,
+            "the same streaming turn is preserved across hydrate"
+        );
+        assert_eq!(live_reply.text, "streaming so far");
+    }
+
+    #[test]
     fn session_hydrate_result_replaces_messages_and_pending_approval() {
         use crate::client_event::ClientEvent;
 
@@ -13024,6 +15626,203 @@ mod tests {
         );
         assert!(store.state.status.contains("2 message(s)"));
         assert!(store.state.status.contains("1 pending approval"));
+    }
+
+    #[test]
+    fn hydrate_reconciles_leaked_running_activity_in_terminal_turn() {
+        use crate::client_event::ClientEvent;
+        // GAP 1: a client rehydrating a session whose turn is already TERMINAL
+        // (Completed/Errored/Interrupted) but that still carries a stranded
+        // running-status activity item (a `ToolStarted` whose `ToolCompleted`
+        // never arrived — leaked spawn_only chip / any uncovered path) must heal
+        // the orphan. `apply_session_hydrate_result` never called the terminal
+        // reconcile, so the chip pinned "Orchestrating…" forever after reconnect.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        // Leaked running item bound to the (about-to-be-terminal) turn.
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Completed,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-1".into()),
+            }]),
+            pending_approvals: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let leaked = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+            .expect("leaked item retained");
+        assert_eq!(
+            leaked.status,
+            crate::model::ACTIVITY_STATUS_INTERRUPTED,
+            "a terminal hydrated turn's stranded running item must be reconciled to interrupted"
+        );
+        assert!(
+            !crate::model::activity_status_is_running(&leaked.status),
+            "the reconciled item must no longer read as running"
+        );
+    }
+
+    #[test]
+    fn hydrate_does_not_reconcile_running_activity_in_active_turn() {
+        use crate::client_event::ClientEvent;
+        // GAP 1 guard against over-suppression: a hydrated turn that is still the
+        // live/active turn (state == Active) carries genuine in-flight work. The
+        // hydrate reconcile must touch ONLY terminal turns, so this running item
+        // must stay running.
+        let turn_id = TurnId::new();
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-live"),
+        );
+
+        let result = SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 1,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: Some(vec![HydratedTurn {
+                turn_id: turn_id.clone(),
+                state: TurnLifecycleState::Active,
+                started_at: None,
+                completed_at: None,
+                thread_id: Some("thread-1".into()),
+            }]),
+            pending_approvals: None,
+            replayed_envelopes: None,
+        };
+        store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+        let live = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.tool_call_id.as_deref() == Some("call-live"))
+            .expect("live item retained");
+        assert_eq!(
+            live.status, "running",
+            "an active (non-terminal) hydrated turn's running item must NOT be reconciled"
+        );
+    }
+
+    #[test]
+    fn hydrate_reconciles_leaked_running_activity_in_errored_and_interrupted_turns() {
+        use crate::client_event::ClientEvent;
+        // GAP 1 coverage: the hydrate reconcile treats ALL three terminal
+        // lifecycle states identically via the shared sweep. The existing test
+        // exercises `Completed`; assert `Errored` and `Interrupted` heal too.
+        for terminal in [TurnLifecycleState::Errored, TurnLifecycleState::Interrupted] {
+            let turn_id = TurnId::new();
+            let mut store = store_with_empty_session();
+            let session_id = store.state.sessions[0].id.clone();
+            store.state.push_activity(
+                ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                    .with_turn(turn_id.clone())
+                    .with_tool_call("call-leaked"),
+            );
+
+            let result = SessionHydrateResult {
+                session_id: session_id.clone(),
+                cursor: octos_core::ui_protocol::UiCursor {
+                    stream: session_id.0.clone(),
+                    seq: 1,
+                },
+                context: None,
+                context_state: None,
+                messages: None,
+                threads: None,
+                turns: Some(vec![HydratedTurn {
+                    turn_id: turn_id.clone(),
+                    state: terminal,
+                    started_at: None,
+                    completed_at: None,
+                    thread_id: Some("thread-1".into()),
+                }]),
+                pending_approvals: None,
+                replayed_envelopes: None,
+            };
+            store.apply_client_event(ClientEvent::SessionHydrate(result));
+
+            let leaked = store
+                .state
+                .activity
+                .iter()
+                .find(|item| item.tool_call_id.as_deref() == Some("call-leaked"))
+                .expect("leaked item retained");
+            assert_eq!(
+                leaked.status,
+                crate::model::ACTIVITY_STATUS_INTERRUPTED,
+                "a {terminal:?} hydrated turn's stranded running item must be reconciled"
+            );
+        }
+    }
+
+    #[test]
+    fn envelope_turn_completed_does_not_touch_non_tool_turn_less_row() {
+        // GAP 2 kind guard: the envelope reconcile is filtered to
+        // `ActivityKind::Tool`. A turn-less NON-tool row carrying this thread's
+        // marker (e.g. a Progress row) must never be flipped, even when its
+        // session+thread match the TurnCompleted barrier.
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.push_activity(
+            ActivityItem::new(ActivityKind::Progress, "sub-agent", "running")
+                .with_session(session_id.clone())
+                .with_detail(crate::model::AppState::envelope_tool_detail_for_thread(
+                    "thread-1",
+                )),
+        );
+
+        store.apply_event(AppUiEvent::Protocol(envelope_notification(
+            session_id,
+            1,
+            Payload::TurnCompleted {
+                token_usage: octos_core::ui_protocol::EnvelopeTokenUsage::default(),
+            },
+        )));
+
+        let row = store
+            .state
+            .activity
+            .iter()
+            .find(|item| item.kind == ActivityKind::Progress && item.title == "sub-agent")
+            .expect("non-tool progress row retained");
+        assert!(
+            crate::model::activity_status_is_running(&row.status),
+            "a non-tool turn-less row must NOT be reconciled by the envelope sweep, got {:?}",
+            row.status
+        );
     }
 
     #[test]

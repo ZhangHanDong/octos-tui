@@ -158,6 +158,9 @@ impl Widget for MultiSelectViewWidget<'_> {
             let body = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+                // 2-col gutter so a clipped list item can't butt straight into
+                // the preview text (the "Aliasubmission" collision).
+                .spacing(2)
                 .split(chunks[0]);
             render_item_list(self.view, body[0], buf, self.palette);
             render_preview(self.view.preview.as_ref(), body[1], buf, self.palette);

@@ -3,8 +3,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
 };
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use octos_core::ui_protocol::approval_kinds;
@@ -67,8 +68,13 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
         frame.area().height,
     );
     let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
     let surface_budget = frame.area().height.saturating_sub(
-        min_transcript_height(frame.area().height) + composer_height + autonomy_height + 1,
+        min_transcript_height(frame.area().height)
+            + composer_height
+            + autonomy_height
+            + harness_height
+            + 1,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -77,6 +83,7 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
             Constraint::Min(8),
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -89,9 +96,12 @@ fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     if autonomy_height > 0 {
         frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
     }
-    frame.render_widget(render_composer(app, palette, root[3]), root[3]);
-    set_composer_cursor(frame, app, root[3]);
-    frame.render_widget(render_status(app, palette), root[4]);
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
 }
 
 fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
@@ -139,12 +149,14 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
         frame.area().height,
     );
     let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(12),
             Constraint::Length(menu_height),
             Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
             Constraint::Length(composer_height),
             Constraint::Length(4),
         ])
@@ -190,9 +202,12 @@ fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palet
     if autonomy_height > 0 {
         frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
     }
-    frame.render_widget(render_composer(app, palette, root[3]), root[3]);
-    set_composer_cursor(frame, app, root[3]);
-    frame.render_widget(render_status(app, palette), root[4]);
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
 }
 
 fn active_menu_surface(app: &AppState) -> Option<menu_render::MenuSurface> {
@@ -274,15 +289,56 @@ fn composer_visible_input_rows(text: &str, terminal_width: u16, terminal_height:
 }
 
 fn visual_rows_for_text(text: &str, width: usize) -> usize {
-    text.width().max(1).div_ceil(width.max(1))
+    // Derived from the wrap so the rows reserved here always equal the rows
+    // actually drawn by render_composer (and the rows the cursor math counts).
+    wrap_composer_line(text, width).len()
+}
+
+/// Split one logical composer line into the visual sub-lines it occupies, each
+/// fitting within `width` display columns. The `Paragraph` that draws the
+/// composer has no soft-wrap, so without this the overflow of a long line is
+/// clipped at the pane edge and its reserved continuation row renders blank
+/// ("dark/invisible").
+///
+/// Packing is by grapheme cluster measured with `UnicodeWidthStr::width` (the
+/// same primitive `str::width()` uses), so a multi-codepoint glyph (CJK, emoji
+/// ZWJ/modifier/variation sequences) is never split across a row boundary, and
+/// the chunk count is the authoritative visual-row count (`visual_rows_for_text`
+/// delegates here) — keeping reserved height, rendered rows, and cursor row in
+/// agreement for every input. Always returns at least one (possibly empty)
+/// chunk so an empty logical line still occupies a row.
+fn wrap_composer_line(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_w = 0usize;
+    for grapheme in text.graphemes(true) {
+        let g_w = grapheme.width();
+        if current_w + g_w > width && !current.is_empty() {
+            chunks.push(std::mem::take(&mut current));
+            current_w = 0;
+        }
+        current.push_str(grapheme);
+        current_w += g_w;
+    }
+    if !current.is_empty() || chunks.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 const CODE_BLOCK_LINE_LIMIT: usize = 120;
 const COLLAPSED_TOOL_PREVIEW_LINES: usize = 1;
 const EXPANDED_TOOL_PREVIEW_LINES: usize = 24;
 
+/// True while an activity is genuinely in-flight. Thin wrapper over the shared
+/// [`crate::model::activity_status_is_running`] running-status set so the
+/// renderer's chip "active" count and the orphan activity-chip self-heal in
+/// [`crate::model::AppState::capture_completed_turn_activity`] stay in lockstep.
+/// Sub-agent liveness is tracked separately via the task count
+/// ([`running_subagent_titles_for_chip`]).
 fn is_running_activity(item: &ActivityItem) -> bool {
-    matches!(item.status.as_str(), "running" | "queued") || item.status.ends_with('%')
+    crate::model::activity_status_is_running(&item.status)
 }
 
 fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
@@ -1695,13 +1751,34 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         .rev()
         .copied()
         .collect::<Vec<_>>();
+    let pending_continuations = active_session_pending_continuations(app);
+    // The header counts tally the FULL per-turn set (from `flow_activity`), not
+    // the display-capped `group` — so a chip header agrees with the sibling
+    // "... +N older action(s)" footer below.
+    let full_group = |turn: Option<&octos_core::ui_protocol::TurnId>| -> Vec<&ActivityItem> {
+        flow_activity
+            .iter()
+            .copied()
+            .filter(|item| item.turn_id.as_ref() == turn)
+            .collect()
+    };
     let mut group: Vec<&ActivityItem> = Vec::new();
     let mut last_turn: Option<&octos_core::ui_protocol::TurnId> = None;
     for item in recent.iter().copied() {
         let turn_id = item.turn_id.as_ref();
         if last_turn != turn_id {
             if !group.is_empty() {
-                push_agent_task_group(lines, palette, last_turn, &group, app.expanded_tool_outputs);
+                push_agent_task_group(
+                    lines,
+                    palette,
+                    last_turn,
+                    &full_group(last_turn),
+                    &group,
+                    &running_subagent_titles_for_chip(app, last_turn),
+                    pending_continuations,
+                    is_active_group(app, last_turn),
+                    app.expanded_tool_outputs,
+                );
                 group.clear();
             }
             last_turn = turn_id;
@@ -1709,7 +1786,17 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         group.push(item);
     }
     if !group.is_empty() {
-        push_agent_task_group(lines, palette, last_turn, &group, app.expanded_tool_outputs);
+        push_agent_task_group(
+            lines,
+            palette,
+            last_turn,
+            &full_group(last_turn),
+            &group,
+            &running_subagent_titles_for_chip(app, last_turn),
+            pending_continuations,
+            is_active_group(app, last_turn),
+            app.expanded_tool_outputs,
+        );
     }
     if flow_activity.len() > recent.len() {
         lines.push(Line::from(vec![
@@ -1729,15 +1816,79 @@ fn has_flow_activity(app: &AppState) -> bool {
     !flow_activity_items(app).is_empty()
 }
 
+/// Pending master re-entries the server has queued for the active session
+/// (from the `session/orchestration` mirror). Drives the "re-entering" chip
+/// title so a settled-but-continuing turn doesn't read as completed.
+fn active_session_pending_continuations(app: &AppState) -> u32 {
+    app.active_session()
+        .and_then(|session| app.orchestration.get(&session.id))
+        .filter(|status| status.active)
+        .map(|status| status.pending_continuations)
+        .unwrap_or(0)
+}
+
+/// Whether the agent-task group identified by `group_turn` is the CURRENT/active
+/// turn's group (vs an ARCHIVED past-turn group).
+///
+/// Blocking bug 1: `active_session_pending_continuations` is a per-SESSION
+/// fact (the server's queued re-entry count), so feeding it to every group
+/// retitled archived completed/failed groups as "Re-entering". Only the active
+/// group may flip to "Re-entering"; this predicate scopes that.
+///
+/// A group is active when:
+/// - its `turn_id` equals the active session's live turn (`active_turn`), OR
+/// - it is the turn-less fold (`None`) AND no turn is live but the session is
+///   orchestrating — the turn-less sub-agent fold of the live orchestration is
+///   the current group (see `flow_activity_items` / `is_subagent_progress`).
+fn is_active_group(app: &AppState, group_turn: Option<&octos_core::ui_protocol::TurnId>) -> bool {
+    match (group_turn, app.active_turn()) {
+        (Some(group_turn), Some((_, active_turn))) => group_turn == active_turn,
+        (Some(_), None) => false,
+        // Turn-less fold: only the live orchestration's sub-agent fold (no live
+        // turn) is the current group. With a live turn present, the turn-less
+        // fold is not the active group.
+        (None, None) => app
+            .active_session()
+            .and_then(|session| app.orchestration.get(&session.id))
+            .is_some_and(|status| status.active),
+        (None, Some(_)) => false,
+    }
+}
+
 fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
     let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
     app.activity
         .iter()
         .filter(|item| match active_turn_id {
             Some(turn_id) => item.turn_id.as_ref() == Some(turn_id),
-            None => item.turn_id.is_none(),
+            // When no turn is active, turn-less running sub-agent progress is
+            // folded into the orchestrating turn's chip (as children) — don't
+            // also render it here as a separate turn-less "Orchestrating" chip.
+            None => item.turn_id.is_none() && !is_subagent_progress(app, item),
         })
         .collect()
+}
+
+/// A turn-less running sub-agent progress row (an `AgentUpdated` / spawn-complete
+/// `Progress` item with no originating turn) that is ALSO represented by a
+/// running sub-agent task. Such rows are surfaced under the orchestrating turn's
+/// chip via `running_subagent_titles_for_chip`, so they must not also form their
+/// own phantom turn-less "Orchestrating" chip (mini5 soak: the "two Orchestrating
+/// chips" for one parallel-spawn turn).
+///
+/// codex P2: we only suppress when a matching running TASK exists. A turn-less
+/// progress row with no matching task has nothing to fold into, so we keep it
+/// visible in the flow rather than hiding it entirely (orphaned-from-view).
+fn is_subagent_progress(app: &AppState, item: &ActivityItem) -> bool {
+    if item.turn_id.is_some() || item.kind != ActivityKind::Progress || !is_running_activity(item) {
+        return false;
+    }
+    app.active_session().is_some_and(|session| {
+        session.tasks.iter().any(|task| {
+            matches!(task_state_label(task.state), "pending" | "running")
+                && task.title == item.title
+        })
+    })
 }
 
 fn push_turn_activity_log_section(
@@ -1753,32 +1904,30 @@ fn push_turn_activity_log_section(
         lines.push(Line::from(""));
     }
     let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
-    let shown = log
-        .items
+    // Full uncapped set (header counts + footer tally both derive from this via
+    // `task_group_counts`, so they cannot diverge).
+    let full = log.items.iter().collect::<Vec<_>>();
+    let shown = full
         .iter()
         .rev()
         .take(shown_limit)
         .rev()
+        .copied()
         .collect::<Vec<_>>();
     push_agent_task_group(
         lines,
         palette,
         Some(&log.turn_id),
+        &full,
         &shown,
+        &running_subagent_titles_for_chip(app, Some(&log.turn_id)),
+        active_session_pending_continuations(app),
+        is_active_group(app, Some(&log.turn_id)),
         app.expanded_tool_outputs,
     );
-    if log.items.len() > shown.len() {
-        let hidden = log.items.len() - shown.len();
-        let completed = log
-            .items
-            .iter()
-            .filter(|item| activity_is_completed(item))
-            .count();
-        let active = log
-            .items
-            .iter()
-            .filter(|item| is_running_activity(item))
-            .count();
+    if full.len() > shown.len() {
+        let hidden = full.len() - shown.len();
+        let (_, completed, active, _) = task_group_counts(&full);
         lines.push(Line::from(vec![
             Span::styled("     ", palette.muted()),
             Span::styled(
@@ -1792,33 +1941,91 @@ fn push_turn_activity_log_section(
     }
 }
 
-fn push_agent_task_group(
-    lines: &mut Vec<Line<'static>>,
-    palette: Palette,
-    turn_id: Option<&octos_core::ui_protocol::TurnId>,
-    items: &[&ActivityItem],
-    expanded: bool,
-) {
-    if items.is_empty() {
-        return;
-    }
-    let active = items
-        .iter()
-        .filter(|item| is_running_activity(item))
-        .count();
-    let completed = items
-        .iter()
-        .filter(|item| activity_is_completed(item))
-        .count();
-    let failed = items.iter().filter(|item| activity_is_failed(item)).count();
-    let title = if active > 0 {
+/// "Tentacle pulse" octopus spinner frames (braille blob, all single-width).
+const SPINNER_FRAMES: [&str; 8] = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"];
+
+/// Current spinner frame, advancing ~every 120ms off a process-lifetime clock
+/// (independent of any turn timer, so it keeps animating while background
+/// sub-agents run after the parent turn has finished). The event loop redraws
+/// every ~25ms, so this reads as smooth motion.
+fn spinner_frame() -> &'static str {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    SPINNER_FRAMES[(elapsed / 120) as usize % SPINNER_FRAMES.len()]
+}
+
+/// Title for an agent-task group chip. Pure so it can be unit-tested
+/// directly (Gap 2 fix #2). The order of precedence is deliberate:
+///
+/// 1. `in_progress` (live tool calls or running sub-agents) → "Orchestrating".
+/// 2. `pending_continuations > 0` AND `is_active_group` → "re-entering". The
+///    parent's tool calls can all be settled while the server has a master
+///    re-entry queued; the CURRENT turn's chip must NOT read "Agent task
+///    completed" in that gap (the "looks done" lie).
+///
+///    Blocking bug 1: `pending_continuations` is the active SESSION's queued
+///    count, not a per-group fact. It must only retitle the CURRENT/active
+///    turn's group — never an ARCHIVED past-turn group (whose work is over and
+///    is not the thing being continued). `is_active_group` gates this. For the
+///    active group the continuation is the live truth, so it even wins over a
+///    `failed` parent (the failure is what is being retried/continued).
+/// 3. `failed > 0` → finished with errors (the only re-entry-beating outcome
+///    for ARCHIVED groups; pending never applies there).
+/// 4. otherwise → completed.
+fn agent_task_group_title(
+    in_progress: bool,
+    failed: usize,
+    pending_continuations: u32,
+    is_active_group: bool,
+) -> &'static str {
+    if in_progress {
         "Orchestrating..."
+    } else if is_active_group && pending_continuations > 0 {
+        "Re-entering (continuing)..."
     } else if failed > 0 {
         "Agent task finished with errors"
     } else {
         "Agent task completed"
-    };
-    let mut metadata = vec![format!("{} action(s)", items.len())];
+    }
+}
+
+/// Render an agent-task-group chip: a header (title + count metadata) plus the
+/// display-capped `items` as children.
+///
+/// `full_items` is the UNCAPPED turn activity set used for the HEADER counts;
+/// `items` is the display-capped slice (last N rows) actually rendered as
+/// children. The header tallies `full_items` via [`task_group_counts`] — the
+/// SAME helper the sibling "... +N older" footer uses — so the header and
+/// footer numbers cannot diverge (render-cap bug: a 66-action turn previously
+/// read "3 action(s) · 3 completed" because the header counted the cap).
+#[allow(clippy::too_many_arguments)]
+fn push_agent_task_group(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    turn_id: Option<&octos_core::ui_protocol::TurnId>,
+    full_items: &[&ActivityItem],
+    items: &[&ActivityItem],
+    subagent_titles: &[String],
+    pending_continuations: u32,
+    is_active_group: bool,
+    expanded: bool,
+) {
+    let active_subagents = subagent_titles.len();
+    if items.is_empty() && subagent_titles.is_empty() {
+        return;
+    }
+    // Header counts tally the FULL turn set, not the display-capped `items`.
+    let (total, completed, active, failed) = task_group_counts(full_items);
+    // `spawn` returns immediately, so the parent's tool-call rollup can be all
+    // "completed" while the sub-agents it launched are still running (tracked
+    // separately in `session.tasks`). Treat the turn as still orchestrating
+    // while any of its sub-agents are live, so the chip never says "completed"
+    // with work outstanding.
+    let in_progress = active > 0 || active_subagents > 0;
+    let title = agent_task_group_title(in_progress, failed, pending_continuations, is_active_group);
+    let mut metadata = vec![format!("{total} action(s)")];
     if active > 0 {
         metadata.push(format!("{active} active"));
     }
@@ -1828,12 +2035,19 @@ fn push_agent_task_group(
     if failed > 0 {
         metadata.push(format!("{failed} failed"));
     }
+    if active_subagents > 0 {
+        metadata.push(format!("{active_subagents} sub-agent(s) running"));
+    }
     if let Some(turn_id) = turn_id {
         metadata.push(format!("turn {}", short_id(&turn_id.0.to_string())));
     }
 
+    // While orchestrating, show the animated octopus "tentacle pulse" spinner;
+    // a settled chip keeps the static bullet. Both are 1 col wide so the title
+    // stays aligned whether running or done.
+    let icon = if in_progress { spinner_frame() } else { "•" };
     let spans = vec![
-        Span::styled("• ", palette.selected()),
+        Span::styled(format!("{icon} "), palette.selected()),
         Span::styled(title, palette.title().add_modifier(Modifier::BOLD)),
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
@@ -1841,6 +2055,21 @@ fn push_agent_task_group(
 
     for (idx, item) in items.iter().enumerate() {
         push_agent_task_child(lines, palette, item, idx == 0, expanded);
+    }
+
+    // List this turn's running sub-agents (from session.tasks, attributed by
+    // turn) as children, so their live progress shows under THIS chip instead
+    // of forming a separate turn-less "Orchestrating" chip (mini5 soak: folds
+    // the phantom second chip into the orchestrating turn's chip).
+    for (idx, title) in subagent_titles.iter().enumerate() {
+        let first = items.is_empty() && idx == 0;
+        let prefix = if first { "  ⎿  " } else { "     " };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, palette.border()),
+            Span::styled("◻ ", palette.selected()),
+            Span::styled(title.clone(), palette.text()),
+            Span::styled("  running", palette.muted()),
+        ]));
     }
 }
 
@@ -1997,7 +2226,12 @@ fn push_compact_tool_preview(
 
 fn activity_status_icon(item: &ActivityItem, palette: Palette) -> (&'static str, Style) {
     if is_running_activity(item) {
-        ("◻", palette.selected())
+        // Animate the marker for in-progress rows (octopus spinner) so a row
+        // like "Background work started for run_pipeline" visibly reads as
+        // still-running rather than a static dot. Uses the shared
+        // process-clock spinner (not terminal SGR blink, which is unreliable /
+        // distracting and inconsistently supported).
+        (spinner_frame(), palette.selected())
     } else if activity_is_failed(item) {
         ("✗", Style::default().fg(palette.danger))
     } else if activity_is_completed(item) {
@@ -2019,11 +2253,46 @@ fn activity_is_failed(item: &ActivityItem) -> bool {
     matches!(item.success, Some(false)) || matches!(item.status.as_str(), "failed" | "error")
 }
 
+/// Tally the agent-task-group counts over a slice of activity items.
+///
+/// Returns `(total, completed, active, failed)` using the SAME predicates the
+/// chip header and footer already use ([`activity_is_completed`],
+/// [`is_running_activity`], [`activity_is_failed`]).
+///
+/// The chip header MUST tally over the FULL turn activity set, not the
+/// display-capped slice of children that's actually rendered — otherwise a
+/// 66-action turn showing the last 3 rows reads "3 action(s) · 3 completed"
+/// while its own "... +63 older action(s)" footer proves the real total is 66.
+/// Both the header and the footer call this single helper so their numbers
+/// cannot diverge.
+fn task_group_counts(full_items: &[&ActivityItem]) -> (usize, usize, usize, usize) {
+    let total = full_items.len();
+    let completed = full_items
+        .iter()
+        .filter(|item| activity_is_completed(item))
+        .count();
+    let active = full_items
+        .iter()
+        .filter(|item| is_running_activity(item))
+        .count();
+    let failed = full_items
+        .iter()
+        .filter(|item| activity_is_failed(item))
+        .count();
+    (total, completed, active, failed)
+}
+
 fn push_inline_diff_preview(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
     diff: &DiffPreviewPaneState,
 ) {
+    // C6: when there is no usable line diff ("line diff unavailable for this
+    // mutation"), hide the box entirely instead of rendering an empty preview
+    // with a dead "[/] select hunk | c stage" UI. Loading/error stay visible.
+    if !diff.has_renderable_diff() {
+        return;
+    }
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
@@ -2212,6 +2481,56 @@ fn active_background_tasks(app: &AppState) -> usize {
                 .count()
         })
         .unwrap_or(0)
+}
+
+/// Titles of the running sub-agents attributed to an agent-task chip. Each
+/// running task is attributed to the chip for its OWN originating turn
+/// (`task.turn_id`, stamped by the server per C1 step 4), so two turns can no
+/// longer both claim the same global sub-agent count — the "two Orchestrating
+/// chips" bug (C5). Background sub-agents outlive the parent turn (it shows
+/// "done" while they keep running), and that still works: their `turn_id` keeps
+/// pointing at the turn that spawned them, so that — and only that — chip stays
+/// "Orchestrating", and lists those agents as its children (so their live
+/// progress no longer forms a *second*, turn-less "Orchestrating" chip).
+///
+/// Tasks the server couldn't stamp with a turn (legacy daemons, `session/open`
+/// replay, synthetic emitters → `turn_id == None`) fall back to a SINGLE current
+/// chip — the active (live) turn if one exists, else the latest activity-log
+/// turn — so they still surface without being double-counted across chips.
+fn running_subagent_titles_for_chip(
+    app: &AppState,
+    turn_id: Option<&octos_core::ui_protocol::TurnId>,
+) -> Vec<String> {
+    let Some(chip_turn) = turn_id else {
+        return Vec::new();
+    };
+    let Some(session) = app.active_session() else {
+        return Vec::new();
+    };
+    // The one chip that owns turn-less tasks: prefer the active (live) turn; if
+    // the turn already finished, this session's latest activity-log turn. At most
+    // one chip is ever "current", so unattributed tasks are counted exactly once.
+    // Scope the log lookup to the active session (codex P2): `turn_activity_logs`
+    // is cross-session, and the tasks we count belong to `session`, so a newer
+    // log in a *different* session must not steal this session's fallback chip.
+    let current_turn = app.active_turn().map(|(_, t)| t).or_else(|| {
+        app.turn_activity_logs
+            .iter()
+            .rev()
+            .find(|log| log.session_id == session.id)
+            .map(|log| &log.turn_id)
+    });
+    let owns_unattributed = current_turn == Some(chip_turn);
+    session
+        .tasks
+        .iter()
+        .filter(|task| matches!(task_state_label(task.state), "pending" | "running"))
+        .filter(|task| match task.turn_id.as_ref() {
+            Some(task_turn) => task_turn == chip_turn,
+            None => owns_unattributed,
+        })
+        .map(|task| task.title.clone())
+        .collect()
 }
 
 fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -2693,6 +3012,204 @@ fn render_autonomy_indicator(app: &AppState, palette: Palette) -> Paragraph<'sta
     Paragraph::new(Text::from(lines)).style(Style::default().fg(palette.text).bg(palette.surface))
 }
 
+/// Default context-window denominator used to render `ctx N%`. The wire does
+/// not (yet) carry a per-model context-window max, so we estimate the percent
+/// against a common modern default. Surfaces the inspector-only
+/// `token_estimate` as a glanceable budget bar in the harness status row.
+const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
+
+/// Compact token count for the harness row: `34211` -> `34.2k`.
+fn humanize_token_count(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// True when the harness has live state worth surfacing in the dedicated
+/// status row: the active session is orchestrating (server `active`) OR a turn
+/// is in progress locally. Idle → the row collapses to height 0 so it can
+/// never collide with the composer's top-border chrome (the prior revert,
+/// 249fe652, drew the indicator ON the composer border).
+fn harness_status_active(app: &AppState) -> bool {
+    let orchestrating = app
+        .active_session()
+        .and_then(|session| app.orchestration.get(&session.id))
+        .is_some_and(|status| status.active);
+    orchestrating || matches!(app.run_state, SessionRunState::InProgress)
+}
+
+/// Rows the harness status indicator needs: 1 when active, 0 when idle.
+fn harness_status_height(app: &AppState) -> u16 {
+    if harness_status_active(app) { 1 } else { 0 }
+}
+
+/// Context-window fill ratio (0.0..=1.0) for the harness row `LineGauge`, or
+/// `None` when no `token_estimate` is known for the active session yet.
+fn harness_context_ratio(app: &AppState) -> Option<f64> {
+    let session = app.active_session()?;
+    let token_estimate = app
+        .context_lifecycle_for(&session.id)?
+        .state
+        .as_ref()?
+        .token_estimate;
+    if DEFAULT_CONTEXT_WINDOW_TOKENS == 0 {
+        return None;
+    }
+    Some((token_estimate as f64 / DEFAULT_CONTEXT_WINDOW_TOKENS as f64).clamp(0.0, 1.0))
+}
+
+/// Integer context-window percent (0..=100) for the `ctx N%` label.
+fn harness_context_percent(app: &AppState) -> Option<u16> {
+    harness_context_ratio(app).map(|ratio| (ratio * 100.0).round() as u16)
+}
+
+/// Build the harness status line(s): spinner + phase + agent count +
+/// re-entering + token in/out + cost + retry + ctx %. Empty when idle.
+fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+    if !harness_status_active(app) {
+        return Vec::new();
+    }
+    let Some(session) = app.active_session() else {
+        return Vec::new();
+    };
+    let session_id = session.id.clone();
+    let status = app.orchestration.get(&session_id);
+
+    let phase = match status.and_then(|s| s.phase.as_deref()) {
+        Some("orchestrating") => "Orchestrating",
+        Some("re-entering") => "Re-entering",
+        Some("working") => "Working",
+        Some(other) if !other.is_empty() => other,
+        _ => "Working",
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled(
+        format!("{} ", spinner_frame()),
+        Style::default()
+            .fg(palette.accent)
+            .add_modifier(Modifier::BOLD)
+            .bg(palette.surface),
+    ));
+    spans.push(Span::styled(
+        phase.to_string(),
+        palette.title().bg(palette.surface),
+    ));
+
+    if let Some(status) = status {
+        if status.running_agents > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " · {} agent{}",
+                    status.running_agents,
+                    if status.running_agents == 1 { "" } else { "s" }
+                ),
+                palette.text().bg(palette.surface),
+            ));
+        }
+        // The re-entry gap (sub-agents settled, a continuation queued) is the
+        // whole reason for this row: it must NOT read as done.
+        if status.pending_continuations > 0 {
+            spans.push(Span::styled(
+                " · re-entering".to_string(),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+    }
+
+    // Token in/out + cumulative session cost (from token_cost progress).
+    if let Some((input, output, cost)) = app.session_usage.get(&session_id) {
+        if input.is_some() || output.is_some() {
+            spans.push(Span::styled(
+                format!(
+                    " · ↑{} ↓{}",
+                    humanize_token_count(input.unwrap_or(0)),
+                    humanize_token_count(output.unwrap_or(0)),
+                ),
+                palette.text().bg(palette.surface),
+            ));
+        }
+        if let Some(cost) = cost.filter(|c| *c > 0.0) {
+            spans.push(Span::styled(
+                format!(" · ${cost:.4}"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+    }
+
+    // Retry/backoff (metadata.retry — previously ignored on the wire).
+    if let Some(retry) = app.session_retry.get(&session_id) {
+        let attempt = match (retry.attempt, retry.max_attempts) {
+            (Some(a), Some(max)) => format!(" · retrying (attempt {a}/{max})"),
+            (Some(a), None) => format!(" · retrying (attempt {a})"),
+            _ => " · retrying".to_string(),
+        };
+        spans.push(Span::styled(
+            attempt,
+            palette
+                .muted()
+                .bg(palette.surface)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Context window %, mirrored as the textual label alongside the gauge so
+    // it survives a narrow terminal (and is unit-testable).
+    if let Some(percent) = harness_context_percent(app) {
+        // `~` marks this as an estimate: the wire carries no per-model context
+        // window, so the percent is against a fixed default denominator
+        // (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate when the real
+        // model window differs.
+        spans.push(Span::styled(
+            format!(" · ctx ~{percent}%"),
+            palette.muted().bg(palette.surface),
+        ));
+    }
+
+    vec![Line::from(spans)]
+}
+
+/// Render the dedicated harness status row. Splits the row so the textual
+/// status sits on the left and a `LineGauge` context-window bar sits on the
+/// right when a `token_estimate` is known. Drawn into its own layout row
+/// (never the composer border).
+fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
+    let lines = harness_status_lines(app, palette);
+    if lines.is_empty() {
+        return;
+    }
+    let ratio = harness_context_ratio(app);
+    // Reserve a fixed-width column for the context gauge only when we have a
+    // ratio to show; otherwise the text spans the full width.
+    const GAUGE_WIDTH: u16 = 18;
+    if let Some(ratio) = ratio.filter(|_| area.width > GAUGE_WIDTH + 12) {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(12), Constraint::Length(GAUGE_WIDTH)])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(palette.text).bg(palette.surface)),
+            split[0],
+        );
+        let percent = (ratio * 100.0).round() as u16;
+        let gauge = LineGauge::default()
+            .ratio(ratio)
+            .label(format!("ctx ~{percent}%"))
+            .filled_style(Style::default().fg(palette.accent).bg(palette.surface))
+            .unfilled_style(Style::default().fg(palette.frame).bg(palette.surface));
+        frame.render_widget(gauge, split[1]);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Text::from(lines))
+                .style(Style::default().fg(palette.text).bg(palette.surface)),
+            area,
+        );
+    }
+}
+
 fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
     let mut lines = Vec::new();
     let composer = app.composer_presentation();
@@ -2752,17 +3269,22 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         ])),
         ComposerPresentation::Inline(_) => {
             if let Some(view) = input_view.as_ref() {
-                for (index, line) in view.lines.iter().enumerate() {
-                    let prefix = if index == 0 { " › " } else { "   " };
-                    let prefix_style = if index == 0 {
-                        palette.selected().bg(palette.surface)
-                    } else {
-                        palette.muted().bg(palette.surface)
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(prefix, prefix_style),
-                        Span::styled(line.clone(), palette.text().bg(palette.surface)),
-                    ]));
+                let text_width = composer_text_width(area.width);
+                let mut first_row = true;
+                for line in view.lines.iter() {
+                    for chunk in wrap_composer_line(line, text_width) {
+                        let prefix = if first_row { " › " } else { "   " };
+                        let prefix_style = if first_row {
+                            palette.selected().bg(palette.surface)
+                        } else {
+                            palette.muted().bg(palette.surface)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix, prefix_style),
+                            Span::styled(chunk, palette.text().bg(palette.surface)),
+                        ]));
+                        first_row = false;
+                    }
                 }
             }
         }
@@ -2788,17 +3310,16 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         }
     }
 
+    let block = titled_block(
+        "Composer",
+        palette,
+        app.focus == FocusPane::Composer,
+        Some("Enter send | Tab inspector"),
+    )
+    .border_style(palette.border());
     Paragraph::new(Text::from(lines))
         .style(Style::default().fg(palette.text).bg(palette.surface))
-        .block(
-            titled_block(
-                "Composer",
-                palette,
-                app.focus == FocusPane::Composer,
-                Some("Enter send | Tab inspector"),
-            )
-            .border_style(palette.border()),
-        )
+        .block(block)
 }
 
 fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -2970,19 +3491,36 @@ fn tail_around_cursor(
     width: usize,
     max_rows: usize,
 ) -> VisibleCursorLine {
-    let max_width = width.saturating_mul(max_rows).max(1);
     let prefix = &text[..cursor.min(text.len())];
-    let prefix_width = prefix.width();
-    if text.width() <= max_width || prefix_width < max_width {
+    // Whole line fits the budget: show it unchanged. Measured via the same
+    // grapheme wrapping render uses, so this can't disagree with what is drawn.
+    if visual_rows_for_text(text, width) <= max_rows {
         return VisibleCursorLine {
             text: text.to_string(),
             before_cursor: prefix.to_string(),
         };
     }
-
-    let suffix_width = max_width.saturating_sub(3).max(1);
-    let before_cursor = suffix_by_display_width(prefix, suffix_width);
-    let text = format!("...{before_cursor}");
+    // Line is taller than the budget. If the cursor is still within the first
+    // `max_rows` rows, show the HEAD window (the first `max_rows` wrapped rows)
+    // — the cursor is already inside it — so render never emits more rows than
+    // the composer reserved (which would clip the footer).
+    let cursor_chunks = wrap_composer_line(prefix, width);
+    if cursor_chunks.len() <= max_rows {
+        let chunks = wrap_composer_line(text, width);
+        let head: String = chunks[..max_rows.min(chunks.len())].concat();
+        return VisibleCursorLine {
+            text: head,
+            before_cursor: prefix.to_string(),
+        };
+    }
+    // Cursor is past the budget: show the tail of `prefix` ending at the cursor.
+    // Keep the last `max_rows - 1` wrapped rows and reserve the first row for the
+    // "..." marker, so the window never exceeds `max_rows` rows even when
+    // double-width graphemes leave spare columns at a row boundary.
+    let keep = max_rows.saturating_sub(1).max(1);
+    let start = cursor_chunks.len().saturating_sub(keep);
+    let tail: String = cursor_chunks[start..].concat();
+    let text = format!("...{tail}");
     VisibleCursorLine {
         text: text.clone(),
         before_cursor: text,
@@ -2990,41 +3528,19 @@ fn tail_around_cursor(
 }
 
 fn cursor_row_for_text(text: &str, width: usize) -> usize {
-    let display_width = text.width();
-    if display_width == 0 {
-        0
-    } else {
-        (display_width - 1) / width.max(1)
-    }
+    // Row index of the cursor within its logical line, derived from the same
+    // grapheme wrapping render uses (wrap_composer_line) so the cursor sits on
+    // the row the text is actually drawn on.
+    wrap_composer_line(text, width).len().saturating_sub(1)
 }
 
 fn cursor_width_for_text(text: &str, width: usize) -> usize {
-    let display_width = text.width();
-    if display_width == 0 {
-        0
-    } else {
-        ((display_width - 1) % width.max(1)) + 1
-    }
-}
-
-fn suffix_by_display_width(text: &str, max_width: usize) -> String {
-    if max_width == 0 {
-        return String::new();
-    }
-    let mut width = 0usize;
-    let mut chars = Vec::new();
-    for ch in text.chars().rev() {
-        let ch_width = ch.width().unwrap_or(0);
-        if width > 0 && width.saturating_add(ch_width) > max_width {
-            break;
-        }
-        width = width.saturating_add(ch_width);
-        chars.push(ch);
-        if width >= max_width {
-            break;
-        }
-    }
-    chars.into_iter().rev().collect()
+    // Display column of the cursor within its row: the width of the last wrapped
+    // chunk (0 for empty input).
+    wrap_composer_line(text, width)
+        .last()
+        .map(|chunk| chunk.width())
+        .unwrap_or(0)
 }
 
 fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
@@ -3789,6 +4305,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: String::new(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -3815,6 +4332,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: "artifact log line\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -3954,6 +4472,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: "artifact log line\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -4256,7 +4775,15 @@ mod tests {
                     path: "styles.css".into(),
                     old_path: None,
                     status: "modified".into(),
-                    hunks: Vec::new(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![DiffPreviewLine {
+                            kind: "added".into(),
+                            content: "body {}".into(),
+                            old_line: None,
+                            new_line: Some(1),
+                        }],
+                    }],
                 }],
             },
         });
@@ -4341,7 +4868,15 @@ mod tests {
                     path: "src/styles.css".into(),
                     old_path: None,
                     status: "modified".into(),
-                    hunks: Vec::new(),
+                    hunks: vec![DiffPreviewHunk {
+                        header: "@@ -1 +1 @@".into(),
+                        lines: vec![DiffPreviewLine {
+                            kind: "added".into(),
+                            content: "body {}".into(),
+                            old_line: None,
+                            new_line: Some(1),
+                        }],
+                    }],
                 }],
             },
         });
@@ -4516,6 +5051,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: None,
                     output_tail: String::new(),
+                    turn_id: None,
                 }],
                 live_reply: Some(crate::model::LiveReply {
                     turn_id: TurnId::new(),
@@ -5310,6 +5846,72 @@ mod tests {
     }
 
     #[test]
+    fn render_composer_draws_wrapped_tail_of_long_single_line() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // One logical line longer than the composer width: the tail must wrap
+        // onto a 2nd visible row, not be clipped (and the reserved row left dark).
+        app.composer = format!("HEAD{}TAIL", "x".repeat(160));
+
+        let palette = Palette::for_theme(ThemeName::Codex);
+        let (buffer, _cursor) = rendered_buffer_and_cursor(&app, palette);
+        let rows = rendered_rows(&buffer);
+
+        let head_row = row_index_containing(&rows, "HEAD");
+        let tail_row = row_index_containing(&rows, "TAIL");
+        assert!(
+            tail_row > head_row,
+            "wrapped tail should render below the head (head={head_row}, tail={tail_row})"
+        );
+        // ...and it must be drawn in the visible text colour, not the surface bg.
+        let tail_style = style_for_text(&buffer, "TAIL").expect("tail rendered");
+        assert_eq!(
+            tail_style.fg,
+            Some(palette.text),
+            "wrapped tail must use the composer text colour, not be invisible"
+        );
+    }
+
+    #[test]
+    fn tail_around_cursor_caps_window_to_row_budget() {
+        let width = 10;
+        let max_rows = 3;
+        // A single logical line far taller than the budget.
+        let text = "x".repeat(100);
+
+        // Cursor at the very start: HEAD window, must not exceed the budget
+        // (render_composer wraps the returned text, so an over-long return clips
+        // the composer footer).
+        let head = tail_around_cursor(&text, 0, width, max_rows);
+        assert!(
+            visual_rows_for_text(&head.text, width) <= max_rows,
+            "head window must fit row budget, got {} rows",
+            visual_rows_for_text(&head.text, width)
+        );
+
+        // Cursor at the end: TAIL window, also within budget, marked truncated.
+        let tail = tail_around_cursor(&text, text.len(), width, max_rows);
+        assert!(
+            visual_rows_for_text(&tail.text, width) <= max_rows,
+            "tail window must fit row budget, got {} rows",
+            visual_rows_for_text(&tail.text, width)
+        );
+        assert!(tail.text.starts_with("..."), "tail window marks truncation");
+    }
+
+    #[test]
     fn render_empty_composer_shows_cursor_before_hint() {
         let app = AppState::new(
             vec![SessionView {
@@ -5594,6 +6196,898 @@ mod tests {
         assert!(text.contains("... +9 more"));
         assert!(text.contains("12 completed"));
         assert!(!text.contains("src/file_1.rs"));
+    }
+
+    #[test]
+    fn chip_stays_orchestrating_while_sub_agents_run_after_parent_calls_complete() {
+        // Parallel-spawn regression: `spawn` returns immediately, so the parent
+        // turn's tool calls are all "completed" while the spawned sub-agents
+        // (session.tasks, Running) are still working. The chip must NOT say
+        // "Agent task completed" — it should stay "Orchestrating…" and surface
+        // the running sub-agent count.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("launch agents to study X, Y, Z")],
+                tasks: vec![
+                    crate::model::TaskView {
+                        id: octos_core::TaskId::new(),
+                        title: "hermes-research".into(),
+                        state: TaskRuntimeState::Running,
+                        runtime_detail: None,
+                        output_tail: String::new(),
+                        turn_id: None,
+                    },
+                    crate::model::TaskView {
+                        id: octos_core::TaskId::new(),
+                        title: "openclaw-research".into(),
+                        state: TaskRuntimeState::Running,
+                        runtime_detail: None,
+                        output_tail: String::new(),
+                        turn_id: None,
+                    },
+                ],
+                // Parent turn has FINISHED (no live_reply) but the background
+                // sub-agents it spawned are still running — the chip must still
+                // attribute them (via latest-turn), not flip to "completed".
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("launch agents".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+                ActivityItem::new(ActivityKind::Tool, "glob", "complete")
+                    .with_turn(turn_id)
+                    .with_success(true),
+            ],
+        });
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Orchestrating"),
+            "chip must stay Orchestrating while sub-agents run: {text:?}"
+        );
+        assert!(
+            text.contains("2 sub-agent(s) running"),
+            "chip should surface the running sub-agent count: {text:?}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "chip must NOT report completed while sub-agents run: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_task_group_title_with_pending_continuations_does_not_say_completed() {
+        // Gap 2 fix #2: when the parent's tool calls are all settled (no active
+        // items, no running sub-agents) but the server reports a pending
+        // continuation, the title must NOT read "Agent task completed" — that
+        // "looks done" lie hides the master re-entry. It must reflect
+        // re-entering/continuing instead. The pending re-entry only applies to
+        // the CURRENT/active group (`is_active_group = true`).
+        let settled = agent_task_group_title(false, 0, 0, true);
+        assert_eq!(settled, "Agent task completed", "baseline settled title");
+
+        let reentering = agent_task_group_title(false, 0, 1, true);
+        assert!(
+            !reentering.to_lowercase().contains("completed")
+                && !reentering.to_lowercase().contains("done"),
+            "pending continuation must not read as completed/done: {reentering:?}"
+        );
+        assert!(
+            reentering.to_lowercase().contains("re-enter")
+                || reentering.to_lowercase().contains("continu"),
+            "pending continuation must read as re-entering/continuing: {reentering:?}"
+        );
+
+        // In-progress still wins (orchestrating), and errors still surface even
+        // with a pending continuation.
+        assert!(agent_task_group_title(true, 0, 1, true).contains("Orchestrating"));
+        assert!(
+            agent_task_group_title(false, 2, 0, true)
+                .to_lowercase()
+                .contains("error")
+        );
+    }
+
+    #[test]
+    fn agent_task_group_title_pending_continuation_does_not_retitle_archived_group() {
+        // Blocking bug 1: `pending_continuations` is the active session's queued
+        // re-entry count. It is fed into EVERY group title call, including
+        // ARCHIVED past-turn groups. A settled archived group (no live work)
+        // must keep its "completed" title even while a continuation is pending —
+        // only the CURRENT/active group may flip to "Re-entering". Guard via
+        // `is_active_group = false`.
+        let archived_completed = agent_task_group_title(false, 0, 1, false);
+        assert_eq!(
+            archived_completed, "Agent task completed",
+            "archived completed group must NOT read as re-entering: {archived_completed:?}"
+        );
+
+        // An archived FAILED group must keep its failed title — `failed > 0`
+        // must NOT be overridden by the active session's pending continuation.
+        let archived_failed = agent_task_group_title(false, 2, 1, false);
+        assert!(
+            archived_failed.to_lowercase().contains("error"),
+            "archived failed group must keep its failed title, not re-entering: {archived_failed:?}"
+        );
+        assert!(
+            !archived_failed.to_lowercase().contains("re-enter"),
+            "archived failed group must NOT read as re-entering: {archived_failed:?}"
+        );
+    }
+
+    #[test]
+    fn archived_completed_group_keeps_title_while_active_turn_continuation_pending() {
+        // Blocking bug 1 (end-to-end render): a session has an ARCHIVED
+        // completed turn (turn A) AND a live active turn (turn B). The server
+        // reports a pending continuation for the session. The archived group
+        // must STILL read "Agent task completed" — only the active turn's group
+        // may flip to "Re-entering". (RED on f588b6f: the pending count was fed
+        // to every group, retitling the archived completed turn.)
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let archived_turn = TurnId::new();
+        let active_turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("first request"),
+                    Message::assistant("First answer."),
+                    Message::user("second request"),
+                ],
+                tasks: vec![],
+                // Active turn B is live (the current/active group).
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Archived completed group for turn A, anchored to the first request.
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: archived_turn,
+            request: Some("first request".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete").with_success(true),
+            ],
+        });
+        // Server has a continuation queued for the active session.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 1,
+                phase: Some("re-entering".into()),
+            },
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Agent task completed"),
+            "archived completed group must keep its title: {text:?}"
+        );
+    }
+
+    #[test]
+    fn archived_failed_group_keeps_failed_title_while_continuation_pending() {
+        // Blocking bug 1 (end-to-end render): an ARCHIVED FAILED group must keep
+        // its failed title even while a continuation is pending for the active
+        // session — pending must NOT override `failed > 0` for a non-active
+        // group. (RED on f588b6f: pending won over failed, losing the failed
+        // title on archived groups.)
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let archived_turn = TurnId::new();
+        let active_turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("first request"),
+                    Message::assistant("First answer."),
+                    Message::user("second request"),
+                ],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: archived_turn,
+            request: Some("first request".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "failed").with_success(false),
+            ],
+        });
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 1,
+                phase: Some("re-entering".into()),
+            },
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Agent task finished with errors"),
+            "archived failed group must keep its failed title: {text:?}"
+        );
+    }
+
+    #[test]
+    fn active_turn_group_with_pending_continuation_reads_reentering() {
+        // Blocking bug 1 (pins intended behavior): the ACTIVE/current turn's
+        // group (the live `live_reply` turn, archived to its log) DOES read
+        // "Re-entering (continuing)…" when a continuation is pending. The active
+        // group is identified by `log.turn_id == active_turn().turn_id`.
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let active_turn = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("only request")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: active_turn.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // The active turn's settled tool calls are archived to its log (the
+        // re-entry gap: parent calls done, continuation queued).
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: session_id.clone(),
+            turn_id: active_turn.clone(),
+            request: Some("only request".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(active_turn)
+                    .with_success(true),
+            ],
+        });
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 1,
+                phase: Some("re-entering".into()),
+            },
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Re-entering (continuing)"),
+            "active turn group with pending continuation reads re-entering: {text:?}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "active turn group must NOT read completed during the re-entry gap: {text:?}"
+        );
+    }
+
+    #[test]
+    fn task_group_counts_tally_full_set_not_display_cap() {
+        // Render-cap bug: the chip header counted the DISPLAY-CAPPED slice (3 or
+        // 12 rows), so a 66-action turn read "3 action(s) · 3 completed" even
+        // though its sibling footer correctly tallied the full 66. The header
+        // and footer now both call `task_group_counts` over the FULL set, so the
+        // counts reflect 66 actions — not the cap.
+        let mut items: Vec<ActivityItem> = Vec::new();
+        // 60 completed earlier actions.
+        for _ in 0..60 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete").with_success(true),
+            );
+        }
+        // 2 active (still running) earlier actions.
+        items.push(ActivityItem::new(
+            ActivityKind::Tool,
+            "run_pipeline",
+            "running",
+        ));
+        items.push(ActivityItem::new(
+            ActivityKind::Tool,
+            "run_pipeline",
+            "running",
+        ));
+        // 1 failed earlier action.
+        items.push(ActivityItem::new(ActivityKind::Tool, "shell", "failed").with_success(false));
+        // Last 3 (the only ones the chip renders as children) are completed.
+        for _ in 0..3 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete").with_success(true),
+            );
+        }
+        assert_eq!(items.len(), 66, "fixture sanity: 66 total actions");
+
+        let full: Vec<&ActivityItem> = items.iter().collect();
+        let (total, completed, active, failed) = task_group_counts(&full);
+        assert_eq!(total, 66, "total must be the FULL set, not the display cap");
+        assert_eq!(completed, 63, "60 early + 3 late completed");
+        assert_eq!(active, 2, "two running actions");
+        assert_eq!(failed, 1, "one failed action");
+
+        // The display-capped slice (last 3) must NOT be what the header counts:
+        // if the header tallied the cap it would read 3/3/0/0 — the original bug.
+        let capped: Vec<&ActivityItem> = full.iter().rev().take(3).rev().copied().collect();
+        let (cap_total, cap_completed, _, _) = task_group_counts(&capped);
+        assert_eq!(cap_total, 3);
+        assert_eq!(cap_completed, 3);
+        assert_ne!(
+            (total, completed),
+            (cap_total, cap_completed),
+            "header tally must differ from the display-cap tally"
+        );
+    }
+
+    #[test]
+    fn chip_header_counts_full_turn_set_and_agrees_with_footer() {
+        // End-to-end render guard: a 66-action turn's chip HEADER must read the
+        // full set ("66 action(s) · ... 66 completed") and AGREE with its sibling
+        // "... +63 more" footer — not the display-capped "3 action(s) · 3
+        // completed". RED on the pre-fix code: the header counted only the last
+        // 3 rendered children.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut items: Vec<ActivityItem> = Vec::new();
+        // 63 earlier actions, all completed.
+        for _ in 0..63 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+            );
+        }
+        // Last 3 (the rendered children) completed too → 66 total, 66 completed.
+        for _ in 0..3 {
+            items.push(
+                ActivityItem::new(ActivityKind::Tool, "read_file", "complete")
+                    .with_turn(turn_id.clone())
+                    .with_success(true),
+            );
+        }
+        assert_eq!(items.len(), 66);
+
+        let app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("big turn")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let mut app = app;
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id,
+            request: Some("big turn".into()),
+            anchor_index: Some(0),
+            items,
+        });
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("66 action(s)"),
+            "header must read the full 66-action set, not the display cap: {text:?}"
+        );
+        assert!(
+            !text.contains("3 action(s)"),
+            "header must NOT read the capped 3-action slice: {text:?}"
+        );
+        // 63 of the 66 are hidden (only 3 rendered as children); footer tallies
+        // the full set, so header and footer must agree.
+        assert!(
+            text.contains("+63 more"),
+            "footer must report the 63 hidden actions: {text:?}"
+        );
+        assert!(
+            text.contains("66 completed"),
+            "header completed count must reflect the full set: {text:?}"
+        );
+    }
+
+    #[test]
+    fn agent_task_group_title_failed_active_turn_with_pending_reads_reentering() {
+        // Precedence decision for the ACTIVE group: a failed active turn that
+        // the server is genuinely continuing (pending_continuations > 0) reads
+        // "Re-entering (continuing)…" — the queued continuation is the live
+        // truth (the failure is being retried/continued), so it wins over the
+        // failed title FOR THE ACTIVE GROUP ONLY.
+        let active_failed_pending = agent_task_group_title(false, 1, 1, true);
+        assert!(
+            active_failed_pending.to_lowercase().contains("re-enter")
+                || active_failed_pending.to_lowercase().contains("continu"),
+            "failed active turn that is continuing reads re-entering: {active_failed_pending:?}"
+        );
+
+        // A failed active turn with NO pending continuation still reads as
+        // failed (no continuation queued → it really did finish with errors).
+        let active_failed = agent_task_group_title(false, 1, 0, true);
+        assert!(
+            active_failed.to_lowercase().contains("error"),
+            "failed active turn with no continuation reads as failed: {active_failed:?}"
+        );
+    }
+
+    #[test]
+    fn leaked_running_item_in_terminal_turn_log_does_not_pin_orchestrating() {
+        // Orphan activity-chip self-heal: a `ToolStarted` whose matching
+        // `ToolCompleted` never arrived (a leaked spawn_only chip / any future
+        // uncovered path) leaves a "running"-status item bound to the turn. When
+        // the turn reaches its terminal state, `capture_completed_turn_activity`
+        // archives the turn's activity AND reconciles the stranded running item
+        // to a terminal status. With no live work and no running sub-agents, the
+        // captured chip must NOT stay pinned on "Orchestrating…" — its turn is
+        // over. This is the path that reappears after a reconnect: hydrate
+        // replays the unbalanced started-state and the turn re-completes through
+        // the same capture, healing the residual chip.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![
+                    Message::user("run the background job"),
+                    Message::assistant("Kicked off the background job."),
+                ],
+                // No live_reply → this turn is terminal / not the active turn,
+                // and no sub-agent tasks remain.
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Leaked started-state in the turn's live activity: status never reached
+        // terminal because no `ToolCompleted` arrived.
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-leaked"),
+        );
+        // The turn went terminal: capturing it must self-heal the leaked item.
+        assert!(app.capture_completed_turn_activity(&session_id, &turn_id));
+
+        let text = rendered_text(&app);
+        assert!(
+            !text.contains("Orchestrating"),
+            "a leaked running item in a terminal turn must not pin Orchestrating: {text:?}"
+        );
+        assert!(
+            !text.contains("1 active"),
+            "the leaked item must not be counted as active once its turn is terminal: {text:?}"
+        );
+    }
+
+    #[test]
+    fn leaked_running_item_in_active_turn_still_shows_orchestrating() {
+        // Guard against over-suppression: a "running" item whose turn IS the
+        // session's currently-active turn (live_reply present) is genuine
+        // in-flight work and MUST still read as Orchestrating. The self-heal
+        // only fires when the turn is captured as terminal; an active turn's
+        // live activity is never captured/reconciled.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the live job")],
+                tasks: vec![],
+                // Active turn: live_reply present and pointing at turn_id.
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.push_activity(
+            ActivityItem::new(ActivityKind::Tool, "run_pipeline", "running")
+                .with_turn(turn_id.clone())
+                .with_tool_call("call-live"),
+        );
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Orchestrating"),
+            "the active turn's in-flight work must still read as Orchestrating: {text:?}"
+        );
+    }
+
+    #[test]
+    fn subagents_attributed_per_turn_not_double_counted() {
+        // C5 regression: two turns each spawn sub-agents. Before C1's `turn_id`
+        // landed on the task wire, `running_subagent_titles_for_chip` returned the
+        // GLOBAL active count for every chip matching active-OR-latest, so both
+        // turns' chips lit up "Orchestrating" with the same total ("two chips").
+        // Now each chip counts ONLY its own turn's running tasks; turn-less tasks
+        // (server couldn't stamp them) fall back to a SINGLE current chip.
+        let turn_a = TurnId::new();
+        let turn_b = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let running = |title: &str, turn: Option<TurnId>| crate::model::TaskView {
+            id: octos_core::TaskId::new(),
+            title: title.into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: turn,
+        };
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("two turns of agents")],
+                tasks: vec![
+                    running("a1", Some(turn_a.clone())),
+                    running("b1", Some(turn_b.clone())),
+                    running("b2", Some(turn_b.clone())),
+                    // Turn-less (legacy / replay / synthetic) → single current chip.
+                    running("orphan", None),
+                ],
+                // turn_a is the live/active turn.
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_a.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_b.clone(),
+            request: Some("earlier turn".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn_b.clone())
+                    .with_success(true),
+            ],
+        });
+
+        // turn_a (active) chip: its own 1 running task + the orphan (None → the
+        // single current chip, which is the active turn).
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_a)).len(),
+            2
+        );
+        // turn_b chip: its own 2 running tasks — NOT the global 4, NOT the orphan.
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_b)).len(),
+            2
+        );
+        // The pre-C5 bug would have returned the global active count (4) for BOTH.
+        assert_ne!(
+            running_subagent_titles_for_chip(&app, Some(&turn_a)).len(),
+            running_subagent_titles_for_chip(&app, Some(&turn_b)).len() + 2,
+            "chips must not both report the global total"
+        );
+    }
+
+    #[test]
+    fn turnless_tasks_fall_back_to_active_session_not_a_newer_other_session_log() {
+        // codex P2: the None-fallback chip is "this session's latest turn", not
+        // the globally-latest log. A *different* session having the newest
+        // activity log must not steal the active session's turn-less task.
+        let turn_active = TurnId::new();
+        let turn_other = TurnId::new();
+        let active_id = SessionKey("local:active".into());
+        let other_id = SessionKey("local:other".into());
+        let orphan = crate::model::TaskView {
+            id: octos_core::TaskId::new(),
+            title: "orphan".into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: None,
+        };
+        // Active session (index 0) has the turn-less task but NO live_reply and
+        // NO log; the other session owns the globally-newest log.
+        let mut app = AppState::new(
+            vec![
+                SessionView {
+                    id: active_id.clone(),
+                    title: "active".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("active session")],
+                    tasks: vec![orphan],
+                    live_reply: None,
+                },
+                SessionView {
+                    id: other_id.clone(),
+                    title: "other".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("other session")],
+                    tasks: vec![],
+                    live_reply: None,
+                },
+            ],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Active session's log first, then a NEWER log for the OTHER session.
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: active_id,
+            turn_id: turn_active.clone(),
+            request: Some("active turn".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete").with_success(true),
+            ],
+        });
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id: other_id,
+            turn_id: turn_other.clone(),
+            request: Some("other turn".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete").with_success(true),
+            ],
+        });
+
+        // The orphan attaches to the active session's own latest turn…
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_active)).len(),
+            1
+        );
+        // …and NOT to the other (globally-newest) session's turn.
+        assert_eq!(
+            running_subagent_titles_for_chip(&app, Some(&turn_other)).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn subagent_progress_folds_into_orchestrating_chip_not_a_second_chip() {
+        // mini5 soak: a parallel-spawn turn rendered TWO "Orchestrating" chips —
+        // the parent turn's chip (spawn calls + "N sub-agent(s) running") AND a
+        // phantom turn-less chip made of the sub-agents' own progress rows. The
+        // progress rows must fold into the parent chip as children → exactly ONE
+        // orchestrating chip, with the sub-agents listed under it.
+        let turn = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let running = |title: &str| crate::model::TaskView {
+            id: octos_core::TaskId::new(),
+            title: title.into(),
+            state: TaskRuntimeState::Running,
+            runtime_detail: None,
+            output_tail: String::new(),
+            turn_id: Some(turn.clone()),
+        };
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run parallel agents")],
+                tasks: vec![
+                    running("openclaw-deep-analysis"),
+                    running("hermes-deep-analysis"),
+                ],
+                // Parent turn finished; its sub-agents keep running.
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        // Parent turn's spawn tool-calls, logged + completed.
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn.clone(),
+            request: Some("run parallel agents".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "complete")
+                    .with_turn(turn.clone())
+                    .with_success(true),
+            ],
+        });
+        // The sub-agents' own live progress rows (turn-less) — the phantom-chip
+        // source. These must NOT form their own chip.
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "openclaw-deep-analysis",
+            "running",
+        ));
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Progress,
+            "hermes-deep-analysis",
+            "running",
+        ));
+
+        let text = rendered_text(&app);
+        assert_eq!(
+            text.matches("Orchestrating").count(),
+            1,
+            "exactly one Orchestrating chip (the phantom must fold in): {text:?}"
+        );
+        assert!(
+            text.contains("2 sub-agent(s) running"),
+            "the orchestrating chip surfaces the count: {text:?}"
+        );
+        assert!(
+            text.contains("openclaw-deep-analysis") && text.contains("hermes-deep-analysis"),
+            "the running sub-agents are folded in as children: {text:?}"
+        );
+    }
+
+    #[test]
+    fn subagent_progress_suppressed_only_when_a_matching_task_exists() {
+        // codex P2: a turn-less running progress row is folded (suppressed from
+        // the flow) ONLY if a running sub-agent task with the same title exists —
+        // otherwise it has nothing to fold into and must stay visible, not vanish.
+        let turn = TurnId::new();
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("x")],
+                tasks: vec![crate::model::TaskView {
+                    id: octos_core::TaskId::new(),
+                    title: "alpha".into(),
+                    state: TaskRuntimeState::Running,
+                    runtime_detail: None,
+                    output_tail: String::new(),
+                    turn_id: Some(turn),
+                }],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let matched = ActivityItem::new(ActivityKind::Progress, "alpha", "running");
+        let orphan = ActivityItem::new(ActivityKind::Progress, "ghost", "running");
+        assert!(
+            is_subagent_progress(&app, &matched),
+            "a progress row with a matching running task folds in → suppressed"
+        );
+        assert!(
+            !is_subagent_progress(&app, &orphan),
+            "a progress row with NO matching task must stay visible, not vanish"
+        );
+    }
+
+    #[test]
+    fn active_and_delivering_sub_agents_count_as_running() {
+        // Regression: the server reports non-terminal task states beyond
+        // running/queued (TaskRuntimeState::Active -> "active",
+        // "delivering_outputs"). They must classify as running, else the
+        // agent-task group title flips to "Agent task completed" while a
+        // sub-agent is still working.
+        for status in ["active", "delivering_outputs", "running", "queued", "42%"] {
+            assert!(
+                is_running_activity(&ActivityItem::new(ActivityKind::Tool, "spawn", status)),
+                "status {status:?} should count as running"
+            );
+        }
+        for status in [
+            "completed",
+            "complete",
+            "done",
+            "success",
+            "failed",
+            "error",
+            "cancelled",
+        ] {
+            assert!(
+                !is_running_activity(&ActivityItem::new(ActivityKind::Tool, "spawn", status)),
+                "terminal status {status:?} should NOT count as running"
+            );
+        }
+
+        // ...and the group title reflects it.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("do multi-agent work")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.turn_activity_logs.push(TurnActivityLog {
+            session_id,
+            turn_id: turn_id.clone(),
+            request: Some("do multi-agent work".into()),
+            anchor_index: Some(0),
+            items: vec![
+                ActivityItem::new(ActivityKind::Tool, "spawn", "active").with_turn(turn_id.clone()),
+                ActivityItem::new(ActivityKind::Tool, "deep_research", "delivering_outputs")
+                    .with_turn(turn_id),
+            ],
+        });
+
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("Orchestrating..."),
+            "active/delivering sub-agents must keep the running title: {text:?}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "must NOT show completed while sub-agents are active/delivering"
+        );
     }
 
     #[test]
@@ -6288,6 +7782,40 @@ mod tests {
     }
 
     #[test]
+    fn diff_box_hidden_when_no_usable_hunks() {
+        // C6 (mini5 soak): an auto-opened preview whose file carries no hunks
+        // ("line diff unavailable for this mutation") must hide the whole box —
+        // no "Diff Preview" header, no dead "[/] select hunk | c stage" UI.
+        let app = app_with_diff(DiffPreviewGetResult {
+            status: "ready".into(),
+            source: "pending_store".into(),
+            preview: DiffPreview {
+                session_id: SessionKey("local:test".into()),
+                preview_id: PreviewId::new(),
+                title: Some("Empty mutation".into()),
+                files: vec![DiffPreviewFile {
+                    path: "src/empty.rs".into(),
+                    old_path: None,
+                    status: "modified".into(),
+                    hunks: vec![],
+                }],
+            },
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(
+            !text.contains("Diff Preview"),
+            "diff box must be hidden when no usable hunks: {text:?}"
+        );
+        assert!(
+            !text.contains("select hunk"),
+            "dead hunk-select UI must not render: {text:?}"
+        );
+        assert!(!text.contains("line diff unavailable"));
+    }
+
+    #[test]
     fn render_inline_diff_uses_codex_style_add_delete_colors() {
         let app = app_with_diff(DiffPreviewGetResult {
             status: "ready".into(),
@@ -6608,6 +8136,178 @@ mod tests {
         assert!(text.contains("Loops: 2 running"));
         assert!(text.contains("5m deploy-check"));
         assert!(text.contains("self-paced PR-watch"));
+    }
+
+    #[test]
+    fn harness_status_row_surfaces_orchestration_usage_and_context() {
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+
+        // Idle: no orchestration, no active turn → row reserves no rows and is
+        // absent from the render (so it cannot collide with the composer).
+        assert_eq!(harness_status_height(&app), 0);
+        assert!(harness_status_lines(&app, Palette::for_theme(ThemeName::Codex)).is_empty());
+
+        // Orchestrating: active, 2 running agents, 1 pending continuation.
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 2,
+                pending_continuations: 1,
+                phase: Some("orchestrating".into()),
+            },
+        );
+        app.session_usage
+            .insert(session_id.clone(), (Some(34_211), Some(374), Some(0.0123)));
+        // Context usage (token_estimate) is inspector-only today — surface it
+        // as ctx N% in the harness row.
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 64_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        assert_eq!(
+            harness_status_height(&app),
+            1,
+            "active row reserves one row"
+        );
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(text.contains("Orchestrating"), "{text:?}");
+        assert!(text.contains("2 agents"), "{text:?}");
+        assert!(text.contains("re-entering"), "{text:?}");
+        assert!(text.contains("↑34.2k"), "{text:?}");
+        assert!(text.contains("↓374"), "{text:?}");
+        assert!(text.contains("$0.0123"), "{text:?}");
+        assert!(
+            text.contains("ctx ~50%"),
+            "ctx % from token_estimate (approximate marker): {text:?}"
+        );
+        // Context ratio drives the LineGauge (64000 / 128000 = 0.5).
+        assert_eq!(harness_context_ratio(&app), Some(0.5));
+
+        // Even with the row ACTIVE the composer's top-border chrome survives —
+        // the indicator lives on its own dedicated layout row, not the border
+        // (the collision that caused the 249fe652 revert cannot recur).
+        let rendered = rendered_text(&app);
+        assert!(
+            rendered.contains("Orchestrating"),
+            "active row renders: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Composer"),
+            "composer chrome intact: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Tab inspector"),
+            "composer hint not clobbered: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_ctx_label_marks_estimate() {
+        // Nit: ctx% uses a fixed DEFAULT_CONTEXT_WINDOW_TOKENS denominator (no
+        // per-model window on the wire), so the label must read as an ESTIMATE
+        // (`ctx ~N%`) rather than an exact figure that would mislead when the
+        // real model window differs.
+        use octos_core::ui_protocol::SessionOrchestrationEvent;
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        app.context_lifecycle_mut(&session_id).state = Some(crate::model::ContextLifecycleState {
+            session_id: session_id.clone(),
+            thread_id: None,
+            generation: 1,
+            transcript_hash: String::new(),
+            item_count: 10,
+            token_estimate: 32_000,
+            recovery_state: "healthy".into(),
+            last_checkpoint_id: None,
+            last_compaction_id: None,
+        });
+
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            text.contains("ctx ~25%"),
+            "ctx label must carry the approximate marker: {text:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_surfaces_retry_state() {
+        use octos_core::ui_protocol::{SessionOrchestrationEvent, UiRetryBackoff};
+        let session_id = SessionKey("local:test".into());
+        let mut app = autonomy_app_state();
+        app.orchestration.insert(
+            session_id.clone(),
+            SessionOrchestrationEvent {
+                session_id: session_id.clone(),
+                active: true,
+                running_agents: 0,
+                pending_continuations: 0,
+                phase: Some("working".into()),
+            },
+        );
+        let mut retry = UiRetryBackoff::new();
+        retry.attempt = Some(3);
+        app.session_retry.insert(session_id, retry);
+
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(
+            text.to_lowercase().contains("retry") || text.to_lowercase().contains("retrying"),
+            "retry state must render in the harness row: {text:?}"
+        );
+        assert!(
+            text.contains('3'),
+            "retry attempt number must render: {text:?}"
+        );
+    }
+
+    #[test]
+    fn harness_status_row_does_not_collide_with_composer_when_idle() {
+        // Idle render: the dedicated harness row takes height 0, so the
+        // composer's top-border chrome ("Composer  Enter send | Tab inspector")
+        // is fully intact — the collision that caused the prior revert
+        // (249fe652) cannot recur because the indicator is never on the border.
+        let app = autonomy_app_state();
+        assert_eq!(harness_status_height(&app), 0);
+        let text = rendered_text(&app);
+        assert!(text.contains("Composer"), "{text:?}");
+        assert!(text.contains("Tab inspector"), "{text:?}");
+        assert!(
+            !text.contains("Orchestrating"),
+            "idle harness row must be absent: {text:?}"
+        );
     }
 
     #[test]

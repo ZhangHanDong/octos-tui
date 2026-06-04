@@ -5,10 +5,11 @@ use octos_core::ui_protocol::{
     ApprovalDecision, ApprovalId, ApprovalRenderHints, ApprovalRequestedEvent,
     ApprovalScopesListParams, ApprovalTypedDetails, DiffPreviewGetParams, OutputCursor,
     PermissionProfileListParams, PermissionProfileSelection, PermissionProfileSetParams, PreviewId,
-    SessionHydrateParams, TaskArtifactReadParams, TaskCancelParams, TaskListParams,
-    TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState, ThreadGraphGetParams,
-    ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams, TurnStateGetParams,
-    TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities, approval_scopes,
+    SessionHydrateParams, SessionOrchestrationEvent, TaskArtifactReadParams, TaskCancelParams,
+    TaskListParams, TaskOutputReadParams, TaskRestartFromNodeParams, TaskRuntimeState,
+    ThreadGraphGetParams, ThreadGraphGetResult, TurnId, TurnInterruptParams, TurnStartParams,
+    TurnStateGetParams, TurnStateGetResult, UiPaneSnapshot, UiProtocolCapabilities, UiRetryBackoff,
+    approval_scopes,
 };
 use octos_core::{Message, SessionKey, TaskId};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -3024,6 +3025,37 @@ impl Default for SessionRunState {
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub sessions: Vec<SessionView>,
+    /// Latest whole-job orchestration status per session (`session/orchestration`).
+    /// Drives the composer top-border job indicator; absent/`active:false` hides it.
+    pub orchestration: std::collections::HashMap<SessionKey, SessionOrchestrationEvent>,
+    /// Latest usage per session — (input tokens, output tokens, session cost
+    /// USD) — merged from `token_cost` progress updates. `session_cost` is
+    /// cumulative; in/out reflect the most recent update. Rendered on the job
+    /// indicator.
+    pub session_usage:
+        std::collections::HashMap<SessionKey, (Option<u64>, Option<u64>, Option<f64>)>,
+    /// Latest retry/backoff status per session — the `UiRetryBackoff` carried
+    /// on `metadata.retry` progress updates that the TUI previously ignored.
+    /// Drives the "retrying (attempt N)" surface in the harness status row.
+    /// Cleared on the session's next non-retry progress event so a settled
+    /// turn doesn't linger as "retrying".
+    pub session_retry: std::collections::HashMap<SessionKey, UiRetryBackoff>,
+    /// Per-session set of turn ids that were already finalized (committed OR
+    /// dropped) by `commit_pending_live_reply_for_turn_switch` at a turn-switch
+    /// boundary. A prior turn's OWN late `TurnCompleted`/`TurnError` may still
+    /// arrive after the switch already closed it; the terminal handlers consume
+    /// this marker and no-op so they neither emit a false fallback card (for a
+    /// committed turn whose successor already completed and left `live_reply ==
+    /// None`) nor mishandle a dropped-empty turn. Bounded per session via the
+    /// paired FIFO queue (capped at [`Self::FINALIZED_BY_SWITCH_CAP`]) so an
+    /// adversarial/long-running session cannot grow it without bound.
+    pub finalized_by_switch: std::collections::HashMap<
+        SessionKey,
+        (
+            std::collections::HashSet<TurnId>,
+            std::collections::VecDeque<TurnId>,
+        ),
+    >,
     pub selected_session: usize,
     pub selected_task: usize,
     pub transcript_scroll: usize,
@@ -3268,6 +3300,15 @@ pub struct ActivityItem {
     pub duration_ms: Option<u64>,
     pub turn_id: Option<TurnId>,
     pub tool_call_id: Option<String>,
+    /// Owning session for items created on a session-scoped path. Only set by
+    /// the projection-envelope `ToolStart` emit (`apply_envelope`), which is the
+    /// one path whose items carry NO turn identity and so cannot be reconciled
+    /// by `turn_id`. The envelope `TurnCompleted` self-heal
+    /// ([`AppState::reconcile_envelope_thread_running_activity`]) filters on
+    /// this so a thread_id shared across sessions cannot over-suppress a sibling
+    /// session's genuinely-active chip. Left `None` for all turn-scoped items
+    /// (which reconcile via `turn_id`).
+    pub session_id: Option<SessionKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3289,6 +3330,7 @@ impl ActivityItem {
             duration_ms: None,
             turn_id: None,
             tool_call_id: None,
+            session_id: None,
         }
     }
 
@@ -3304,6 +3346,14 @@ impl ActivityItem {
 
     pub fn with_tool_call(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Stamp the owning session. Used only on the projection-envelope
+    /// `ToolStart` path so the envelope `TurnCompleted` self-heal can scope its
+    /// thread-marker sweep to one session (see [`ActivityItem::session_id`]).
+    pub fn with_session(mut self, session_id: SessionKey) -> Self {
+        self.session_id = Some(session_id);
         self
     }
 
@@ -3850,6 +3900,20 @@ impl DiffPreviewPaneState {
         self.clamp_selection();
     }
 
+    /// Whether the inline diff box has anything worth rendering. A preview whose
+    /// files carry no hunks ("line diff unavailable for this mutation") is not a
+    /// usable diff — the box should be hidden rather than shown empty with a dead
+    /// "[/] select hunk | c stage" UI (mini5 soak C6). Loading and error states
+    /// stay visible: loading is a transient "fetching…", error is actionable.
+    pub fn has_renderable_diff(&self) -> bool {
+        if self.loading || self.error.is_some() {
+            return true;
+        }
+        self.preview
+            .as_ref()
+            .is_some_and(|preview| preview.files.iter().any(|file| !file.hunks.is_empty()))
+    }
+
     pub fn close(&mut self) {
         *self = Self::default();
     }
@@ -4268,6 +4332,54 @@ fn first_non_empty_line(text: &str) -> Option<&str> {
 }
 
 impl AppState {
+    /// Per-session cap on the [`AppState::finalized_by_switch`] marker set. A
+    /// long-running session that switches turns many times must not retain an
+    /// unbounded set of finalized turn ids — only the most recent switches can
+    /// realistically be followed by a late terminal, so older ids are evicted
+    /// FIFO.
+    pub const FINALIZED_BY_SWITCH_CAP: usize = 128;
+
+    /// Record that `turn_id` in `session_id` was finalized (committed OR
+    /// dropped) by a turn-switch, so the turn's OWN late terminal can be
+    /// recognized and treated as a no-op. Bounded FIFO per session.
+    pub fn mark_turn_finalized_by_switch(&mut self, session_id: &SessionKey, turn_id: &TurnId) {
+        let (set, queue) = self
+            .finalized_by_switch
+            .entry(session_id.clone())
+            .or_default();
+        if set.insert(turn_id.clone()) {
+            queue.push_back(turn_id.clone());
+            while queue.len() > Self::FINALIZED_BY_SWITCH_CAP {
+                if let Some(evicted) = queue.pop_front() {
+                    set.remove(&evicted);
+                }
+            }
+        }
+    }
+
+    /// Consume the finalized-by-switch marker for `turn_id` in `session_id`,
+    /// returning `true` iff it was present (and removing it). A late terminal
+    /// for a turn that was already closed at a switch boundary uses this to
+    /// no-op exactly once.
+    pub fn take_turn_finalized_by_switch(
+        &mut self,
+        session_id: &SessionKey,
+        turn_id: &TurnId,
+    ) -> bool {
+        let Some((set, queue)) = self.finalized_by_switch.get_mut(session_id) else {
+            return false;
+        };
+        if set.remove(turn_id) {
+            queue.retain(|id| id != turn_id);
+            if set.is_empty() {
+                self.finalized_by_switch.remove(session_id);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         let panes = SnapshotPaneSeed::from_snapshot(&snapshot);
         Self::new_with_panes(
@@ -4310,6 +4422,10 @@ impl AppState {
 
         Self {
             sessions,
+            orchestration: std::collections::HashMap::new(),
+            session_usage: std::collections::HashMap::new(),
+            session_retry: std::collections::HashMap::new(),
+            finalized_by_switch: std::collections::HashMap::new(),
             selected_session,
             selected_task: 0,
             transcript_scroll: 0,
@@ -4899,20 +5015,62 @@ impl AppState {
         self.optimistic_user_messages = retained;
     }
 
+    /// Orphan activity-chip self-heal: a turn just became terminal, so any of
+    /// its activity items still sitting in a running-type status is a leaked
+    /// started-state (a `ToolStarted` whose `ToolCompleted` never arrived — a
+    /// leaked spawn_only chip / any future uncovered path). Reconcile each to a
+    /// terminal display status ([`ACTIVITY_STATUS_INTERRUPTED`]) so the archived
+    /// log — and the live `self.activity` — can no longer count it as in-flight
+    /// and pin the chip on "Orchestrating…". A genuinely settled item
+    /// ("complete"/"failed"/`success`) is untouched.
+    ///
+    /// Single source of truth shared by [`Self::capture_completed_turn_activity`]
+    /// (live `TurnCompleted`/`TurnError` chokepoint) and the hydrate path
+    /// (`apply_session_hydrate_result`, GAP 1) so a terminal turn reconciles
+    /// identically whether it goes terminal live or is rehydrated terminal. The
+    /// caller MUST only invoke this for a turn that is genuinely terminal — never
+    /// the session's currently-active/live turn.
+    ///
+    /// Returns the number of items flipped (callers may ignore it).
+    pub fn reconcile_terminal_turn_running_activity(&mut self, turn_id: &TurnId) -> usize {
+        let mut flipped = 0;
+        for item in self
+            .activity
+            .iter_mut()
+            .filter(|item| item.turn_id.as_ref() == Some(turn_id))
+        {
+            if activity_status_is_running(&item.status) {
+                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
+                flipped += 1;
+            }
+        }
+        flipped
+    }
+
     pub fn capture_completed_turn_activity(
         &mut self,
         session_id: &SessionKey,
         turn_id: &TurnId,
     ) -> bool {
+        if !self
+            .activity
+            .iter()
+            .any(|item| item.turn_id.as_ref() == Some(turn_id))
+        {
+            return false;
+        }
+
+        // The turn is now terminal — heal any stranded running item in the LIVE
+        // activity before archiving (shared with the hydrate path), so both the
+        // captured log and any residual live row read as not-running.
+        self.reconcile_terminal_turn_running_activity(turn_id);
+
         let items = self
             .activity
             .iter()
             .filter(|item| item.turn_id.as_ref() == Some(turn_id))
             .cloned()
             .collect::<Vec<_>>();
-        if items.is_empty() {
-            return false;
-        }
 
         let optimistic = self
             .optimistic_user_messages
@@ -4950,6 +5108,60 @@ impl AppState {
         self.activity
             .retain(|item| item.turn_id.as_ref() != Some(turn_id));
         true
+    }
+
+    /// Detail marker stamped on activity items created by the M9-γ
+    /// projection-envelope `ToolStart` path. The envelope wire shape carries NO
+    /// turn identity (it is keyed on `thread_id`/`seq`), so envelope tool items
+    /// have `turn_id == None` and the turn-scoped reconcile cannot match them.
+    /// This thread-scoped marker is how the envelope `TurnCompleted` reconcile
+    /// (GAP 2) finds the items the envelope path itself started, keeping emit and
+    /// reconcile in lockstep (same discipline as the running-status set).
+    pub fn envelope_tool_detail_for_thread(thread_id: &str) -> String {
+        format!("thread {thread_id}")
+    }
+
+    /// GAP 2 — orphan activity-chip self-heal on the projection-envelope path.
+    /// An envelope `TurnCompleted` is a hard terminal barrier for its
+    /// `(session_id, thread_id)` pair: no further tool activity can legitimately
+    /// run for that thread in that session. Reconcile any turn-less running item
+    /// the envelope `ToolStart` path created for this session's thread (a
+    /// `ToolStart` whose `ToolEnd` never arrived) to
+    /// [`ACTIVITY_STATUS_INTERRUPTED`] so it can no longer pin a turn-less
+    /// "Orchestrating…" chip.
+    ///
+    /// Scoped tightly to NOT over-suppress, on FOUR independent guards:
+    /// - `session_id` — `thread_id` is NOT globally unique (two sessions can run
+    ///   envelope tools under the same projection thread), so the sweep is
+    ///   confined to items the envelope path stamped for THIS session. Without
+    ///   it, session A's `TurnCompleted` would suppress session B's
+    ///   genuinely-active chip on the same `thread_id`.
+    /// - [`ActivityKind::Tool`] — the envelope `ToolStart` path only ever creates
+    ///   `Tool` items; a non-tool turn-less row is never touched.
+    /// - `turn_id == None` — all envelope items are turn-less; turn-scoped items
+    ///   reconcile via [`Self::reconcile_terminal_turn_running_activity`].
+    /// - the thread's envelope-tool marker (kept in lockstep with the emit via
+    ///   the shared [`Self::envelope_tool_detail_for_thread`] source) — so legacy
+    ///   turn-less sub-agent progress rows are left alone.
+    pub fn reconcile_envelope_thread_running_activity(
+        &mut self,
+        session_id: &SessionKey,
+        thread_id: &str,
+    ) -> usize {
+        let marker = Self::envelope_tool_detail_for_thread(thread_id);
+        let mut flipped = 0;
+        for item in self.activity.iter_mut().filter(|item| {
+            item.session_id.as_ref() == Some(session_id)
+                && item.kind == ActivityKind::Tool
+                && item.turn_id.is_none()
+                && item.detail.as_deref() == Some(marker.as_str())
+        }) {
+            if activity_status_is_running(&item.status) {
+                item.status = ACTIVITY_STATUS_INTERRUPTED.to_string();
+                flipped += 1;
+            }
+        }
+        flipped
     }
 
     pub fn has_pending_messages(&self) -> bool {
@@ -5824,6 +6036,53 @@ pub fn task_state_label(state: TaskRuntimeState) -> &'static str {
     }
 }
 
+/// Terminal display status applied to an [`ActivityItem`] whose turn went
+/// terminal while the item was still in a running-type status — a leaked
+/// started-state (orphan activity-chip self-heal). Chosen over "complete"
+/// (no false success ✓) and "failed" (no real failure ✗): it renders as a
+/// settled, neutral row and is read as not-running by [`activity_status_is_running`].
+pub const ACTIVITY_STATUS_INTERRUPTED: &str = "interrupted";
+
+/// True while an [`ActivityItem`] status counts as genuinely in-flight. This is
+/// the single source of truth for the running-type status set, shared by the
+/// renderer's `is_running_activity` (the chip's "active" count) and the orphan
+/// activity-chip self-heal in [`AppState::capture_completed_turn_activity`], so
+/// the reconcile and the render agree on exactly which statuses are "running".
+///
+/// Uses an EXPLICIT set of running states rather than "anything non-terminal":
+/// a row whose status never reaches a terminal value (e.g. a diff-preview row
+/// stuck at `preview ready` / `pending_store`) must NOT pin the chip forever.
+pub fn activity_status_is_running(status: &str) -> bool {
+    let status = status.trim().to_ascii_lowercase();
+    matches!(
+        status.as_str(),
+        "running"
+            | "queued"
+            | "pending"
+            | "active"
+            | "streaming"
+            | "delivering_outputs"
+            | "in_progress"
+    ) || status.ends_with('%')
+}
+
+/// Map a durable `agent/updated` record's `status` string to the terminal
+/// [`TaskRuntimeState`] it represents, or `None` if the status is non-terminal.
+///
+/// The server's `background_task_agent_status` emits `running` / `completed` /
+/// `failed` / `interrupted` (the last is the wire form of a cancelled task).
+/// Used by the stuck-chip reconcile so a task whose terminal `task/updated`
+/// never arrived (per-turn channel torn down) still flips off "Orchestrating…"
+/// once the durable terminal agent record lands.
+pub fn terminal_task_state_from_agent_status(status: &str) -> Option<TaskRuntimeState> {
+    match status {
+        "completed" => Some(TaskRuntimeState::Completed),
+        "failed" => Some(TaskRuntimeState::Failed),
+        "interrupted" | "cancelled" => Some(TaskRuntimeState::Cancelled),
+        _ => None,
+    }
+}
+
 fn preview_id_from_text(text: &str) -> Option<PreviewId> {
     let lower = text.to_ascii_lowercase();
     let marker_start = ["preview_id", "preview-id", "preview id"]
@@ -5883,6 +6142,7 @@ mod tests {
                     state: TaskRuntimeState::Running,
                     runtime_detail: Some(format!("pending preview_id: {}", preview_id.0)),
                     output_tail: "bootstrap: seeded mock session\n".into(),
+                    turn_id: None,
                 }],
                 live_reply: None,
             }],
@@ -6095,6 +6355,7 @@ mod tests {
             state: TaskRuntimeState::Running,
             runtime_detail: Some(format!("pending preview_id: {}", preview_id.0)),
             output_tail: String::new(),
+            turn_id: None,
         });
 
         assert_eq!(state.active_diff_preview_id(), Some(preview_id));
