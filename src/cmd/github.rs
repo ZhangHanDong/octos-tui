@@ -45,7 +45,9 @@ fn client() -> Result<reqwest::blocking::Client> {
         .wrap_err("failed to build HTTP client")
 }
 
-fn token() -> Option<String> {
+/// The GitHub token from `OCTOS_TUI_GITHUB_TOKEN`, if set and non-blank.
+/// Shared with the self-update path so axoupdater honors the same token.
+pub(crate) fn token() -> Option<String> {
     std::env::var("OCTOS_TUI_GITHUB_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())

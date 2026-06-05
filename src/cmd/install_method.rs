@@ -96,7 +96,7 @@ pub struct PathClassifierInput {
     /// Homebrew prefixes to test as ancestors (e.g. `/opt/homebrew`,
     /// `/usr/local`). Cellar paths are matched by the `/Cellar/` segment.
     pub brew_prefixes: Vec<PathBuf>,
-    /// npm global root(s) (`npm root -g` / `npm prefix -g`).
+    /// npm global root(s) (`npm root -g`, i.e. `…/lib/node_modules`).
     pub npm_global_roots: Vec<PathBuf>,
     /// `~/.cargo/bin` (cargo install destination).
     pub cargo_bin: Option<PathBuf>,
@@ -185,27 +185,45 @@ fn path_has_segments(path: &Path, segments: &[&str]) -> bool {
 
 /// Detect the install method against the live host.
 ///
-/// When the `update` feature is on, a successful cargo-dist receipt load is
-/// authoritative and short-circuits to [`InstallMethod::CargoDistInstaller`].
-/// Otherwise (or when no receipt loads) we fall back to [`classify_path`].
+/// When the `update` feature is on, a cargo-dist receipt that loads **and
+/// corresponds to the currently-running executable** is authoritative and
+/// short-circuits to [`InstallMethod::CargoDistInstaller`]. A stale receipt
+/// (e.g. a cargo-dist install was later replaced by a brew/npm/cargo copy, or a
+/// shell-installed copy sits elsewhere while this binary came from a package
+/// manager) does NOT match and we fall through to [`classify_path`].
 pub fn detect() -> InstallMethod {
-    if receipt_present() {
+    if receipt_for_this_executable() {
         return InstallMethod::CargoDistInstaller;
     }
     classify_path(&live_classifier_input())
 }
 
-/// Probe for a loadable cargo-dist install receipt. Only compiled with the
-/// `update` feature; without axoupdater there is no receipt to load, so the
-/// path heuristics decide.
+/// Probe for a loadable cargo-dist install receipt that belongs to the running
+/// binary. Only meaningful with the `update` feature; without axoupdater there
+/// is no receipt to load, so the path heuristics decide.
+///
+/// A receipt that loads but points at a *different* install prefix than the
+/// current executable is treated as absent — otherwise a stale receipt in
+/// `~/.config/octos-tui` would mislabel a brew/npm/cargo binary as the
+/// self-updating installer and we'd try to clobber a file we don't own.
 #[cfg(feature = "update")]
-fn receipt_present() -> bool {
+fn receipt_for_this_executable() -> bool {
     let mut updater = axoupdater::AxoUpdater::new_for("octos-tui");
-    updater.load_receipt().is_ok()
+    if updater.load_receipt().is_err() {
+        return false;
+    }
+    // 0.6.9 exposes `check_receipt_is_for_this_executable`, which compares the
+    // receipt's install prefix against the canonicalized `current_exe()` (with
+    // `bin/` stripping). Only trust the receipt when it positively matches; on
+    // any error (e.g. `current_exe()` unavailable) fail closed to path
+    // classification rather than self-update a binary we can't verify we own.
+    updater
+        .check_receipt_is_for_this_executable()
+        .unwrap_or(false)
 }
 
 #[cfg(not(feature = "update"))]
-fn receipt_present() -> bool {
+fn receipt_for_this_executable() -> bool {
     false
 }
 
@@ -228,24 +246,32 @@ fn live_classifier_input() -> PathClassifierInput {
 /// Candidate Homebrew prefixes: the standard locations plus `brew --prefix`.
 fn brew_prefixes() -> Vec<PathBuf> {
     let mut prefixes = vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")];
-    if let Ok(out) = std::process::Command::new("brew").arg("--prefix").output()
-        && out.status.success()
-    {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !p.is_empty() {
-            prefixes.push(PathBuf::from(p));
+    if let Ok(out) = std::process::Command::new("brew").arg("--prefix").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() {
+                prefixes.push(PathBuf::from(p));
+            }
         }
     }
     prefixes
 }
 
-/// `npm root -g` and `npm prefix -g` (best effort).
+/// `npm root -g` only (best effort).
+///
+/// We deliberately do **not** use `npm prefix -g`: that returns the install
+/// *prefix* (often `/usr/local` or `/opt/homebrew`), which would make
+/// [`classify_path`] treat every binary under that prefix — including a
+/// Homebrew install under `…/Cellar/…` — as npm, since npm is checked before
+/// Homebrew. `npm root -g` is the specific `…/lib/node_modules` path, which is
+/// the only thing that actually owns globally-installed packages.
 fn npm_global_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for arg in [["root", "-g"], ["prefix", "-g"]] {
-        if let Ok(out) = std::process::Command::new("npm").args(arg).output()
-            && out.status.success()
-        {
+    if let Ok(out) = std::process::Command::new("npm")
+        .args(["root", "-g"])
+        .output()
+    {
+        if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !p.is_empty() {
                 roots.push(PathBuf::from(p));
@@ -328,6 +354,20 @@ mod tests {
     #[test]
     fn should_classify_homebrew_when_cellar_segment_present() {
         let i = input("/usr/local/Cellar/octos-tui/0.1.1/bin/octos-tui");
+        assert_eq!(classify_path(&i), InstallMethod::Homebrew);
+    }
+
+    #[test]
+    fn should_classify_homebrew_cellar_as_homebrew_not_npm_with_real_npm_root() {
+        // Regression for the `npm prefix -g` bug (finding #2): a Homebrew binary
+        // under `/opt/homebrew/Cellar/…` must classify as Homebrew. The npm
+        // global root is the genuine `…/lib/node_modules` path (what
+        // `npm root -g` returns), which does NOT contain the Cellar binary — so
+        // npm must not win. Had we (wrongly) fed `npm prefix -g`'s `/opt/homebrew`
+        // in as a root, npm — checked first — would have stolen this path.
+        let mut i = input("/opt/homebrew/Cellar/octos-tui/0.1.1/bin/octos-tui");
+        i.npm_global_roots = vec![PathBuf::from("/opt/homebrew/lib/node_modules")];
+        i.brew_prefixes = vec![PathBuf::from("/opt/homebrew")];
         assert_eq!(classify_path(&i), InstallMethod::Homebrew);
     }
 

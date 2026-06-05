@@ -186,6 +186,20 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
         .load_receipt()
         .wrap_err("cargo-dist install receipt not found; cannot self-update")?;
 
+    // Honor OCTOS_TUI_GITHUB_TOKEN so rate-limited / private-repo machines don't
+    // fail. axoupdater 0.6.9 exposes the public `set_github_token`, so feed the
+    // same token the GitHub client uses (no need to mutate process env).
+    if let Some(tok) = super::github::token() {
+        updater.set_github_token(&tok);
+    }
+
+    // In JSON mode, suppress the underlying installer's stdout/stderr chatter so
+    // the emitted JSON object is the only thing on stdout (mirrors how `--check`
+    // keeps its JSON clean).
+    if args.json {
+        updater.disable_installer_output();
+    }
+
     // Pin the running version so axoupdater can decide whether an update is
     // needed (the receipt's recorded version may lag a manual swap).
     if let Ok(v) = axoupdater::Version::parse(&current.to_string()) {
@@ -201,8 +215,9 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
     updater.configure_version_specifier(specifier);
     updater.always_update(args.force);
 
-    // Pre-flight confirmation (skipped with --yes or when not a TTY).
-    if !args.yes && is_tty() {
+    // Pre-flight confirmation (skipped with --yes, in --json mode, or when not a
+    // TTY). JSON callers are non-interactive and combine with --yes anyway.
+    if !args.yes && !args.json && is_tty() {
         let needed = updater
             .is_update_needed_sync()
             .wrap_err("failed to check whether an update is available")?;
@@ -222,22 +237,45 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
         .wrap_err("self-update failed (prefix may be unwritable; never sudo-escalate)")?
     {
         Some(result) => {
-            println!(
-                "Updated octos-tui {} -> {} (tag {}).",
-                result
-                    .old_version
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| current.to_string()),
-                result.new_version,
-                result.new_version_tag,
-            );
+            let old_version = result
+                .old_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| current.to_string());
+            if args.json {
+                print_self_update_json(true, &old_version, Some(&result.new_version.to_string()));
+            } else {
+                println!(
+                    "Updated octos-tui {} -> {} (tag {}).",
+                    old_version, result.new_version, result.new_version_tag,
+                );
+            }
             codesign_after_swap(result.install_prefix.as_std_path());
             Ok(UpdateOutcome::Success)
         }
         None => {
-            println!("octos-tui {current} is already up to date.");
+            if args.json {
+                print_self_update_json(false, &current.to_string(), None);
+            } else {
+                println!("octos-tui {current} is already up to date.");
+            }
             Ok(UpdateOutcome::Success)
         }
+    }
+}
+
+/// Emit the machine-readable result of a self-update attempt. When no update
+/// happened, `new_version` is `None` and `old_version` doubles as the current
+/// version so consumers always see the running version.
+#[cfg(feature = "update")]
+fn print_self_update_json(updated: bool, old_version: &str, new_version: Option<&str>) {
+    let payload = serde_json::json!({
+        "updated": updated,
+        "old_version": old_version,
+        "new_version": new_version,
+        "install_method": InstallMethod::CargoDistInstaller.id(),
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&payload) {
+        println!("{text}");
     }
 }
 
