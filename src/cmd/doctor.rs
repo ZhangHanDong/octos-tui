@@ -307,8 +307,9 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
     let mut checks = Vec::new();
 
     // current_exe resolves.
-    match std::env::current_exe() {
-        Ok(exe) => checks.push(
+    let current_exe = std::env::current_exe().ok();
+    match &current_exe {
+        Some(exe) => checks.push(
             Check::pass(
                 CAT_BINARY,
                 "octos-tui binary",
@@ -316,10 +317,10 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
             )
             .with_value(exe.display().to_string()),
         ),
-        Err(err) => checks.push(Check::warn(
+        None => checks.push(Check::warn(
             CAT_BINARY,
             "octos-tui binary",
-            format!("could not resolve current executable: {err}"),
+            "could not resolve current executable",
             "ensure octos-tui is on a real filesystem path",
         )),
     }
@@ -328,9 +329,12 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
     let method = install_method::detect();
     checks.push(Check::pass(CAT_BINARY, "install method", method.label()).with_value(method.id()));
 
-    // Shadowing installs.
-    let shadows = find_octos_tui_on_path();
-    checks.push(shadow_check(&shadows));
+    // PATH resolvability + shadowing installs. We track `$PATH` resolutions
+    // separately from extra known-install prefixes so "on PATH" reflects what
+    // can actually be run *by name*, not merely what exists on disk.
+    let located = locate_octos_tui();
+    checks.push(on_path_check(&located, current_exe.as_deref()));
+    checks.push(shadow_check(&located));
 
     // Newer release (best-effort; network failure → warn, not fail).
     checks.push(release_check(&method));
@@ -338,27 +342,96 @@ fn binary_checks(_args: &DoctorArgs) -> Vec<Check> {
     checks
 }
 
-/// Build the shadowing-install check from a list of resolved binary paths.
-/// `[✓]` when ≤1, `[!]` when >1 (the Claude Code #22415 failure mode).
-fn shadow_check(paths: &[PathBuf]) -> Check {
-    match paths.len() {
-        0 => Check::warn(
+/// `octos-tui` binaries discovered on the host, with `$PATH` hits tracked
+/// separately from extra known-install prefixes (cargo bin, brew, …) that may
+/// not be on `$PATH`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocatedBinaries {
+    /// Resolved via `$PATH` (runnable by bare name), in PATH precedence order.
+    pub on_path: Vec<PathBuf>,
+    /// Found only in extra known-install prefixes that are NOT on `$PATH`.
+    pub off_path: Vec<PathBuf>,
+}
+
+impl LocatedBinaries {
+    /// Every distinct binary location (PATH hits first, then off-PATH extras).
+    fn all(&self) -> Vec<PathBuf> {
+        let mut v = self.on_path.clone();
+        v.extend(self.off_path.iter().cloned());
+        v
+    }
+}
+
+/// Whether `octos-tui` is runnable by bare name (`$PATH`-resolvable). When the
+/// running executable's directory is not on `$PATH`, warn that it was launched
+/// by path and won't be found by name — folding the cargo-bin/brew prefixes in
+/// would mask exactly this case.
+fn on_path_check(located: &LocatedBinaries, current_exe: Option<&Path>) -> Check {
+    if let Some(first) = located.on_path.first() {
+        return Check::pass(CAT_BINARY, "octos-tui on PATH", "resolvable by name")
+            .with_value(first.display().to_string());
+    }
+    // Not on $PATH at all. If we know where this exe lives, point at its dir.
+    match current_exe.and_then(|e| e.parent()) {
+        Some(dir) => Check::warn(
             CAT_BINARY,
-            "no shadowing installs",
+            "octos-tui on PATH",
+            "octos-tui isn't on $PATH — you ran it by path",
+            format!("add {} to PATH to run by name", dir.display()),
+        )
+        .with_value(dir.display().to_string()),
+        None => Check::warn(
+            CAT_BINARY,
+            "octos-tui on PATH",
             "octos-tui not found on $PATH",
             "add the install dir to your PATH",
         ),
-        1 => Check::pass(CAT_BINARY, "no shadowing installs", "exactly one on PATH")
-            .with_value(paths[0].display().to_string()),
+    }
+}
+
+/// Build the shadowing-install check from the located binaries. Shadowing
+/// considers both `$PATH` hits and off-PATH known-install locations (>1 total
+/// is the Claude Code #22415 failure mode), labelling which is which.
+fn shadow_check(located: &LocatedBinaries) -> Check {
+    let all = located.all();
+    match all.len() {
+        0 => Check::warn(
+            CAT_BINARY,
+            "no shadowing installs",
+            "octos-tui not found on $PATH or known install dirs",
+            "install octos-tui or add its dir to your PATH",
+        ),
+        1 => {
+            let only = &all[0];
+            let where_ = if located.on_path.is_empty() {
+                "off PATH"
+            } else {
+                "on PATH"
+            };
+            Check::pass(
+                CAT_BINARY,
+                "no shadowing installs",
+                format!("exactly one ({where_})"),
+            )
+            .with_value(only.display().to_string())
+        }
         n => {
-            let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            let label = |p: &PathBuf| -> String {
+                let tag = if located.on_path.contains(p) {
+                    "PATH"
+                } else {
+                    "known-dir"
+                };
+                format!("{} [{tag}]", p.display())
+            };
+            let labelled: Vec<String> = all.iter().map(label).collect();
             Check::warn(
                 CAT_BINARY,
                 "no shadowing installs",
-                format!("{n} octos-tui binaries on PATH; first wins: {}", list[0]),
-                format!("remove the extras: {}", list[1..].join(", ")),
+                format!("{n} octos-tui binaries found; first wins: {}", labelled[0]),
+                format!("remove the extras: {}", labelled[1..].join(", ")),
             )
-            .with_value(list.join(" | "))
+            .with_value(labelled.join(" | "))
         }
     }
 }
@@ -410,41 +483,54 @@ fn release_check(method: &InstallMethod) -> Check {
 
 /// Enumerate every `octos-tui` on `$PATH` plus known install prefixes,
 /// de-duplicated by canonical path, preserving PATH precedence (first wins).
-pub fn find_octos_tui_on_path() -> Vec<PathBuf> {
+/// `$PATH` resolutions are tracked separately from extra known-install
+/// prefixes so the "on PATH" check reflects bare-name runnability, not mere
+/// on-disk presence (a cargo-bin install whose dir isn't on `$PATH` would
+/// otherwise be mis-reported as runnable by name).
+pub fn locate_octos_tui() -> LocatedBinaries {
     let exe_name = if cfg!(windows) {
         "octos-tui.exe"
     } else {
         "octos-tui"
     };
-    let mut found: Vec<PathBuf> = Vec::new();
+    let mut located = LocatedBinaries::default();
     let mut seen: Vec<PathBuf> = Vec::new();
 
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(path) = std::env::var_os("PATH") {
-        dirs.extend(std::env::split_paths(&path));
-    }
-    // Known prefixes that may not be on PATH.
-    for extra in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-        dirs.push(PathBuf::from(extra));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        dirs.push(PathBuf::from(&home).join(".cargo").join("bin"));
-        dirs.push(PathBuf::from(&home).join(".local").join("bin"));
-    }
-
-    for dir in dirs {
+    let push_if_present = |dir: &Path, dest: &mut Vec<PathBuf>, seen: &mut Vec<PathBuf>| {
         let candidate = dir.join(exe_name);
         if !candidate.is_file() {
-            continue;
+            return;
         }
         let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
         if seen.contains(&canonical) {
-            continue;
+            return;
         }
         seen.push(canonical);
-        found.push(candidate);
+        dest.push(candidate);
+    };
+
+    // Actual `$PATH` resolutions, in precedence order (first wins).
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            push_if_present(&dir, &mut located.on_path, &mut seen);
+        }
     }
-    found
+
+    // Extra known-install prefixes that may NOT be on `$PATH`. These count for
+    // shadow detection but are kept distinct from `$PATH` hits.
+    let mut extras: Vec<PathBuf> = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    if let Some(home) = std::env::var_os("HOME") {
+        extras.push(PathBuf::from(&home).join(".cargo").join("bin"));
+        extras.push(PathBuf::from(&home).join(".local").join("bin"));
+    }
+    for dir in extras {
+        push_if_present(&dir, &mut located.off_path, &mut seen);
+    }
+
+    located
 }
 
 // ---------------------------------------------------------------------------
@@ -467,23 +553,69 @@ fn terminal_checks() -> Vec<Check> {
     ]
 }
 
+/// Result of probing whether a `TERM` value has a loadable terminfo entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminfoProbe {
+    /// `infocmp` confirmed the terminfo entry loads.
+    Found,
+    /// `infocmp` ran but reported the entry is missing (non-zero exit).
+    Missing,
+    /// `infocmp` itself isn't available — we can't probe, so don't hard-fail.
+    ProberAbsent,
+}
+
 fn term_check(term: Option<&str>) -> Check {
+    term_check_with(term, probe_terminfo)
+}
+
+/// `term_check` with an injectable terminfo prober (for tests).
+fn term_check_with(term: Option<&str>, probe: impl Fn(&str) -> TerminfoProbe) -> Check {
     match term {
-        Some(t) if !t.is_empty() && t != "dumb" => {
-            Check::pass(CAT_TERM, "TERM set", t.to_string()).with_value(t.to_string())
-        }
         Some("dumb") => Check::warn(
             CAT_TERM,
             "TERM set",
             "TERM=dumb has no terminfo capabilities",
             "export TERM=xterm-256color",
         ),
+        Some(t) if !t.is_empty() => match probe(t) {
+            // The entry exists, or we couldn't probe (prober absent) — pass.
+            // Don't hard-fail merely because `infocmp` isn't installed.
+            TerminfoProbe::Found | TerminfoProbe::ProberAbsent => {
+                Check::pass(CAT_TERM, "TERM set", t.to_string()).with_value(t.to_string())
+            }
+            // TERM is plausible but its terminfo entry doesn't load — this is
+            // the documented "can't find terminfo database" failure.
+            TerminfoProbe::Missing => Check::warn(
+                CAT_TERM,
+                "TERM set",
+                format!("TERM=`{t}` has no terminfo entry (the TUI will report 'can't find terminfo database')"),
+                "set TERM=xterm-256color or install the terminfo package for your terminal",
+            )
+            .with_value(t.to_string()),
+        },
         _ => Check::warn(
             CAT_TERM,
             "TERM set",
             "TERM is unset; the TUI may not render or may report 'can't find terminfo database'",
             "export TERM=xterm-256color",
         ),
+    }
+}
+
+/// Probe whether `term`'s terminfo entry is loadable by shelling out to
+/// `infocmp`. A zero exit means the entry was found; a non-zero exit means it's
+/// missing; a spawn failure means `infocmp` isn't installed (can't probe).
+fn probe_terminfo(term: &str) -> TerminfoProbe {
+    match std::process::Command::new("infocmp")
+        .arg("-1")
+        .arg(term)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => TerminfoProbe::Found,
+        Ok(_) => TerminfoProbe::Missing,
+        Err(_) => TerminfoProbe::ProberAbsent,
     }
 }
 
@@ -648,16 +780,108 @@ fn backend_checks(args: &DoctorArgs) -> Vec<Check> {
     checks
 }
 
-/// Resolve the first token of `--stdio-command` on PATH and, if it is the
-/// `octos` server, run `<bin> --version` to surface the build it would launch.
+/// Shell operators that mean the stdio command runs as a shell *script*, not a
+/// bare exec — pipes, sequencing, redirection, command substitution, etc. When
+/// any of these are present we cannot statically resolve "the binary".
+const SHELL_OPERATORS: &[&str] = &[
+    "&&", "||", ";", "|", "`", "$(", ">", "<", "&", "\n", "(", ")", "{", "}",
+];
+
+/// What the leading executable of a stdio command resolves to, after stripping
+/// shell prefixes. The stdio child runs via the transport's shell (`sh -c` /
+/// `cmd /C`), so env-assignment prefixes and shell operators are legal and must
+/// not be reported as a hard `[✗]` failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StdioResolution {
+    /// A plain `prog arg…` (possibly with `VAR=val` prefixes) whose leading
+    /// program is `prog`.
+    Program(String),
+    /// The command uses shell syntax (operators/substitution); the binary
+    /// can't be statically verified — it'll run via the transport shell.
+    ShellSyntax,
+    /// The command couldn't be parsed (unbalanced quotes, …).
+    Unparsable,
+}
+
+/// Classify a stdio command into a resolvable leading program, shell syntax, or
+/// an unparsable string. Strips leading `VAR=value` env-assignment prefixes.
+fn classify_stdio_command(command: &str) -> StdioResolution {
+    // Shell operators ⇒ the transport shell runs a script; don't hard-fail.
+    if SHELL_OPERATORS.iter().any(|op| command.contains(op)) {
+        return StdioResolution::ShellSyntax;
+    }
+    let Some(tokens) = shlex::split(command) else {
+        return StdioResolution::Unparsable;
+    };
+    // Skip leading `VAR=value` env-assignment prefixes (e.g. `FOO=1 octos …`).
+    let mut rest = tokens.into_iter().skip_while(|tok| is_env_assignment(tok));
+    let Some(program) = rest.next() else {
+        // Only env assignments (or empty) — nothing to exec statically, but the
+        // shell would still run; treat as shell syntax, not a hard failure.
+        return StdioResolution::ShellSyntax;
+    };
+    // An explicit shell wrapper (`sh -c '…'`, `bash -lc '…'`) runs an arbitrary
+    // script; the real binary is inside the quoted argument and can't be
+    // statically resolved.
+    if is_shell_wrapper(&program) && rest.any(|a| a.starts_with("-") && a.contains('c')) {
+        return StdioResolution::ShellSyntax;
+    }
+    StdioResolution::Program(program)
+}
+
+/// Whether `program` is a POSIX shell that would run its `-c` argument as a
+/// script (so the real executable is hidden inside the quoted string).
+fn is_shell_wrapper(program: &str) -> bool {
+    let base = Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish")
+}
+
+/// Whether `tok` is a leading `VAR=value` shell env-assignment. The name must
+/// be a non-empty valid shell identifier (`[A-Za-z_][A-Za-z0-9_]*`).
+fn is_env_assignment(tok: &str) -> bool {
+    let Some(eq) = tok.find('=') else {
+        return false;
+    };
+    let name = &tok[..eq];
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap_or('\0');
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Resolve the leading executable of `--stdio-command` on PATH and, if it is
+/// the `octos` server, run `<bin> --version` to surface the build it would
+/// launch. The child runs via the transport's shell, so shell-syntax commands
+/// (env prefixes, `cd … &&`, pipes) are downgraded to `[!]` warns — we can't
+/// statically verify them — rather than reported as a missing binary `[✗]`.
 fn stdio_command_check(command: &str) -> Check {
-    let Some(program) = shlex::split(command).and_then(|parts| parts.into_iter().next()) else {
-        return Check::fail(
-            CAT_BACKEND,
-            "stdio command",
-            format!("could not parse stdio command `{command}`"),
-            "set a valid --stdio-command (e.g. `octos serve --stdio`)",
-        );
+    let program = match classify_stdio_command(command) {
+        StdioResolution::Program(p) => p,
+        StdioResolution::ShellSyntax => {
+            return Check::warn(
+                CAT_BACKEND,
+                "stdio command",
+                "stdio command uses shell syntax; can't statically verify the binary — it will run via the transport shell",
+                "ensure the command launches an octos server with `--stdio` (e.g. `octos serve --stdio`)",
+            )
+            .with_value(command.to_string());
+        }
+        StdioResolution::Unparsable => {
+            return Check::fail(
+                CAT_BACKEND,
+                "stdio command",
+                format!("could not parse stdio command `{command}`"),
+                "set a valid --stdio-command (e.g. `octos serve --stdio`)",
+            );
+        }
     };
 
     let resolved = which(&program);
@@ -902,23 +1126,94 @@ mod tests {
 
     #[test]
     fn shadow_check_passes_for_single_and_warns_for_multiple() {
-        let one = shadow_check(&[PathBuf::from("/usr/local/bin/octos-tui")]);
+        let one = shadow_check(&LocatedBinaries {
+            on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
+            off_path: vec![],
+        });
         assert_eq!(one.status, CheckStatus::Pass);
+        assert!(one.detail.contains("on PATH"));
 
-        let two = shadow_check(&[
-            PathBuf::from("/opt/homebrew/bin/octos-tui"),
-            PathBuf::from("/home/u/.cargo/bin/octos-tui"),
-        ]);
+        let two = shadow_check(&LocatedBinaries {
+            on_path: vec![PathBuf::from("/opt/homebrew/bin/octos-tui")],
+            off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
+        });
         assert_eq!(two.status, CheckStatus::Warn);
         assert!(two.detail.contains("2 octos-tui binaries"));
-        assert!(two.fix.unwrap().contains(".cargo/bin/octos-tui"));
+        let fix = two.fix.unwrap();
+        assert!(fix.contains(".cargo/bin/octos-tui"));
+        // The two locations are labelled by where they were found.
+        assert!(fix.contains("[known-dir]") || two.detail.contains("[PATH]"));
+    }
+
+    #[test]
+    fn shadow_check_warns_when_nothing_found() {
+        let none = shadow_check(&LocatedBinaries::default());
+        assert_eq!(none.status, CheckStatus::Warn);
+    }
+
+    #[test]
+    fn on_path_check_passes_when_resolvable_by_name() {
+        let located = LocatedBinaries {
+            on_path: vec![PathBuf::from("/usr/local/bin/octos-tui")],
+            off_path: vec![],
+        };
+        let check = on_path_check(&located, Some(Path::new("/usr/local/bin/octos-tui")));
+        assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn on_path_check_warns_when_ran_by_abs_path_and_dir_not_on_path() {
+        // Finding #1: running `~/.cargo/bin/octos-tui doctor` while
+        // `~/.cargo/bin` is NOT on $PATH must WARN that it isn't runnable by
+        // name — not pass because the binary merely exists in a known dir.
+        let located = LocatedBinaries {
+            on_path: vec![],
+            off_path: vec![PathBuf::from("/home/u/.cargo/bin/octos-tui")],
+        };
+        let exe = PathBuf::from("/home/u/.cargo/bin/octos-tui");
+        let check = on_path_check(&located, Some(&exe));
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("isn't on $PATH"));
+        // The fix points at the running exe's directory.
+        assert!(check.fix.unwrap().contains("/home/u/.cargo/bin"));
     }
 
     #[test]
     fn term_check_warns_when_unset_or_dumb() {
-        assert_eq!(term_check(None).status, CheckStatus::Warn);
-        assert_eq!(term_check(Some("dumb")).status, CheckStatus::Warn);
-        assert_eq!(term_check(Some("xterm-256color")).status, CheckStatus::Pass);
+        // Force the prober to say "Found" so the only warns come from the
+        // TERM value itself, not a missing terminfo entry.
+        let found = |_: &str| TerminfoProbe::Found;
+        assert_eq!(term_check_with(None, found).status, CheckStatus::Warn);
+        assert_eq!(
+            term_check_with(Some("dumb"), found).status,
+            CheckStatus::Warn
+        );
+        assert_eq!(
+            term_check_with(Some("xterm-256color"), found).status,
+            CheckStatus::Pass
+        );
+    }
+
+    #[test]
+    fn term_check_warns_when_terminfo_entry_missing() {
+        // Finding #3: a plausible TERM whose terminfo entry doesn't load must
+        // WARN (the documented "can't find terminfo database" case), not pass.
+        let missing = |_: &str| TerminfoProbe::Missing;
+        let check = term_check_with(Some("xterm-256color"), missing);
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("terminfo"));
+        assert!(check.fix.unwrap().contains("xterm-256color"));
+    }
+
+    #[test]
+    fn term_check_passes_when_prober_absent() {
+        // If `infocmp` isn't installed we can't probe; pass-with-caveat rather
+        // than hard-fail on the prober being absent.
+        let absent = |_: &str| TerminfoProbe::ProberAbsent;
+        assert_eq!(
+            term_check_with(Some("xterm-256color"), absent).status,
+            CheckStatus::Pass
+        );
     }
 
     #[test]
@@ -1042,6 +1337,77 @@ mod tests {
         assert!(!is_executable_file(&missing));
         // A directory is not a runnable file even though it "exists".
         assert!(!is_executable_file(&std::env::temp_dir()));
+    }
+
+    #[test]
+    fn stdio_classify_plain_command_resolves_leading_program() {
+        match classify_stdio_command("octos serve --stdio") {
+            StdioResolution::Program(p) => assert_eq!(p, "octos"),
+            other => panic!("expected Program, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_classify_strips_env_assignment_prefix() {
+        // Finding #2: `FOO=1 octos serve --stdio` resolves to `octos`, not the
+        // env assignment, and must not be a hard `[✗]`.
+        match classify_stdio_command("FOO=1 BAR=2 octos serve --stdio") {
+            StdioResolution::Program(p) => assert_eq!(p, "octos"),
+            other => panic!("expected Program, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stdio_check_env_prefixed_command_is_not_hard_fail() {
+        // The env-prefixed plain command resolves to `octos`; whether `octos`
+        // is installed in the test env or not, the result must never be a hard
+        // `[✗]` caused by mis-resolving the `FOO=1` token as the program.
+        let check = stdio_command_check("FOO=1 octos serve --stdio");
+        // Either it resolves (Pass) or `octos` is absent (Fail referencing
+        // `octos`, never `FOO=1`).
+        if check.status == CheckStatus::Fail {
+            assert!(
+                check.detail.contains("`octos`"),
+                "fail must reference octos, not the env prefix: {}",
+                check.detail
+            );
+        }
+        assert!(!check.detail.contains("FOO=1"));
+    }
+
+    #[test]
+    fn stdio_check_shell_operator_command_warns_not_fails() {
+        // Finding #2: `cd repo && ./octos serve --stdio` uses shell syntax and
+        // must downgrade to `[!]` warn, never a hard `[✗]` "binary not found".
+        let check = stdio_command_check("cd repo && ./octos serve --stdio");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("shell syntax"));
+    }
+
+    #[test]
+    fn stdio_classify_recognizes_pipes_and_substitution_as_shell() {
+        assert_eq!(
+            classify_stdio_command("sh -c 'octos serve --stdio'"),
+            StdioResolution::ShellSyntax
+        );
+        assert_eq!(
+            classify_stdio_command("octos serve --stdio | tee log"),
+            StdioResolution::ShellSyntax
+        );
+        assert_eq!(
+            classify_stdio_command("$(which octos) serve --stdio"),
+            StdioResolution::ShellSyntax
+        );
+    }
+
+    #[test]
+    fn is_env_assignment_matches_only_valid_shell_assignments() {
+        assert!(is_env_assignment("FOO=1"));
+        assert!(is_env_assignment("_FOO_BAR=baz"));
+        assert!(!is_env_assignment("octos"));
+        assert!(!is_env_assignment("./octos"));
+        assert!(!is_env_assignment("=value"));
+        assert!(!is_env_assignment("1FOO=bad"));
     }
 
     #[test]
