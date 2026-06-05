@@ -556,7 +556,10 @@ fn config_checks(args: &DoctorArgs) -> Vec<Check> {
 }
 
 /// Check that a directory exists and is writable (or creatable). A missing dir
-/// that can be created is a `[!]` with a `--fix`-able action, not a failure.
+/// that can be created is a `[!]` with a `--fix`-able action, not a failure. A
+/// path that exists but is **not** a directory (e.g. a stray regular file at
+/// `~/.octos`) is a `[✗]` failure: the `mkdir -p` hint would fail, so we tell
+/// the user to clear the path instead.
 fn writability_check(name: &'static str, dir: &Path) -> Check {
     if dir.is_dir() {
         if is_writable(dir) {
@@ -570,6 +573,19 @@ fn writability_check(name: &'static str, dir: &Path) -> Check {
                 format!("chmod u+w {}", dir.display()),
             )
         }
+    } else if dir.exists() {
+        // Exists but isn't a directory — `mkdir -p` would fail, so don't offer
+        // it. The path is occupied by a file (or other non-dir); clear it.
+        Check::fail(
+            CAT_CONFIG,
+            name,
+            format!("{} exists but is not a directory", dir.display()),
+            format!(
+                "remove the file at {} or point --data-dir elsewhere",
+                dir.display()
+            ),
+        )
+        .with_value(dir.display().to_string())
     } else {
         Check::warn(
             CAT_CONFIG,
@@ -793,6 +809,11 @@ fn network_checks() -> Vec<Check> {
 // ---------------------------------------------------------------------------
 
 /// Cross-platform `which`: resolve `program` against `$PATH`.
+///
+/// A match must be an *executable* regular file — a non-executable file on PATH
+/// would pass an `is_file()`-only check yet fail to launch, so on Unix we also
+/// require an executable bit (`mode & 0o111`). Windows relies on the `.exe`
+/// extension (added above) as its executability signal.
 fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let exe = if cfg!(windows) && !program.ends_with(".exe") {
@@ -802,7 +823,28 @@ fn which(program: &str) -> Option<PathBuf> {
     };
     std::env::split_paths(&path)
         .map(|dir| dir.join(&exe))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| is_executable_file(candidate))
+}
+
+/// Whether `path` is a regular file that can actually be executed. On Unix the
+/// file must carry an executable bit; on other platforms `is_file()` (with the
+/// `.exe` extension applied by [`which`]) is the best available signal.
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -967,5 +1009,54 @@ mod tests {
         let check = writability_check("missing", &missing);
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.fix.unwrap().contains("mkdir -p"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_executable_file_rejects_non_executable_and_accepts_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        // Finding #4: a non-executable file on PATH must not count as a match,
+        // since launching it would fail with EACCES.
+        let base = std::env::temp_dir().join("octos-tui-doctor-exec-probe-13579");
+        let _ = std::fs::remove_file(&base);
+        std::fs::write(&base, b"#!/bin/sh\n").expect("create probe");
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod non-exec");
+        assert!(
+            !is_executable_file(&base),
+            "0o644 file must not be executable"
+        );
+
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod exec");
+        assert!(is_executable_file(&base), "0o755 file must be executable");
+
+        let _ = std::fs::remove_file(&base);
+    }
+
+    #[test]
+    fn is_executable_file_rejects_directory_and_missing() {
+        let missing = std::env::temp_dir().join("octos-tui-doctor-exec-missing-24680");
+        let _ = std::fs::remove_file(&missing);
+        assert!(!is_executable_file(&missing));
+        // A directory is not a runnable file even though it "exists".
+        assert!(!is_executable_file(&std::env::temp_dir()));
+    }
+
+    #[test]
+    fn writability_check_fails_when_path_is_a_file() {
+        // A path that exists as a regular file must NOT report "does not exist
+        // yet (mkdir -p)" — `mkdir -p` would fail. It is a [✗] failure with a
+        // remove/relocate fix (finding #3).
+        let file = std::env::temp_dir().join("octos-tui-doctor-datadir-as-file-98765");
+        let _ = std::fs::remove_file(&file);
+        std::fs::write(&file, b"not a dir").expect("create probe file");
+        let check = writability_check("data dir", &file);
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(check.status, CheckStatus::Fail);
+        let fix = check.fix.unwrap();
+        assert!(fix.contains("remove the file"));
+        assert!(!fix.contains("mkdir -p"));
     }
 }

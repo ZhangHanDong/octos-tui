@@ -93,8 +93,11 @@ https://github.com/octos-org/octos-tui/releases/latest/download/octos-tui-instal
 pub struct PathClassifierInput {
     /// Resolved `current_exe()` path (canonicalized when possible).
     pub current_exe: PathBuf,
-    /// Homebrew prefixes to test as ancestors (e.g. `/opt/homebrew`,
-    /// `/usr/local`). Cellar paths are matched by the `/Cellar/` segment.
+    /// Confirmed Homebrew prefixes to test as ancestors (e.g. `/opt/homebrew`,
+    /// or whatever `brew --prefix` reports). `/usr/local` is included only when
+    /// brew actually lives there — never unconditionally — so a manual binary
+    /// under `/usr/local` is not mistaken for brew. Cellar installs are matched
+    /// separately by the `/Cellar/` segment.
     pub brew_prefixes: Vec<PathBuf>,
     /// npm global root(s) (`npm root -g`, i.e. `…/lib/node_modules`).
     pub npm_global_roots: Vec<PathBuf>,
@@ -243,9 +246,18 @@ fn live_classifier_input() -> PathClassifierInput {
     }
 }
 
-/// Candidate Homebrew prefixes: the standard locations plus `brew --prefix`.
+/// Candidate Homebrew prefixes.
+///
+/// `/opt/homebrew` is brew-specific (Apple Silicon default) so it is always a
+/// candidate. `/usr/local`, by contrast, is the classic FHS local prefix that
+/// distro/manual installs share with brew — so we add it **only** when `brew
+/// --prefix` confirms brew actually lives there. Otherwise a manual binary at
+/// `/usr/local/bin/octos-tui` would be misclassified as Homebrew and `update`
+/// would print the wrong (brew) command. Binaries under a real Cellar dir still
+/// classify as Homebrew via the `/Cellar/` segment match in [`classify_path`],
+/// independent of these prefixes.
 fn brew_prefixes() -> Vec<PathBuf> {
-    let mut prefixes = vec![PathBuf::from("/opt/homebrew"), PathBuf::from("/usr/local")];
+    let mut prefixes = vec![PathBuf::from("/opt/homebrew")];
     if let Ok(out) = std::process::Command::new("brew").arg("--prefix").output() {
         if out.status.success() {
             let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -354,6 +366,27 @@ mod tests {
     #[test]
     fn should_classify_homebrew_when_cellar_segment_present() {
         let i = input("/usr/local/Cellar/octos-tui/0.1.1/bin/octos-tui");
+        assert_eq!(classify_path(&i), InstallMethod::Homebrew);
+    }
+
+    #[test]
+    fn should_classify_usr_local_as_unknown_when_no_brew_present() {
+        // Regression for finding #1 (symmetric to the npm-prefix bug): with no
+        // brew present, `/usr/local` is NOT a Homebrew prefix, so a manual /
+        // distro binary at `/usr/local/bin/octos-tui` must classify as Unknown,
+        // not Homebrew (which would print the wrong `brew upgrade` command).
+        // `brew_prefixes()` no longer adds `/usr/local` unconditionally; here we
+        // model "no brew" by leaving brew_prefixes empty.
+        let i = input("/usr/local/bin/octos-tui");
+        assert_eq!(classify_path(&i), InstallMethod::Unknown);
+    }
+
+    #[test]
+    fn should_classify_usr_local_cellar_as_homebrew_even_without_prefix() {
+        // A genuine Homebrew binary lives under `…/Cellar/…`; the `/Cellar/`
+        // segment match keeps it classified as Homebrew even when no brew prefix
+        // was resolved.
+        let i = input("/opt/homebrew/Cellar/octos-tui/0.1.2/bin/octos-tui");
         assert_eq!(classify_path(&i), InstallMethod::Homebrew);
     }
 

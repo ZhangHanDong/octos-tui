@@ -249,7 +249,9 @@ fn self_update(args: &UpdateArgs, current: &Version) -> Result<UpdateOutcome> {
                     old_version, result.new_version, result.new_version_tag,
                 );
             }
-            codesign_after_swap(result.install_prefix.as_std_path());
+            // In --json mode, suppress the codesign *success* notice so stdout
+            // stays a single valid JSON document; errors still go to stderr.
+            codesign_after_swap(result.install_prefix.as_std_path(), args.json);
             Ok(UpdateOutcome::Success)
         }
         None => {
@@ -296,8 +298,12 @@ compiled without in-place self-update (`update` feature off)."
 /// macOS: re-codesign the swapped binary so Gatekeeper does not SIGKILL it on
 /// Sequoia (replacing the bit-pattern invalidates the prior signature even when
 /// bit-identical). No-op on other platforms / on signing failure (best effort).
+///
+/// `quiet` suppresses the *success* notice (printed to stdout) so a `--json`
+/// self-update keeps stdout a single valid JSON document; failures are always
+/// reported on stderr regardless.
 #[cfg(feature = "update")]
-fn codesign_after_swap(install_prefix: &std::path::Path) {
+fn codesign_after_swap(install_prefix: &std::path::Path, quiet: bool) {
     #[cfg(target_os = "macos")]
     {
         let binary = install_prefix.join("bin").join("octos-tui");
@@ -315,10 +321,12 @@ fn codesign_after_swap(install_prefix: &std::path::Path) {
             .status();
         match status {
             Ok(s) if s.success() => {
-                println!(
-                    "Re-signed {} (ad-hoc) for macOS Gatekeeper.",
-                    target.display()
-                );
+                if !quiet {
+                    println!(
+                        "Re-signed {} (ad-hoc) for macOS Gatekeeper.",
+                        target.display()
+                    );
+                }
             }
             _ => eprintln!(
                 "warning: could not re-codesign {}; if it is SIGKILLed, run: \
@@ -329,7 +337,10 @@ codesign --force --sign - {}",
         }
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = install_prefix;
+    {
+        let _ = install_prefix;
+        let _ = quiet;
+    }
 }
 
 /// The compiled-in version of this binary.
