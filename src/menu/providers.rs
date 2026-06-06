@@ -43,11 +43,11 @@ use crate::model::{
     LlmRouteConfig, LlmSelectionConfig, McpConfigDeleteParams, McpConfigEntry, McpConfigListParams,
     McpConfigSetEnabledParams, McpConfigTestParams, McpStatus, McpStatusListParams, ModelStatus,
     OnboardingAction, OnboardingProviderPending, OnboardingProviderSaveTarget,
-    OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams, ProfileLlmSelectParams,
-    ProfileLlmTestParams, ProfileSkillsInstallParams, ProfileSkillsListParams,
-    ProfileSkillsRemoveParams, RuntimePolicyMcpServer, SessionStatusReadParams,
-    ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams, ToolConfigSetEnabledParams,
-    ToolConfigTestParams, ToolStatus, ToolStatusListParams,
+    OnboardingProviderStatus, OnboardingWizardState, ProfileLlmCatalogParams, ProfileLlmListParams,
+    ProfileLlmSelectParams, ProfileLlmTestParams, ProfileSkillsInstallParams,
+    ProfileSkillsListParams, ProfileSkillsRemoveParams, RuntimePolicyMcpServer,
+    SessionStatusReadParams, ToolConfigDeleteParams, ToolConfigEntry, ToolConfigListParams,
+    ToolConfigSetEnabledParams, ToolConfigTestParams, ToolStatus, ToolStatusListParams,
 };
 
 pub fn core_menu_registry() -> MenuRegistry {
@@ -974,17 +974,34 @@ fn onboarding_provider_setup_menu(
         .with_state(MenuItemState::required(
             state.staged_permission_profile.is_some(),
         )),
-        MenuItem::new(
-            "onboard.finish",
-            "Open coding session",
-            MenuAction::Local(LocalAction::Onboarding(OnboardingAction::Finish)),
-        )
-        .with_description("Start Octos coding with this profile")
-        .maybe_disabled(onboarding_open_session_disabled_reason(
-            ctx,
-            state,
-            current_profile,
-        )),
+        // Issue #2/#4: the final ACTIVATE step. After model config + test +
+        // save succeed and the workspace validates, this is the one explicit
+        // action that opens the coding session and drops the user into the
+        // working surface. The label + description spell out exactly what to do
+        // ("press Enter") so the activation step is never a mystery.
+        {
+            let activate_blocked =
+                onboarding_open_session_disabled_reason(ctx, state, current_profile);
+            let label = if activate_blocked.is_none() {
+                "▶ Activate workspace — open coding session (Enter)"
+            } else {
+                "Activate workspace — open coding session"
+            };
+            let description = match &activate_blocked {
+                None => {
+                    "Ready. Press Enter here to open the session and start coding.".to_owned()
+                }
+                Some(reason) => format!("Complete the steps above first ({reason})."),
+            };
+            MenuItem::new(
+                "onboard.finish",
+                label,
+                MenuAction::Local(LocalAction::Onboarding(OnboardingAction::Finish)),
+            )
+            .with_description(description)
+            .with_state(MenuItemState::required(activate_blocked.is_none()))
+            .maybe_disabled(activate_blocked)
+        },
     ]);
 
     for (idx, item) in items.iter_mut().enumerate() {
@@ -993,18 +1010,74 @@ fn onboarding_provider_setup_menu(
         }
     }
 
+    // Wizard framing: compute the coarse step (Provider → Connect → Save →
+    // Workspace → Activate) so the subtitle, footer, and right-side checklist
+    // all stay in lock-step with the granular rows above.
+    let progress = crate::menu::wizard::WizardProgress::from_state(
+        state,
+        current_profile,
+        local_profile_create_supported(ctx),
+    );
+    let next_action = onboarding_next_action_hint(ctx, state, current_profile);
+
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_ONBOARD),
-        title: "Set Up LLM Provider".into(),
-        subtitle: Some("Choose a dashboard model route, enter its API key, then save.".into()),
+        title: "Octos Setup Wizard".into(),
+        subtitle: Some(progress.subtitle()),
         items,
         tabs: Vec::new(),
         searchable: true,
         search_placeholder: Some("Filter setup actions".into()),
-        footer_hint: Some("Enter select/edit/test/save | type API key, Enter save field".into()),
-        preview: None,
+        footer_hint: Some(progress.footer_hint(&next_action)),
+        preview: Some(progress.checklist_preview()),
         mode: MenuMode::SingleSelect,
     })
+}
+
+/// Compute the single next concrete action for the provider/setup phase of the
+/// wizard, in dependency order. This drives the `Next: ...` footer so the user
+/// always knows the immediate thing to do.
+fn onboarding_next_action_hint(
+    ctx: &MenuContext<'_>,
+    state: &OnboardingWizardState,
+    current_profile: Option<&str>,
+) -> String {
+    if ctx.app.profile_llm_catalog.is_none() {
+        return "load the provider catalog".into();
+    }
+    if state.provider.family_id.trim().is_empty() {
+        return "choose a model family".into();
+    }
+    if state.provider.model_id.trim().is_empty() {
+        return "choose a model".into();
+    }
+    if !state.selection_ready() {
+        return "choose a provider route".into();
+    }
+    if !state.has_api_key() {
+        return "paste your API key".into();
+    }
+    if !state.provider_tested
+        && !matches!(
+            state.provider_status(),
+            OnboardingProviderStatus::SavedPrimary
+        )
+    {
+        return "test the provider".into();
+    }
+    if !matches!(
+        state.provider_status(),
+        OnboardingProviderStatus::SavedPrimary | OnboardingProviderStatus::SavedFallback
+    ) {
+        return "save the provider".into();
+    }
+    if onboarding_workspace_disabled_reason(state).is_some() {
+        return "validate the workspace".into();
+    }
+    if onboarding_open_session_disabled_reason(ctx, state, current_profile).is_none() {
+        return "press Enter on Activate to start coding".into();
+    }
+    "finish the remaining steps".into()
 }
 
 fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResult {
@@ -1047,19 +1120,31 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         .maybe_disabled(onboarding_local_profile_disabled_reason(state)),
     ];
 
+    // Wizard framing: this is Step 1 (Profile). The local-create branch is only
+    // reached when `profile/local/create` is supported AND no profile is
+    // resolved yet, so progress is computed with `local_create_supported = true`
+    // and `current_profile = None`.
+    let progress = crate::menu::wizard::WizardProgress::from_state(state, None, true);
+    let next_action = if state.local_profile_ready() {
+        "Continue to create the profile"
+    } else {
+        "fill name, username, and email"
+    };
+
     MenuBuildResult::Ready(MenuSpec {
         id: MenuId::from(MENU_ONBOARD),
         title: t!("onboarding.welcome_title").into(),
-        subtitle: Some(t!("onboarding.local.subtitle").into()),
+        subtitle: Some(progress.subtitle()),
         items,
         tabs: Vec::new(),
         searchable: false,
         search_placeholder: None,
-        footer_hint: Some(t!("onboarding.local.footer").into()),
-        // The first-run OCTOS splash now renders in the MAIN window (see
-        // `render_onboarding_first_launch_layout` in app.rs), so the onboarding
-        // entry screen carries NO right-side preview pane — keeping it clean.
-        preview: None,
+        footer_hint: Some(progress.footer_hint(next_action)),
+        // The first-run OCTOS splash renders in the MAIN window (see
+        // `render_onboarding_first_launch_layout` in app.rs); the right pane now
+        // carries the wizard progress checklist so the user always sees where
+        // they are and what's left.
+        preview: Some(progress.checklist_preview()),
         mode: MenuMode::SingleSelect,
     })
 }
@@ -4742,8 +4827,16 @@ mod tests {
         let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_ONBOARD), &ctx) else {
             panic!("expected onboarding menu");
         };
-        assert_eq!(spec.title, "Set Up LLM Provider");
-        assert!(spec.preview.is_none());
+        assert_eq!(spec.title, "Octos Setup Wizard");
+        // The provider/setup phase now carries the wizard progress checklist as
+        // its right-side preview pane.
+        assert!(
+            matches!(
+                spec.preview,
+                Some(crate::menu::types::MenuPreview::KeyValues { .. })
+            ),
+            "provider setup menu should show the wizard progress checklist"
+        );
         assert!(
             spec.items
                 .iter()
@@ -5134,12 +5227,16 @@ mod tests {
                 .any(|item| item.id == "onboard.auth.verify")
         );
         assert_eq!(spec.title, "Welcome to Octos");
-        // The first-run splash now renders in the MAIN window (app.rs
-        // render_onboarding_first_launch_layout); the onboarding entry menu
-        // carries NO right-side preview pane.
+        // The first-run splash renders in the MAIN window (app.rs
+        // render_onboarding_first_launch_layout); the welcome menu now also
+        // carries the wizard progress checklist as its preview so the user sees
+        // the full Step-N-of-M path from the first screen.
         assert!(
-            spec.preview.is_none(),
-            "onboarding menu should have no preview pane (splash moved to the main window)"
+            matches!(
+                spec.preview,
+                Some(crate::menu::types::MenuPreview::KeyValues { .. })
+            ),
+            "welcome menu should show the wizard progress checklist"
         );
         assert!(
             !spec

@@ -608,19 +608,36 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
 fn menu_composer_edit_active(store: &Store) -> bool {
     store.state.focus == FocusPane::Composer
         && !store.state.composer.is_empty()
-        && !slash_help_query_active(store)
+        // While the slash popup is open and the composer holds a slash draft
+        // (even the bare `/`), keystrokes must flow into the menu's inline
+        // filter — NOT the generic composer-edit branch. Gating on the broader
+        // `slash_help_capture_active` (any length) rather than
+        // `slash_help_query_active` (len > 1) is what removes the dead first
+        // keystroke: the FIRST letter typed after `/` now reaches
+        // `slash_help_should_capture_char` and syncs the search query, matching
+        // codex's inline `/` behaviour.
+        && !slash_help_capture_active(store)
+}
+
+/// True whenever the slash popup is open and the composer is a slash draft
+/// (`/`, `/t`, `/theme`, ...). Used to route keystrokes into the inline filter
+/// from the very first character — distinct from [`slash_help_query_active`],
+/// which gates submit/backspace semantics and only fires once a query exists
+/// (composer longer than the bare `/`).
+fn slash_help_capture_active(store: &Store) -> bool {
+    slash_help_menu_active(store) && store.state.composer.starts_with('/')
 }
 
 fn slash_help_query_active(store: &Store) -> bool {
-    slash_help_menu_active(store)
-        && store.state.composer.starts_with('/')
-        && store.state.composer.len() > 1
+    slash_help_capture_active(store) && store.state.composer.len() > 1
 }
 
 fn slash_help_should_capture_char(store: &Store, ch: char) -> bool {
-    slash_help_menu_active(store)
-        && store.state.composer.starts_with('/')
-        && (store.state.composer.len() > 1 || !matches!(ch, 'j' | 'k'))
+    // With a query already typed (`/t...`) every printable char is captured.
+    // On the bare `/` we still reserve `j`/`k` for vim-style list navigation,
+    // so a user who opened the popup but hasn't started filtering can move the
+    // selection. Any other first letter starts the inline filter immediately.
+    slash_help_capture_active(store) && (store.state.composer.len() > 1 || !matches!(ch, 'j' | 'k'))
 }
 
 fn slash_help_menu_active(store: &Store) -> bool {
@@ -1317,6 +1334,39 @@ mod tests {
                 .expect("slash menu")
                 .search_query,
             "permissions"
+        );
+    }
+
+    #[test]
+    fn typing_slash_then_a_letter_filters_help_menu_without_dead_keystroke() {
+        // Regression: opening the slash popup with `/` and typing the FIRST
+        // letter must filter the menu immediately (single keystroke), matching
+        // codex's inline slash behaviour. Previously the first letter after `/`
+        // landed in the composer-edit branch without syncing the search query,
+        // so the menu only began filtering on the SECOND keystroke.
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('/'))),
+            KeyAction::Continue
+        ));
+        assert!(store.state.menu_stack.is_active(), "slash popup opened");
+
+        assert!(matches!(
+            handle_key(&mut store, key(KeyCode::Char('t'))),
+            KeyAction::Continue
+        ));
+        assert_eq!(store.state.composer, "/t");
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .expect("slash menu")
+                .search_query,
+            "t",
+            "first letter after / must filter the menu immediately"
         );
     }
 
