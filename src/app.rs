@@ -184,10 +184,12 @@ fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, 
 
     let menu = active_menu_surface(app);
     // On the onboarding WELCOME screen, show the OCTOS logo in the main window
-    // above the menu. The splash no longer lives in a right-side preview pane
-    // (the onboarding menu carries no `preview`), so the right side stays clean.
-    // Logo rows come only from the surplus above the menu's own needs, so the
-    // menu is never clipped — and only on the welcome step, not provider setup.
+    // above the menu. The wizard menu now carries a right-side progress
+    // checklist (`Setup progress`) as its preview; the selection view renders it
+    // beside the items on wide terminals, so the splash sits above and the
+    // checklist sits to the right. Logo rows come only from the surplus above
+    // the menu's own needs (which includes the preview rows), so the menu is
+    // never clipped — and only on the welcome step, not provider setup.
     let menu_area = if onboarding_welcome_active(app) {
         let menu_needed = menu
             .as_ref()

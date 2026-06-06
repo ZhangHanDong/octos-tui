@@ -14,6 +14,7 @@ pub mod render;
 #[allow(dead_code)]
 pub mod selection_view;
 pub mod types;
+pub mod wizard;
 
 pub use availability::*;
 pub use registry::*;

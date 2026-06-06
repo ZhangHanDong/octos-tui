@@ -2464,6 +2464,21 @@ impl Store {
             .is_some_and(|frame| frame.id.as_str() == id)
     }
 
+    /// True when any onboarding wizard menu (welcome / provider setup / its
+    /// family/model/route children) is the active surface. Used to decide
+    /// whether opening a session should tear the wizard down (issue #4).
+    fn active_menu_is_onboarding(&self) -> bool {
+        self.state.menu_stack.active().is_some_and(|frame| {
+            matches!(
+                frame.id.as_str(),
+                crate::menu::registry::MENU_ONBOARD
+                    | crate::menu::registry::MENU_ONBOARD_FAMILY
+                    | crate::menu::registry::MENU_ONBOARD_MODEL
+                    | crate::menu::registry::MENU_ONBOARD_ROUTE
+            )
+        })
+    }
+
     fn require_appui_method(&mut self, method: &'static str) -> bool {
         if self
             .state
@@ -5152,6 +5167,15 @@ impl Store {
                 }
                 if self.state.active_turn().is_none() {
                     self.state.set_run_state_idle();
+                }
+                // Issue #4: finishing the setup wizard must drop the user into a
+                // clean, ready coding surface — not leave the onboarding menu
+                // stacked over the chat. When a session opens while an
+                // onboarding menu is active, tear the wizard down so the
+                // composer is focused and the transcript is the active surface.
+                if self.active_menu_is_onboarding() {
+                    self.close_all_menus();
+                    self.state.focus = FocusPane::Composer;
                 }
                 self.state.status =
                     format!("Opened {} on {}", session_id.0, self.state.protocol_version);
@@ -9893,6 +9917,64 @@ mod tests {
         };
         assert_eq!(params.update.mode, Some(PermissionProfileMode::ReadOnly));
         assert_eq!(params.update.approval_policy.as_deref(), Some("on-request"));
+    }
+
+    /// Issue #4: finishing the wizard must drop the user into the working
+    /// surface, not leave the onboarding menu stacked over the chat. When a
+    /// session opens while an onboarding menu is active, the wizard is torn
+    /// down and the composer is focused.
+    #[test]
+    fn session_opened_closes_onboarding_wizard_and_focuses_composer() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE,
+            crate::model::APPUI_METHOD_AUTH_STATUS,
+        ]);
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD));
+        assert!(store.state.menu_stack.is_active(), "wizard menu is open");
+        store.state.focus = FocusPane::Sessions;
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "onboarding wizard is torn down after the session opens"
+        );
+        assert_eq!(
+            store.state.focus,
+            FocusPane::Composer,
+            "user lands focused on the composer, ready to code"
+        );
+    }
+
+    /// A session opening while a NON-onboarding menu (or no menu) is active
+    /// must not be force-closed — only the wizard tears itself down.
+    #[test]
+    fn session_opened_leaves_non_onboarding_menu_open() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_THEME));
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(
+            store.state.menu_stack.is_active(),
+            "a non-onboarding menu stays open across session open"
+        );
     }
 
     #[test]

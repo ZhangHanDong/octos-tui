@@ -490,8 +490,8 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
         },
         CommandSpec {
             name: "onboard",
-            aliases: &["setup"],
-            description: "Run the guided login and LLM provider setup wizard.",
+            aliases: &["setup", "wizard"],
+            description: "Open the setup wizard to configure or reconfigure your profile, provider, model, and workspace.",
             category: CommandCategory::Settings,
             availability: CommandAvailability::app_ui_read(&[])
                 .with_session(SessionRequirement::Any)
