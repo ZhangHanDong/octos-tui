@@ -1047,49 +1047,19 @@ fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     };
     let current_profile = ctx.app.current_profile;
 
+    // UX2 feedback: the left list holds ONLY rows the user can act on by
+    // selecting them — Validate and Activate. The read-only staged items
+    // (workspace path, validation status, permission profile) are `Noop` (set
+    // via slash commands, not selectable), so they moved to the right info
+    // pane (see `onboarding_workspace_preview`) instead of cluttering the list
+    // with un-selectable rows.
     let mut items = vec![
-        // Surface the staged candidate (or the active workspace root) and its
-        // validation status.
-        MenuItem::new(
-            "onboard.workspace.current",
-            format!(
-                "Workspace: {}",
-                onboarding_workspace_display(state, ctx.app.cwd.unwrap_or(""))
-            ),
-            MenuAction::Noop,
-        )
-        .with_description(
-            "Stage with /onboard workspace <path> (try `.` for the current folder); defaults to the launch directory.",
-        )
-        .with_state(MenuItemState::required(
-            state.workspace_validation.is_valid(),
-        )),
-        MenuItem::new(
-            "onboard.workspace.status",
-            onboarding_workspace_status_label(state),
-            MenuAction::Noop,
-        )
-        .with_description("Validation status from the local probe (replaceable with backend workspace/probe when added)."),
         MenuItem::new(
             "onboard.workspace.validate",
             "Validate workspace",
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::ValidateWorkspace)),
         )
         .with_description("Probe the staged path; required before you can activate."),
-        // M22-D: permission profile staging row. The wizard only displays the
-        // staged choice — the server confirms it via the runtime policy stamp
-        // after `session/open`.
-        MenuItem::new(
-            "onboard.permissions.staged",
-            onboarding_permission_profile_label(state),
-            MenuAction::Noop,
-        )
-        .with_description(
-            "Stage with /onboard permissions <default|read-only|workspace-write|workspace-write-never|full-access|clear>.",
-        )
-        .with_state(MenuItemState::required(
-            state.staged_permission_profile.is_some(),
-        )),
         // The final ACTIVATE step: after model config + test + save succeed and
         // the workspace validates, this is the one explicit action that opens
         // the coding session and drops the user into the working surface.
@@ -1103,10 +1073,11 @@ fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             };
             let description = match &activate_blocked {
                 None => t!("onboarding.wizard.activate_ready_description").into_owned(),
-                Some(reason) => {
-                    t!("onboarding.wizard.activate_blocked_description", reason = reason)
-                        .into_owned()
-                }
+                Some(reason) => t!(
+                    "onboarding.wizard.activate_blocked_description",
+                    reason = reason
+                )
+                .into_owned(),
             };
             MenuItem::new(
                 "onboard.finish",
@@ -1141,9 +1112,44 @@ fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: false,
         search_placeholder: None,
         footer_hint: Some(progress.footer_hint(&next_action)),
-        preview: Some(progress.explanation_preview()),
+        preview: Some(onboarding_workspace_preview(
+            &progress,
+            state,
+            ctx.app.cwd.unwrap_or(""),
+        )),
         mode: MenuMode::SingleSelect,
     })
+}
+
+/// Right-pane preview for the Workspace step. Beyond the standard step
+/// explanation it lists the read-only "staged" items the user can't select on
+/// this screen — the workspace path, its validation status, and the staged
+/// permission profile (all set via slash commands, not by selecting a row) —
+/// plus how to change each. This keeps the LEFT list to only the actions the
+/// user can actually take here (Validate, Activate).
+fn onboarding_workspace_preview(
+    progress: &crate::menu::wizard::WizardProgress,
+    state: &OnboardingWizardState,
+    active_workspace: &str,
+) -> MenuPreview {
+    let mut preview = progress.explanation_preview();
+    if let MenuPreview::Text { body, .. } = &mut preview {
+        body.push_str("\n\nStaged (set via commands — not selectable here):");
+        body.push_str(&format!(
+            "\n• Workspace: {}",
+            onboarding_workspace_display(state, active_workspace)
+        ));
+        body.push_str("\n    /onboard workspace <path>   (try `.` for the current folder)");
+        // `onboarding_workspace_status_label` already carries the `Status:` prefix.
+        body.push_str(&format!("\n• {}", onboarding_workspace_status_label(state)));
+        // `onboarding_permission_profile_label` already carries the `Permissions:` prefix.
+        body.push_str(&format!(
+            "\n• {}",
+            onboarding_permission_profile_label(state)
+        ));
+        body.push_str("\n    /onboard permissions <default|read-only|workspace-write|full-access>");
+    }
+    preview
 }
 
 /// Compute the single next concrete action for the provider/setup phase of the
@@ -5114,18 +5120,24 @@ mod tests {
             panic!("expected workspace step menu");
         };
         assert_eq!(spec.title, t!("onboarding.wizard.workspace_title"));
-        // Workspace + validation + activate rows live HERE, not on the provider
-        // screen.
+        // UX2 feedback: the left list holds ONLY actionable rows — Validate +
+        // Activate. The read-only staged rows moved to the info pane.
+        for id in ["onboard.workspace.validate", "onboard.finish"] {
+            assert!(
+                spec.items.iter().any(|item| item.id == id),
+                "workspace menu must contain actionable `{id}`"
+            );
+        }
+        // The non-actionable (`Noop`) staged rows are NO LONGER in the left list
+        // — they're read-only info, surfaced in the right pane instead.
         for id in [
             "onboard.workspace.current",
             "onboard.workspace.status",
-            "onboard.workspace.validate",
             "onboard.permissions.staged",
-            "onboard.finish",
         ] {
             assert!(
-                spec.items.iter().any(|item| item.id == id),
-                "workspace menu must contain `{id}`"
+                !spec.items.iter().any(|item| item.id == id),
+                "read-only `{id}` must move to the info pane, not the left list"
             );
         }
         // Provider config rows do NOT bleed into the workspace screen.
@@ -5146,11 +5158,27 @@ mod tests {
             activate.is_enabled(),
             "activate is unblocked with provider saved + workspace valid"
         );
-        // The teaching panel rides along.
-        assert!(matches!(
-            spec.preview,
-            Some(crate::menu::types::MenuPreview::Text { .. })
-        ));
+        // The staged workspace path, validation status, and permission profile
+        // now ride in the right-side info pane (read-only text), not the list.
+        let Some(crate::menu::types::MenuPreview::Text { body, .. }) = &spec.preview else {
+            panic!("workspace step must keep a Text teaching pane");
+        };
+        assert!(
+            body.contains("/tmp/ws"),
+            "info pane should show the staged workspace path: {body:?}"
+        );
+        assert!(
+            body.contains("Status:"),
+            "info pane should show the validation status: {body:?}"
+        );
+        assert!(
+            body.contains("Permissions:"),
+            "info pane should show the staged permission profile: {body:?}"
+        );
+        assert!(
+            body.contains("/onboard workspace"),
+            "info pane should show how to change the workspace: {body:?}"
+        );
     }
 
     #[test]
