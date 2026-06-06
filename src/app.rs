@@ -3484,7 +3484,11 @@ fn harness_context_percent(app: &AppState) -> Option<u16> {
 
 /// Build the harness status line(s): spinner + phase + agent count +
 /// re-entering + token in/out + cost + retry + ctx %. Empty when idle.
-fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> {
+fn harness_status_lines(
+    app: &AppState,
+    palette: Palette,
+    include_ctx_text: bool,
+) -> Vec<Line<'static>> {
     if !harness_status_active(app) {
         return Vec::new();
     }
@@ -3572,17 +3576,23 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
         ));
     }
 
-    // Context window %, mirrored as the textual label alongside the gauge so
-    // it survives a narrow terminal (and is unit-testable).
-    if let Some(percent) = harness_context_percent(app) {
-        // `~` marks this as an estimate: the wire carries no per-model context
-        // window, so the percent is against a fixed default denominator
-        // (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate when the real
-        // model window differs.
-        spans.push(Span::styled(
-            format!(" · ctx ~{percent}%"),
-            palette.muted().bg(palette.surface),
-        ));
+    // Context window %. This textual label is the NARROW-terminal fallback:
+    // when `render_harness_status_row` draws the LineGauge (wide terminal) it
+    // passes `include_ctx_text = false` so the percent does not render twice —
+    // once as this text on the left and once as the gauge's own label on the
+    // right (the duplicate-`ctx ~N%` bug). Kept (and unit-tested) for narrow
+    // terminals where the gauge column is dropped.
+    if include_ctx_text {
+        if let Some(percent) = harness_context_percent(app) {
+            // `~` marks this as an estimate: the wire carries no per-model
+            // context window, so the percent is against a fixed default
+            // denominator (`DEFAULT_CONTEXT_WINDOW_TOKENS`) and is approximate
+            // when the real model window differs.
+            spans.push(Span::styled(
+                format!(" · ctx ~{percent}%"),
+                palette.muted().bg(palette.surface),
+            ));
+        }
     }
 
     vec![Line::from(spans)]
@@ -3593,15 +3603,20 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
 /// right when a `token_estimate` is known. Drawn into its own layout row
 /// (never the composer border).
 fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
-    let lines = harness_status_lines(app, palette);
+    let ratio = harness_context_ratio(app);
+    // Reserve a fixed-width column for the context gauge only when we have a
+    // ratio to show AND the row is wide enough for both the text and the gauge.
+    const GAUGE_WIDTH: u16 = 18;
+    let show_gauge = ratio.is_some() && area.width > GAUGE_WIDTH + 12;
+    // Suppress the textual `· ctx ~N%` label when the gauge will be drawn —
+    // otherwise the percent renders twice on the same row (text on the left and
+    // gauge on the right). The gauge is canonical on a wide terminal; the text
+    // is the narrow-terminal fallback.
+    let lines = harness_status_lines(app, palette, !show_gauge);
     if lines.is_empty() {
         return;
     }
-    let ratio = harness_context_ratio(app);
-    // Reserve a fixed-width column for the context gauge only when we have a
-    // ratio to show; otherwise the text spans the full width.
-    const GAUGE_WIDTH: u16 = 18;
-    if let Some(ratio) = ratio.filter(|_| area.width > GAUGE_WIDTH + 12) {
+    if let Some(ratio) = ratio.filter(|_| show_gauge) {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(12), Constraint::Length(GAUGE_WIDTH)])
@@ -8848,7 +8863,7 @@ mod tests {
         // Idle: no orchestration, no active turn → row reserves no rows and is
         // absent from the render (so it cannot collide with the composer).
         assert_eq!(harness_status_height(&app), 0);
-        assert!(harness_status_lines(&app, Palette::for_theme(ThemeName::Codex)).is_empty());
+        assert!(harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true).is_empty());
 
         // Orchestrating: active, 2 running agents, 1 pending continuation.
         app.orchestration.insert(
@@ -8882,7 +8897,7 @@ mod tests {
             1,
             "active row reserves one row"
         );
-        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
@@ -8915,6 +8930,16 @@ mod tests {
         assert!(
             rendered.contains("Tab inspector"),
             "composer hint not clobbered: {rendered:?}"
+        );
+        // Regression (duplicate ctx%): on a wide terminal (rendered_text uses
+        // 120 cols, so the gauge column is drawn) the percent must render ONCE —
+        // as the LineGauge on the right, NOT also as the textual `· ctx ~N%`
+        // label on the left. Pre-fix this row showed both "· ctx ~50%" and
+        // "ctx ~50% ───" on the same line.
+        assert_eq!(
+            rendered.matches("ctx ~").count(),
+            1,
+            "ctx% must render exactly once (gauge only) on a wide terminal: {rendered:?}"
         );
     }
 
@@ -8949,7 +8974,7 @@ mod tests {
             last_compaction_id: None,
         });
 
-        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
@@ -8979,7 +9004,7 @@ mod tests {
         retry.attempt = Some(3);
         app.session_retry.insert(session_id, retry);
 
-        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex))
+        let text: String = harness_status_lines(&app, Palette::for_theme(ThemeName::Codex), true)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.to_string())
