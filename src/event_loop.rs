@@ -12,39 +12,56 @@ use crossterm::{
 };
 use eyre::Result;
 use octos_core::app_ui::AppUiEvent;
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::backend::CrosstermBackend;
 
 use crate::{
     app,
     cli::Cli,
     client_event::ClientEvent,
+    insert_history::insert_history_lines,
     model::{AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
     transport::{AppUiBackend, build_backend},
+    tui_terminal::Terminal as InlineTerminal,
+    viewport::ScrollbackTracker,
 };
 
+/// Poll timeout while idle. Short enough that input stays responsive; we redraw
+/// on change (see `draw_dirty`), not on this tick, so this does not cause the
+/// 40×/sec repaint that wiped selections in the old alt-screen model.
 const UI_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Redraw cadence while a turn is active, so the spinner/status animates without
+/// a fixed-rate repaint when nothing is happening.
+const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
 const MAX_BACKEND_EVENTS_PER_TICK: usize = 512;
+
+/// Which screen model the terminal is currently in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    /// Inline viewport at the bottom + normal scrollback above (the chat flow:
+    /// native select / scroll / copy work here with no mode key).
+    Inline,
+    /// Full-screen alternate buffer for a transient overlay (inspector,
+    /// onboarding wizard, detail modals) — matches codex's alt-screen overlays.
+    AltScreen,
+}
 
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // NOTE: deliberately NO `EnableMouseCapture`. Capturing the mouse routes
-    // click-drag to the app and prevents the terminal (and tmux copy-mode) from
-    // doing native text selection — so users can't select+copy (esp. over
-    // tmux/SSH). Matching codex, we leave the mouse to the terminal; scrolling
-    // is covered by PageUp/PageDown (and tmux's own wheel/scrollback), and the
-    // OSC 52 `/copy`/Ctrl+Y path (clipboard.rs) handles structured copy.
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableFocusChange
-    )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    let guard = TerminalGuard;
+    // Inline-viewport model (codex-style): we do NOT enter the alternate screen
+    // for the main chat. The terminal keeps its normal scrollback, so finalized
+    // output written there (see `insert_history`) is natively mouse-selectable,
+    // wheel/scrollbar-scrollable, and copyable (incl. via tmux copy-mode) with
+    // NO app mode key. We also deliberately do NOT `EnableMouseCapture`, which
+    // would route click-drag to the app and defeat native selection.
+    execute!(stdout, EnableBracketedPaste, EnableFocusChange)?;
+    let backend = CrosstermBackend::new(io::stdout());
+    let mut terminal = InlineTerminal::new(backend)?;
+    let mut guard = TerminalGuard {
+        mode: RenderMode::Inline,
+    };
 
     // i18n: select the UI language before the first render. `t!()` reads this
     // process-global locale, chosen at launch via --lang / OCTOS_LANG / LANG
@@ -74,16 +91,38 @@ pub fn run(cli: Cli) -> Result<()> {
             .map(|path| path.to_string_lossy().to_string()),
     );
     let mut input_state = TerminalInputState::default();
+    let mut scrollback = ScrollbackTracker::new();
+    // Force a draw on the first iteration.
+    let mut dirty = true;
+    let mut last_animation = Instant::now();
 
     loop {
-        drain_backend_events(backend.as_mut(), &mut store)?;
+        if drain_backend_events(backend.as_mut(), &mut store)? {
+            dirty = true;
+        }
 
-        let palette = Palette::for_theme(store.state.theme);
-        terminal.draw(|frame| app::render(frame, &store.state, palette))?;
+        // Redraw on change, not on a fixed tick. While a turn is active we also
+        // redraw on the animation cadence so the spinner/status moves; otherwise
+        // an idle UI emits no terminal writes and never wipes a live selection.
+        let turn_active = store.state.run_state.is_active();
+        if turn_active && last_animation.elapsed() >= ANIMATION_INTERVAL {
+            dirty = true;
+            last_animation = Instant::now();
+        }
+        if dirty {
+            draw(&mut terminal, &mut guard, &mut store, &mut scrollback)?;
+            dirty = false;
+        }
 
-        if event::poll(UI_EVENT_POLL_INTERVAL)? {
+        let poll = if turn_active {
+            ANIMATION_INTERVAL.min(UI_EVENT_POLL_INTERVAL)
+        } else {
+            UI_EVENT_POLL_INTERVAL
+        };
+        if event::poll(poll)? {
             let raw_event = event::read()?;
             let next_event_waiting = event::poll(Duration::from_millis(0))?;
+            let is_resize = matches!(raw_event, Event::Resize(_, _));
             match handle_terminal_event_with_input_state(
                 &mut store,
                 raw_event,
@@ -95,14 +134,93 @@ pub fn run(cli: Cli) -> Result<()> {
                 KeyAction::Quit => break,
                 KeyAction::Send(command) => send_command(backend.as_mut(), &mut store, command),
             }
+            // A resize invalidates the inline viewport layout; force a repaint.
+            if is_resize {
+                terminal.invalidate_viewport();
+            }
+            dirty = true;
         }
 
-        flush_pending_clipboard(&mut store);
+        if flush_pending_clipboard(&mut store) {
+            // The OSC 52 write does not touch the rendered frame, but staging it
+            // changed status text; redraw so the status line reflects the copy.
+            dirty = true;
+        }
 
-        drain_backend_events(backend.as_mut(), &mut store)?;
+        if drain_backend_events(backend.as_mut(), &mut store)? {
+            dirty = true;
+        }
     }
 
     drop(guard);
+    Ok(())
+}
+
+/// Draw one frame. In `Inline` mode this flushes newly-finalized history into
+/// scrollback (so it becomes natively selectable) and renders only the live UI
+/// into the bottom inline viewport. For full-screen overlays it switches to the
+/// alternate screen and renders the legacy full layout (codex does the same for
+/// its transient overlays).
+fn draw(
+    terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+    guard: &mut TerminalGuard,
+    store: &mut Store,
+    scrollback: &mut ScrollbackTracker,
+) -> Result<()> {
+    let palette = Palette::for_theme(store.state.theme);
+
+    if app::wants_fullscreen_overlay(&store.state) {
+        // Transient overlay → alternate screen, full legacy render.
+        guard.enter_alt_screen(terminal)?;
+        let size = terminal.size()?;
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+        terminal.set_viewport_area(area);
+        terminal.draw(|frame| {
+            // `render_inline_overlay` is generic over `FrameLike`, so it renders
+            // the legacy full-screen layout straight into the inline `Frame`'s
+            // buffer (no `ratatui::Terminal` needed for the overlay path).
+            app::render_inline_overlay(frame, &store.state, palette);
+        })?;
+        return Ok(());
+    }
+
+    // Inline chat flow.
+    guard.leave_alt_screen(terminal)?;
+
+    let size = terminal.size()?;
+    let width = size.width;
+
+    // Ensure the inline viewport spans the full terminal width BEFORE we insert
+    // history: `insert_history_lines` wraps committed lines to the viewport
+    // width, so a zero-width viewport (the initial state) would wrap every glyph
+    // onto its own row. Anchor a 1-row viewport at the bottom if it has not been
+    // positioned yet; `resize_viewport_to` grows it to the live-UI height next.
+    if terminal.viewport_area.width != width || terminal.viewport_area.height == 0 {
+        let bottom = size.height.saturating_sub(1);
+        let h = terminal.viewport_area.height.max(1).min(size.height);
+        terminal.set_viewport_area(ratatui::layout::Rect::new(
+            0,
+            bottom.min(size.height.saturating_sub(h)),
+            width,
+            h,
+        ));
+    }
+
+    // The scrollback flush must wrap to the SAME width `insert_history_lines`
+    // uses (the full viewport width), so the line accounting stays consistent.
+    let wrap_width = usize::from(width).max(1);
+
+    // 1. Push any newly-finalized committed history into scrollback. This is the
+    //    content that becomes natively selectable / scrollable above the viewport.
+    let update = scrollback.sync(&store.state, palette, wrap_width);
+    if !update.lines_to_insert.is_empty() {
+        insert_history_lines(terminal, update.lines_to_insert)?;
+    }
+
+    // 2. Size the inline viewport to the live UI and render it.
+    let height = app::live_ui_height(&store.state, size.width, size.height);
+    terminal.resize_viewport_to(height)?;
+    terminal.draw(|frame| app::render_viewport(frame, &store.state, palette))?;
     Ok(())
 }
 
@@ -117,8 +235,8 @@ pub fn run(cli: Cli) -> Result<()> {
 /// A failed write (e.g. a closed stdout during teardown) is intentionally
 /// swallowed: the copy is best-effort UX, never load-bearing, and the status
 /// line already reflected the attempt.
-fn flush_pending_clipboard(store: &mut Store) {
-    flush_pending_clipboard_to(store, &mut io::stdout());
+fn flush_pending_clipboard(store: &mut Store) -> bool {
+    flush_pending_clipboard_to(store, &mut io::stdout())
 }
 
 /// Drain a staged clipboard request into `sink` as an OSC 52 escape sequence.
@@ -126,27 +244,33 @@ fn flush_pending_clipboard(store: &mut Store) {
 /// instead of writing to the real terminal — a direct `stdout` write bypasses
 /// libtest's capture, so a terminal that honors OSC 52 would otherwise clobber
 /// the developer's clipboard during `cargo test` (codex P2).
-fn flush_pending_clipboard_to<W: io::Write>(store: &mut Store, sink: &mut W) {
+fn flush_pending_clipboard_to<W: io::Write>(store: &mut Store, sink: &mut W) -> bool {
     let Some(text) = store.state.pending_clipboard.take() else {
-        return;
+        return false;
     };
     let sequence = crate::clipboard::osc52_copy_sequence(&text);
     if sink.write_all(sequence.as_bytes()).is_ok() {
         let _ = sink.flush();
     }
+    true
 }
 
-fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<()> {
+/// Drain pending backend events into the store. Returns `true` when at least
+/// one event was applied, so the event loop knows the UI is dirty and must
+/// redraw (the inline-viewport model only repaints on change).
+fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<bool> {
+    let mut applied = false;
     for _ in 0..MAX_BACKEND_EVENTS_PER_TICK {
         let Some(event) = backend.next_event()? else {
             drain_pending_autonomy_hydration(backend, store);
-            return Ok(());
+            return Ok(applied);
         };
         apply_client_event_and_send_followup(backend, store, event);
+        applied = true;
     }
 
     drain_pending_autonomy_hydration(backend, store);
-    Ok(())
+    Ok(applied)
 }
 
 fn apply_client_event_and_send_followup(
@@ -2346,18 +2470,59 @@ mod tests {
     }
 }
 
-struct TerminalGuard;
+/// Tracks the current screen model and restores terminal state on drop.
+struct TerminalGuard {
+    mode: RenderMode,
+}
+
+impl TerminalGuard {
+    /// Switch into the alternate screen for a full-screen overlay (if not
+    /// already there). The viewport is resized to the full screen by the caller.
+    fn enter_alt_screen(
+        &mut self,
+        terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        if self.mode == RenderMode::AltScreen {
+            return Ok(());
+        }
+        execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        terminal.invalidate_viewport();
+        self.mode = RenderMode::AltScreen;
+        Ok(())
+    }
+
+    /// Return to the inline-viewport model (normal scrollback). On the way back
+    /// we force the next inline draw to repaint the whole viewport.
+    fn leave_alt_screen(
+        &mut self,
+        terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+    ) -> Result<()> {
+        if self.mode == RenderMode::Inline {
+            return Ok(());
+        }
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        // Re-anchor the inline viewport at the current cursor row so history
+        // insertion and viewport draws land in the right place.
+        let size = terminal.size()?;
+        terminal.set_viewport_area(ratatui::layout::Rect::new(
+            0,
+            size.height.saturating_sub(1),
+            size.width,
+            1,
+        ));
+        terminal.invalidate_viewport();
+        self.mode = RenderMode::Inline;
+        Ok(())
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
         let mut stdout: Stdout = io::stdout();
-        let _ = execute!(
-            stdout,
-            DisableBracketedPaste,
-            DisableFocusChange,
-            Show,
-            LeaveAlternateScreen
-        );
+        if self.mode == RenderMode::AltScreen {
+            let _ = execute!(stdout, LeaveAlternateScreen);
+        }
+        let _ = disable_raw_mode();
+        let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
     }
 }

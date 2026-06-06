@@ -13,12 +13,15 @@ pub mod client_event;
 pub mod clipboard;
 pub mod cmd;
 pub mod event_loop;
+pub mod insert_history;
 pub mod keymap;
 pub mod menu;
 pub mod model;
 pub mod store;
 pub mod theme;
 pub mod transport;
+pub mod tui_terminal;
+pub mod viewport;
 
 #[cfg(test)]
 mod i18n_tests {

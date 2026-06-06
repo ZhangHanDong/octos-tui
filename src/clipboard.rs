@@ -31,8 +31,30 @@ use crate::model::AppState;
 /// The payload is standard base64 (RFC 4648, `+`/`/`, `=` padding) with **no**
 /// line wrapping — line breaks in an OSC string would terminate the sequence.
 pub fn osc52_copy_sequence(text: &str) -> String {
+    osc52_copy_sequence_for(text, std::env::var_os("TMUX").is_some())
+}
+
+/// Build the OSC 52 sequence, optionally wrapped for tmux passthrough.
+///
+/// Inside tmux, a bare OSC 52 sequence is consumed by tmux itself and never
+/// reaches the outer terminal (so the operator's *local* clipboard is never
+/// set). tmux's DCS passthrough — `ESC P tmux; <escaped-payload> ESC \` with the
+/// inner `ESC` bytes doubled — forwards the sequence to the outer terminal.
+/// codex uses the same wrapper (`clipboard_copy.rs`). The `set-clipboard on`
+/// tmux option must also be enabled for this to work end to end.
+///
+/// Detection is by the `TMUX` env var (set by tmux for its child processes);
+/// `tmux` is the parameterized seam so the behaviour is unit-testable.
+pub fn osc52_copy_sequence_for(text: &str, tmux: bool) -> String {
     let encoded = base64_encode(text.as_bytes());
-    format!("\x1b]52;c;{encoded}\x07")
+    let bare = format!("\x1b]52;c;{encoded}\x07");
+    if tmux {
+        // Double every ESC inside the payload, then wrap in the tmux DCS frame.
+        let escaped = bare.replace('\x1b', "\x1b\x1b");
+        format!("\x1bPtmux;{escaped}\x1b\\")
+    } else {
+        bare
+    }
 }
 
 /// The text to copy when the user invokes the copy command: the most recent
@@ -143,6 +165,19 @@ mod tests {
     #[test]
     fn should_wrap_payload_in_osc52_clipboard_frame() {
         let seq = osc52_copy_sequence("foobar");
+        assert_eq!(seq, "\x1b]52;c;Zm9vYmFy\x07");
+    }
+
+    #[test]
+    fn should_wrap_in_tmux_passthrough_when_inside_tmux() {
+        // Matches codex's tmux DCS frame: ESC P tmux ; <esc-doubled OSC52> ESC \
+        let seq = osc52_copy_sequence_for("foobar", /*tmux*/ true);
+        assert_eq!(seq, "\x1bPtmux;\x1b\x1b]52;c;Zm9vYmFy\x07\x1b\\");
+    }
+
+    #[test]
+    fn should_emit_bare_osc52_when_not_in_tmux() {
+        let seq = osc52_copy_sequence_for("foobar", /*tmux*/ false);
         assert_eq!(seq, "\x1b]52;c;Zm9vYmFy\x07");
     }
 

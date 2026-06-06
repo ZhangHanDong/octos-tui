@@ -1,5 +1,4 @@
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
@@ -20,9 +19,10 @@ use crate::{
         UserQuestionPickerState, extract_plan_steps, task_state_label,
     },
     theme::Palette,
+    tui_terminal::FrameLike,
 };
 
-pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+pub fn render(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if inspector_visible(app) {
         render_inspector_layout(frame, app, palette);
     } else {
@@ -43,6 +43,13 @@ pub fn render(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
     }
 }
 
+/// Full-screen overlay render for the alt-screen path (inspector, onboarding,
+/// detail modals). Identical layout to [`render`]; named separately so the event
+/// loop's alt-screen branch reads clearly against the inline-viewport branch.
+pub fn render_inline_overlay(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    render(frame, app, palette);
+}
+
 fn inspector_visible(app: &AppState) -> bool {
     matches!(
         app.focus,
@@ -54,7 +61,249 @@ fn inspector_visible(app: &AppState) -> bool {
     )
 }
 
-fn render_chat_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+// ===========================================================================
+// Inline-viewport rendering (codex-style scrollback model).
+//
+// The event loop keeps the live UI (live transcript tail + menus + indicators +
+// composer + status) in a small ratatui inline viewport pinned to the bottom of
+// the screen, and writes *finalized* transcript history into the terminal's
+// normal scrollback (via `insert_history`). The terminal then owns that
+// scrollback, so the user can natively mouse-select, wheel-scroll, and copy
+// prior output (incl. through tmux) with no app mode key.
+//
+// `render_viewport` is the live-UI draw; `finalized_history_lines` produces the
+// committed-only lines flushed to scrollback. Full-screen overlays (inspector,
+// onboarding, modals) fall back to the legacy `render` path under alt-screen —
+// see `wants_fullscreen_overlay`.
+// ===========================================================================
+
+/// True when the current state needs the legacy full-screen render (alt-screen),
+/// rather than the inline-viewport + scrollback chat flow. Mirrors codex using
+/// alt-screen only for transient overlays (transcript pager, resume picker).
+pub fn wants_fullscreen_overlay(app: &AppState) -> bool {
+    inspector_visible(app)
+        || onboarding_first_launch_active(app)
+        || app.task_output.active
+        || app.artifact_detail.active
+        || app.thread_graph_detail.active
+        || app.turn_state_detail.active
+}
+
+/// Height (rows) the live inline viewport needs for the current chat state:
+/// the live transcript tail + menu + indicators + composer + status. Bounded so
+/// it never consumes the whole screen (history must stay visible in scrollback).
+pub fn live_ui_height(app: &AppState, width: u16, height: u16) -> u16 {
+    let composer_height = composer_height_for_size(app, width, height);
+    let active_menu = active_menu_surface(app);
+    let menu_height = menu_height_hint(active_menu.as_ref(), width, height);
+    let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
+    let chrome = menu_height + autonomy_height + harness_height + composer_height + 1; // +1 status
+
+    let tail_height = live_tail_height(app, width, height);
+    let total = chrome.saturating_add(tail_height);
+
+    // Never let the live UI eat the whole screen: leave at least a few rows of
+    // scrollback visible above it (so the user always sees prior output and can
+    // start a selection there). Always at least the chrome.
+    let cap = height
+        .saturating_sub(LIVE_VIEWPORT_MIN_SCROLLBACK)
+        .max(chrome.min(height));
+    total.clamp(chrome.min(height).max(1), cap.max(1))
+}
+
+/// Minimum rows of scrollback to keep visible above the inline viewport.
+const LIVE_VIEWPORT_MIN_SCROLLBACK: u16 = 4;
+
+/// Desired height of the live transcript tail (in-flight / uncommitted content
+/// shown inside the viewport). Bounded; the bulk of history lives in scrollback.
+fn live_tail_height(app: &AppState, width: u16, height: u16) -> u16 {
+    if launch_banner_active(app) {
+        // The empty-session launch banner wants a generous block.
+        return height.saturating_sub(8).clamp(6, 16);
+    }
+    let wrap_width = usize::from(width.saturating_sub(2)).max(1);
+    let lines = live_tail_lines(app, Palette::for_theme(app.theme), wrap_width);
+    let rows = transcript_visual_rows(&lines, wrap_width) as u16;
+    // Cap the tail so it can't dominate the viewport; the rest is in scrollback.
+    let max_tail = height.saturating_sub(10).clamp(3, 18);
+    rows.clamp(0, max_tail)
+}
+
+/// Render the live UI into the inline viewport (`frame.area()` is the viewport).
+/// Mirrors `render_chat_layout` but the top pane shows only the live transcript
+/// tail (finalized history is in scrollback, not here).
+pub fn render_viewport(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
+    let area = frame.area();
+    let composer_height = composer_height_for_size(app, area.width, area.height);
+    let active_menu = active_menu_surface(app);
+    let menu_height = menu_height_hint(active_menu.as_ref(), area.width, area.height)
+        .min(area.height.saturating_sub(composer_height + 1));
+    let autonomy_height = autonomy_indicator_height(app);
+    let harness_height = harness_status_height(app);
+
+    let root = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(menu_height),
+            Constraint::Length(autonomy_height),
+            Constraint::Length(harness_height),
+            Constraint::Length(composer_height),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    if launch_banner_active(app) {
+        render_launch_banner(frame, app, palette, root[0]);
+    } else {
+        frame.render_widget(render_live_tail(app, palette, root[0]), root[0]);
+    }
+    if let Some(menu) = active_menu.as_ref() {
+        menu_render::render_menu_surface(frame, root[1], menu, palette);
+    }
+    if autonomy_height > 0 {
+        frame.render_widget(render_autonomy_indicator(app, palette), root[2]);
+    }
+    if harness_height > 0 {
+        render_harness_status_row(frame, app, palette, root[3]);
+    }
+    frame.render_widget(render_composer(app, palette, root[4]), root[4]);
+    set_composer_cursor(frame, app, root[4]);
+    frame.render_widget(render_status(app, palette), root[5]);
+}
+
+/// The live (uncommitted / in-flight) transcript tail rendered inside the
+/// viewport: recent-user context, turn-flow, the streaming reply, activity, and
+/// pending messages. Committed messages are NOT here — they are in scrollback.
+fn render_live_tail(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'static> {
+    let wrap_width = transcript_wrap_width(area);
+    let lines = live_tail_lines(app, palette, wrap_width);
+
+    let visible_height = transcript_visible_height(area);
+    let total_rows = transcript_visual_rows(&lines, wrap_width);
+    let max_scroll = total_rows.saturating_sub(visible_height);
+    let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
+    let scroll_top = max_scroll.saturating_sub(scroll_from_bottom) as u16;
+
+    Paragraph::new(Text::from(lines))
+        .block(
+            Block::default()
+                .style(Style::default().fg(palette.text).bg(palette.surface_alt))
+                .border_style(palette.border()),
+        )
+        .scroll((scroll_top, 0))
+        .wrap(Wrap { trim: false })
+}
+
+/// Build the live-tail lines (everything that is NOT finalized committed
+/// history): recent-user context pinned for the active turn, turn-flow
+/// (approvals / questions / streaming reply / activity / diff preview), and
+/// pending queued messages.
+fn live_tail_lines(app: &AppState, palette: Palette, wrap_width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+
+    // `should_show_turn_flow` already covers the visible-approval and
+    // visible-question cases (it ORs them in), so a single branch suffices.
+    if should_show_turn_flow(app, session) {
+        if let Some(prompt) = latest_user_message(session) {
+            push_recent_user_context(&mut lines, palette, prompt, wrap_width);
+        }
+        push_turn_flow(&mut lines, palette, app, session, wrap_width);
+    }
+
+    if !app.pending_messages.is_empty() {
+        push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
+    }
+
+    lines
+}
+
+/// The finalized (committed) transcript lines to push into scrollback: the
+/// committed `session.messages` rendered as message blocks. Append-only as long
+/// as messages are append-only; the scrollback tracker detects discontinuities
+/// (session switch / hydrate replace) and re-flushes from scratch.
+pub fn finalized_history_lines(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
+    finalized_history_lines_range(app, palette, wrap_width, 0)
+}
+
+/// Like [`finalized_history_lines`] but only renders committed messages from
+/// index `start` onward — used to flush *just the newly committed* messages to
+/// scrollback without re-emitting the whole history every turn.
+pub fn finalized_history_lines_range(
+    app: &AppState,
+    palette: Palette,
+    wrap_width: usize,
+    start: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let Some(session) = app.active_session() else {
+        return lines;
+    };
+    for message in session.messages.iter().skip(start) {
+        push_message_block(
+            &mut lines,
+            palette,
+            message.role.as_str(),
+            &message.content,
+            wrap_width,
+        );
+        if let Some(reasoning) = message.reasoning_content.as_deref() {
+            push_message_block(&mut lines, palette, "reasoning", reasoning, wrap_width);
+        }
+        if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+            lines.push(Line::from(vec![
+                Span::styled("         tool_call ", palette.muted()),
+                Span::styled(tool_call_id.to_string(), palette.text()),
+            ]));
+        }
+    }
+    lines
+}
+
+/// A stable fingerprint of the committed messages already flushed to scrollback,
+/// used by the event loop's scrollback tracker to decide whether new committed
+/// messages are an append-only extension (flush the tail) or a discontinuity
+/// (session switch / hydrate replace → reset + re-flush).
+pub fn committed_messages_fingerprint(app: &AppState) -> CommittedFingerprint {
+    let Some(session) = app.active_session() else {
+        return CommittedFingerprint::default();
+    };
+    CommittedFingerprint {
+        session_id: session.id.0.clone(),
+        message_count: session.messages.len(),
+        // A cheap content hash of the committed messages so a hydrate that
+        // *replaces* history (same count, different content) is detected.
+        content_hash: committed_content_hash(session),
+    }
+}
+
+/// Identity of the committed history flushed to scrollback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommittedFingerprint {
+    pub session_id: String,
+    pub message_count: usize,
+    pub content_hash: u64,
+}
+
+fn committed_content_hash(session: &SessionView) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for message in &session.messages {
+        message.role.as_str().hash(&mut hasher);
+        message.content.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn render_chat_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     if onboarding_first_launch_active(app) {
         render_onboarding_first_launch_layout(frame, app, palette);
         return;
@@ -212,7 +461,11 @@ fn render_onboarding_header(area: Rect, palette: Palette) -> Paragraph<'static> 
     Paragraph::new(Text::from(lines))
 }
 
-fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+fn render_onboarding_first_launch_layout(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+) {
     let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -272,7 +525,7 @@ fn min_transcript_height(terminal_height: u16) -> u16 {
     if terminal_height < 30 { 8 } else { 12 }
 }
 
-fn render_inspector_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
+fn render_inspector_layout(frame: &mut impl FrameLike, app: &AppState, palette: Palette) {
     let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
     let active_menu = active_menu_surface(app);
     let menu_height = menu_height_hint(
@@ -632,7 +885,7 @@ fn launch_banner_active(app: &AppState) -> bool {
 /// Claude-Code-style launch banner: a rounded box with the OCTOS logo, a
 /// greeting, and the workspace path. No right-hand panel (per product call).
 /// Rendered at the TOP of the transcript area for an empty session.
-fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
+fn render_launch_banner(frame: &mut impl FrameLike, app: &AppState, palette: Palette, area: Rect) {
     let width = area.width as usize;
     if width < 12 || area.height < 6 {
         return;
@@ -3602,7 +3855,12 @@ fn harness_status_lines(
 /// status sits on the left and a `LineGauge` context-window bar sits on the
 /// right when a `token_estimate` is known. Drawn into its own layout row
 /// (never the composer border).
-fn render_harness_status_row(frame: &mut Frame<'_>, app: &AppState, palette: Palette, area: Rect) {
+fn render_harness_status_row(
+    frame: &mut impl FrameLike,
+    app: &AppState,
+    palette: Palette,
+    area: Rect,
+) {
     let ratio = harness_context_ratio(app);
     // Reserve a fixed-width column for the context gauge only when we have a
     // ratio to show AND the row is wide enough for both the text and the gauge.
@@ -3760,7 +4018,7 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         .block(block)
 }
 
-fn set_composer_cursor(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+fn set_composer_cursor(frame: &mut impl FrameLike, app: &AppState, area: Rect) {
     if app.focus != FocusPane::Composer {
         return;
     }
@@ -4358,7 +4616,7 @@ fn push_field(
 }
 
 fn render_task_output_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     output: &TaskOutputDetailState,
     palette: Palette,
 ) {
@@ -4410,7 +4668,7 @@ fn render_task_output_modal(
 }
 
 fn render_artifact_detail_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     artifact: &ArtifactDetailState,
     palette: Palette,
 ) {
@@ -4446,7 +4704,7 @@ fn render_artifact_detail_modal(
 }
 
 fn render_thread_graph_detail_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     graph: &ThreadGraphDetailState,
     palette: Palette,
 ) {
@@ -4482,7 +4740,7 @@ fn render_thread_graph_detail_modal(
 }
 
 fn render_turn_state_detail_modal(
-    frame: &mut Frame<'_>,
+    frame: &mut impl FrameLike,
     turn: &TurnStateDetailState,
     palette: Palette,
 ) {
@@ -9125,5 +9383,149 @@ mod tests {
             "label {label:?} should respect AUTONOMY_LOOP_LABEL_MAX",
         );
         assert!(label.ends_with('…'));
+    }
+
+    // ---- inline-viewport (scrollback) rendering ----
+
+    fn chat_app(messages: Vec<Message>) -> AppState {
+        AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages,
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        )
+    }
+
+    /// Render `render_viewport` into a buffer via the custom inline `Frame`, at
+    /// the live-UI height the event loop would size it to. We render straight
+    /// into a `Buffer` (no escape-emitting backend needed) so the test does not
+    /// require a `Write` backend.
+    fn viewport_rows(app: &AppState, width: u16, height: u16) -> Vec<String> {
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let live_height = super::live_ui_height(app, width, height);
+        let area = Rect::new(0, 0, width, live_height);
+        let mut buffer = Buffer::empty(area);
+        let mut frame = crate::tui_terminal::Frame::for_test(area, &mut buffer);
+        render_viewport(&mut frame, app, palette);
+        rendered_rows(&buffer)
+    }
+
+    #[test]
+    fn viewport_renders_live_ui_not_committed_history() {
+        // Committed messages live in scrollback (finalized_history_lines), NOT
+        // in the inline viewport. The viewport shows the composer + status.
+        let app = chat_app(vec![
+            Message::user("an old committed question"),
+            Message::assistant("an old committed answer"),
+        ]);
+        let rows = viewport_rows(&app, 100, 40);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("Composer"),
+            "viewport should show the composer chrome, got:\n{text}"
+        );
+        assert!(
+            !text.contains("an old committed answer"),
+            "committed history must go to scrollback, not the viewport:\n{text}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_contain_committed_messages() {
+        let app = chat_app(vec![
+            Message::user("question one"),
+            Message::assistant("answer one"),
+        ]);
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let lines = finalized_history_lines(&app, palette, 80);
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("question one"), "missing user msg: {text:?}");
+        assert!(
+            text.contains("answer one"),
+            "missing assistant msg: {text:?}"
+        );
+    }
+
+    #[test]
+    fn finalized_history_lines_range_skips_already_flushed() {
+        let app = chat_app(vec![
+            Message::user("q1"),
+            Message::assistant("a1"),
+            Message::user("q2"),
+            Message::assistant("a2"),
+        ]);
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let tail = finalized_history_lines_range(&app, palette, 80, 2);
+        let text: String = tail
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(text.contains("q2") && text.contains("a2"));
+        assert!(
+            !text.contains("a1"),
+            "range(2) must not re-emit already-flushed messages: {text:?}"
+        );
+    }
+
+    #[test]
+    fn live_ui_height_is_bounded_below_screen_height() {
+        // Even with a huge live tail, the inline viewport must leave scrollback
+        // visible above it (so the user can always select/scroll prior output).
+        let mut app = chat_app(vec![Message::user("hi")]);
+        app.pending_messages = (0..50).map(|i| format!("queued {i}")).collect();
+        let height = 30;
+        let h = super::live_ui_height(&app, 100, height);
+        assert!(
+            h <= height.saturating_sub(super::LIVE_VIEWPORT_MIN_SCROLLBACK),
+            "live UI height {h} must leave >= {} rows of scrollback on a {height}-row screen",
+            super::LIVE_VIEWPORT_MIN_SCROLLBACK
+        );
+        assert!(h >= 1);
+    }
+
+    #[test]
+    fn wants_fullscreen_overlay_tracks_inspector_and_modals() {
+        let mut app = chat_app(vec![Message::user("hi")]);
+        assert!(
+            !super::wants_fullscreen_overlay(&app),
+            "plain chat should use the inline viewport, not alt-screen"
+        );
+        app.focus = FocusPane::Workspace;
+        assert!(
+            super::wants_fullscreen_overlay(&app),
+            "inspector panes should use the full-screen overlay"
+        );
+        app.focus = FocusPane::Composer;
+        app.task_output.active = true;
+        assert!(
+            super::wants_fullscreen_overlay(&app),
+            "an active detail modal should use the full-screen overlay"
+        );
+    }
+
+    #[test]
+    fn committed_fingerprint_changes_on_append_and_session_switch() {
+        let app1 = chat_app(vec![Message::user("hi")]);
+        let fp1 = committed_messages_fingerprint(&app1);
+        let app2 = chat_app(vec![Message::user("hi"), Message::assistant("yo")]);
+        let fp2 = committed_messages_fingerprint(&app2);
+        assert_ne!(fp1, fp2, "appending a message must change the fingerprint");
+        assert_eq!(fp1.session_id, fp2.session_id);
+        assert_eq!(fp2.message_count, 2);
     }
 }
