@@ -117,8 +117,6 @@ const ONBOARDING_LOGO_ART: &str = "\
 ██║   ██║██║        ██║   ██║   ██║╚════██║
 ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
-const ONBOARDING_LOGO_TAGLINE: &str = "Welcome to Octos — Your Coding Buddy";
-
 /// True only on the onboarding WELCOME / local-profile entry screen, where the
 /// splash logo takes over the main window. Discriminated by the welcome menu's
 /// stable first-item id (`onboard.local.status`) rather than the display title:
@@ -165,7 +163,7 @@ fn render_onboarding_logo(height: u16, palette: Palette) -> Paragraph<'static> {
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled(
-        ONBOARDING_LOGO_TAGLINE,
+        t!("app.banner.title").to_string(),
         Style::default().fg(palette.highlight),
     )));
     Paragraph::new(Text::from(lines)).alignment(Alignment::Center)
@@ -462,10 +460,10 @@ fn render_sessions(app: &AppState, palette: Palette) -> List<'static> {
 
     List::new(items).block(
         titled_block(
-            "Sessions",
+            t!("app.pane.sessions").to_string(),
             palette,
             app.focus == FocusPane::Sessions,
-            Some("Tab"),
+            Some("Tab".to_string()),
         )
         .border_style(palette.border()),
     )
@@ -475,7 +473,10 @@ fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mut lines = Vec::new();
     if let Some(session) = app.active_session() {
         if session.tasks.is_empty() {
-            lines.push(Line::from(Span::styled("No tasks yet", palette.muted())));
+            lines.push(Line::from(Span::styled(
+                t!("app.empty.no_tasks").to_string(),
+                palette.muted(),
+            )));
         } else {
             for (idx, task) in session.tasks.iter().enumerate() {
                 let marker = if idx == app.selected_task { "›" } else { " " };
@@ -521,10 +522,10 @@ fn render_tasks(app: &AppState, palette: Palette) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Tasks",
+                t!("app.pane.tasks").to_string(),
                 palette,
                 app.focus == FocusPane::Tasks,
-                Some("j/k or Up/Down"),
+                Some(t!("app.hint.list_nav").into_owned()),
             )
             .border_style(palette.border()),
         )
@@ -536,7 +537,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
 
     if app.artifacts.items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No artifacts in snapshot",
+            t!("app.empty.no_artifacts").to_string(),
             palette.muted(),
         )));
     } else {
@@ -562,7 +563,7 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
             ]));
             if idx == app.artifacts.selected {
                 lines.push(Line::from(Span::styled(
-                    format!("    from {}", item.source),
+                    format!("    {}", t!("app.artifact.from", source = item.source)),
                     palette.muted(),
                 )));
             }
@@ -572,10 +573,10 @@ fn render_artifacts(app: &AppState, palette: Palette) -> Paragraph<'static> {
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Artifacts",
+                t!("app.pane.artifacts").to_string(),
                 palette,
                 app.focus == FocusPane::Artifacts,
-                Some("j/k"),
+                Some("j/k".to_string()),
             )
             .border_style(palette.border()),
         )
@@ -649,20 +650,21 @@ fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette,
         .active_session()
         .and_then(|session| session.profile_id.as_deref())
     {
-        Some(profile) => format!("Welcome back — {profile}"),
-        None => "Welcome to Octos".to_string(),
+        Some(profile) => t!("app.banner.greeting_named", profile = profile).to_string(),
+        None => t!("app.banner.greeting_default").to_string(),
     };
     let greeting_w = greeting.width();
-    lines.push(centered(vec![Span::styled(greeting, highlight)], greeting_w));
+    lines.push(centered(
+        vec![Span::styled(greeting, highlight)],
+        greeting_w,
+    ));
     let cwd = short_path(app.workspace.root.as_str());
     let cwd_w = cwd.width();
     lines.push(centered(vec![Span::styled(cwd, palette.muted())], cwd_w));
     lines.push(centered(vec![], 0));
-    let hint = "Ask Octos anything to begin.";
-    lines.push(centered(
-        vec![Span::styled(hint, palette.muted())],
-        hint.chars().count(),
-    ));
+    let hint = t!("app.banner.hint").to_string();
+    let hint_w = hint.width();
+    lines.push(centered(vec![Span::styled(hint, palette.muted())], hint_w));
     lines.push(Line::from(Span::styled(
         format!("╰{}╯", "─".repeat(inner_w)),
         border,
@@ -745,7 +747,7 @@ fn render_transcript(app: &AppState, palette: Palette, area: Rect) -> Paragraph<
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "No session selected",
+            t!("app.empty.no_session").to_string(),
             palette.muted(),
         )));
     }
@@ -1001,15 +1003,11 @@ fn push_pending_messages_block(
     lines.push(chat_line(
         vec![
             Span::styled(
-                "queued ",
+                format!("{} ", t!("app.transcript.queued_label")),
                 palette.title().add_modifier(Modifier::BOLD).bg(bg),
             ),
             Span::styled(
-                format!(
-                    "{} message{} after active turn",
-                    pending.len(),
-                    if pending.len() == 1 { "" } else { "s" }
-                ),
+                t!("app.transcript.queued_after_turn", count = pending.len()).into_owned(),
                 palette.muted().bg(bg),
             ),
         ],
@@ -1023,7 +1021,10 @@ fn push_pending_messages_block(
     if pending.len() > 3 {
         lines.push(chat_line(
             vec![Span::styled(
-                format!("› +{} more queued", pending.len() - 3),
+                format!(
+                    "› {}",
+                    t!("app.transcript.more_queued", count = pending.len() - 3)
+                ),
                 palette.muted().bg(bg),
             )],
             Some(bg),
@@ -1746,14 +1747,15 @@ impl FileMutationActivity {
     }
 }
 
-fn file_mutation_action_label(operation: &str) -> &'static str {
+fn file_mutation_action_label(operation: &str) -> String {
     match operation {
-        "add" | "added" | "create" | "created" => "Added",
-        "delete" | "deleted" | "remove" | "removed" => "Deleted",
-        "write" | "wrote" => "Wrote",
-        "modify" | "modified" | "update" | "updated" => "Changed",
-        _ => "Changed",
+        "add" | "added" | "create" | "created" => t!("app.tool.added"),
+        "delete" | "deleted" | "remove" | "removed" => t!("app.tool.deleted"),
+        "write" | "wrote" => t!("app.tool.wrote"),
+        "modify" | "modified" | "update" | "updated" => t!("app.tool.changed"),
+        _ => t!("app.tool.changed"),
     }
+    .into_owned()
 }
 
 fn compact_file_path(path: &str) -> String {
@@ -1785,7 +1787,7 @@ fn meaningful_output_lines(output: &str) -> Vec<&str> {
         .collect()
 }
 
-fn tool_action_label(item: &ActivityItem, running: bool) -> &'static str {
+fn tool_action_label(item: &ActivityItem, running: bool) -> String {
     if item.title == "shell" {
         return shell_action_label(
             tool_invocation_text(item).as_deref().unwrap_or_default(),
@@ -1794,59 +1796,64 @@ fn tool_action_label(item: &ActivityItem, running: bool) -> &'static str {
     }
 
     match (item.title.as_str(), running) {
-        ("read_file", true) => "Reading",
-        ("read_file", false) => "Read",
-        ("write_file", true) => "Writing",
-        ("write_file", false) => "Wrote",
-        ("edit_file" | "diff_edit", true) => "Editing",
-        ("edit_file" | "diff_edit", false) => "Edited",
-        ("list_dir", true) => "Listing",
-        ("list_dir", false) => "Listed",
-        ("grep" | "glob" | "web_search" | "deep_search", true) => "Searching",
-        ("grep" | "glob" | "web_search" | "deep_search", false) => "Searched",
-        ("web_fetch", true) => "Fetching",
-        ("web_fetch", false) => "Fetched",
-        ("browser", true) => "Browsing",
-        ("browser", false) => "Browsed",
-        ("spawn", true) => "Spawning",
-        ("spawn", false) => "Spawned",
-        ("send_file", true) => "Sending",
-        ("send_file", false) => "Sent",
-        ("manage_skills" | "admin_manage_skills", true) => "Managing",
-        ("manage_skills" | "admin_manage_skills", false) => "Managed",
-        (_, true) => "Using",
-        (_, false) => "Used",
+        ("read_file", true) => t!("app.tool.reading"),
+        ("read_file", false) => t!("app.tool.read"),
+        ("write_file", true) => t!("app.tool.writing"),
+        ("write_file", false) => t!("app.tool.wrote"),
+        ("edit_file" | "diff_edit", true) => t!("app.tool.editing"),
+        ("edit_file" | "diff_edit", false) => t!("app.tool.edited"),
+        ("list_dir", true) => t!("app.tool.listing"),
+        ("list_dir", false) => t!("app.tool.listed"),
+        ("grep" | "glob" | "web_search" | "deep_search", true) => t!("app.tool.searching"),
+        ("grep" | "glob" | "web_search" | "deep_search", false) => t!("app.tool.searched"),
+        ("web_fetch", true) => t!("app.tool.fetching"),
+        ("web_fetch", false) => t!("app.tool.fetched"),
+        ("browser", true) => t!("app.tool.browsing"),
+        ("browser", false) => t!("app.tool.browsed"),
+        ("spawn", true) => t!("app.tool.spawning"),
+        ("spawn", false) => t!("app.tool.spawned"),
+        ("send_file", true) => t!("app.tool.sending"),
+        ("send_file", false) => t!("app.tool.sent"),
+        ("manage_skills" | "admin_manage_skills", true) => t!("app.tool.managing"),
+        ("manage_skills" | "admin_manage_skills", false) => t!("app.tool.managed"),
+        (_, true) => t!("app.tool.using"),
+        (_, false) => t!("app.tool.used"),
     }
+    .into_owned()
 }
 
-fn shell_action_label(command: &str, running: bool) -> &'static str {
+fn shell_action_label(command: &str, running: bool) -> String {
     let command = command.trim_start();
     let lower = command.to_ascii_lowercase();
     let label = if lower.starts_with("sleep ") || lower.contains("; sleep ") {
-        ("Waiting", "Waited")
+        ("app.tool.waiting", "app.tool.waited")
     } else if lower.contains("cargo test")
         || lower.contains("npm test")
         || lower.contains("npm run test")
         || lower.contains("pytest")
         || lower.contains("go test")
     {
-        ("Testing", "Tested")
+        ("app.tool.testing", "app.tool.tested")
     } else if lower.contains("cargo build")
         || lower.contains("npm run build")
         || lower.contains("pnpm build")
         || lower.contains("go build")
     {
-        ("Building", "Built")
+        ("app.tool.building", "app.tool.built")
     } else if lower.contains("npm install")
         || lower.contains("pnpm install")
         || lower.contains("cargo install")
     {
-        ("Installing", "Installed")
+        ("app.tool.installing", "app.tool.installed")
     } else {
-        ("Running", "Ran")
+        ("app.tool.running", "app.tool.ran")
     };
 
-    if running { label.0 } else { label.1 }
+    if running {
+        t!(label.0).into_owned()
+    } else {
+        t!(label.1).into_owned()
+    }
 }
 
 fn format_duration_ms(duration_ms: u64) -> String {
@@ -1877,7 +1884,10 @@ fn push_command_row(
 ) {
     lines.push(Line::from(vec![
         Span::styled(indent, palette.border().bg(palette.surface)),
-        Span::styled("▸ command  ", palette.selected().bg(palette.surface)),
+        Span::styled(
+            format!("▸ {}  ", t!("app.tool.command_label")),
+            palette.selected().bg(palette.surface),
+        ),
         Span::styled("$ ", palette.selected().bg(palette.surface)),
         Span::styled(command.to_string(), palette.text().bg(palette.surface)),
     ]));
@@ -1892,10 +1902,10 @@ fn push_inline_approval_card(
     lines.push(Line::from(vec![
         Span::styled("  ", palette.muted()),
         Span::styled(
-            "Approval Requested",
+            t!("app.approval.title").to_string(),
             palette.title().add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  inline", palette.muted()),
+        Span::styled(format!("  {}", t!("app.approval.inline")), palette.muted()),
     ]));
     for line in approval_modal_lines(approval, palette) {
         push_prefixed_line(lines, "    ", palette.muted(), line);
@@ -1909,16 +1919,19 @@ fn push_inline_approval_card(
     if approval.diff_preview_id().is_some() {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("d = view diff", palette.selected()),
+            Span::styled(
+                t!("app.approval.action_diff").to_string(),
+                palette.selected(),
+            ),
         ]));
     }
 }
 
-fn approval_action_labels(_approval: &ApprovalModalState) -> [&'static str; 3] {
+fn approval_action_labels(_approval: &ApprovalModalState) -> [String; 3] {
     [
-        "y = approve this command once",
-        "s = approve this command/scope for the session",
-        "n = deny it",
+        t!("app.approval.action_once").to_string(),
+        t!("app.approval.action_session").to_string(),
+        t!("app.approval.action_deny").to_string(),
     ]
 }
 
@@ -1934,14 +1947,19 @@ fn push_inline_user_question_card(
 ) {
     lines.push(Line::from(""));
     let header = if picker.questions.len() > 1 {
-        format!("Question {}/{}", picker.active + 1, picker.questions.len())
+        t!(
+            "app.question.header_multi",
+            n = picker.active + 1,
+            total = picker.questions.len()
+        )
+        .to_string()
     } else {
-        "Question".to_string()
+        t!("app.question.header_single").to_string()
     };
     lines.push(Line::from(vec![
         Span::styled("  ", palette.muted()),
         Span::styled(
-            "Agent asked a question",
+            t!("app.question.card_title").to_string(),
             palette.title().add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  {header}"), palette.muted()),
@@ -1977,7 +1995,7 @@ fn push_inline_user_question_card(
             // stays dismissible (Esc) and recoverable (Alt+a).
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled("No answerable options were provided.", palette.muted()),
+                Span::styled(t!("app.question.no_options").to_string(), palette.muted()),
             ]));
         }
     }
@@ -2046,9 +2064,9 @@ fn push_user_question_entry(
     let cursor = if other_highlighted { ">" } else { " " };
     let body = if entry.free_text.is_empty() {
         if editing {
-            "(type your answer)".to_string()
+            t!("app.question.type_answer").into_owned()
         } else {
-            "Other (free text)".to_string()
+            t!("app.question.free_text_row").to_string()
         }
     } else {
         entry.free_text.clone()
@@ -2060,7 +2078,8 @@ fn push_user_question_entry(
     } else {
         " "
     };
-    let text = format!("{cursor} {marker_open}{mark}{marker_close} Other: {body}");
+    let other_prefix = t!("app.question.other_prefix").to_string();
+    let text = format!("{cursor} {marker_open}{mark}{marker_close} {other_prefix}: {body}");
     let style = if other_highlighted {
         palette.selected().add_modifier(Modifier::BOLD)
     } else {
@@ -2072,18 +2091,18 @@ fn push_user_question_entry(
     ]));
 }
 
-fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<&'static str> {
+fn user_question_action_labels(picker: &UserQuestionPickerState) -> Vec<String> {
     // Garbled / 0-question event: nothing is answerable, so offer only a dismiss
     // hint — never a submit affordance that would form an invalid respond
     // (DO-NOT-SHIP #2). Alt+a re-opens it if dismissed (DO-NOT-SHIP #1).
     if picker.questions.is_empty() {
-        return vec!["Esc = dismiss (no answer to submit)"];
+        return vec![t!("app.question.action_dismiss").to_string()];
     }
-    let mut labels = vec!["Up/Down move | Space toggle | type for Other"];
+    let mut labels = vec![t!("app.question.action_toggle").to_string()];
     if picker.is_last_question() {
-        labels.push("Enter = submit answer(s) | Esc = hide");
+        labels.push(t!("app.question.action_submit").to_string());
     } else {
-        labels.push("Enter = next question | Esc = hide");
+        labels.push(t!("app.question.action_next").to_string());
     }
     labels
 }
@@ -2178,10 +2197,11 @@ fn push_activity_section(lines: &mut Vec<Line<'static>>, palette: Palette, app: 
         lines.push(Line::from(vec![
             Span::styled("     ", palette.muted()),
             Span::styled(
-                format!(
-                    "... +{} older action(s)",
-                    flow_activity.len() - recent.len()
-                ),
+                t!(
+                    "app.activity.older_actions",
+                    count = flow_activity.len() - recent.len()
+                )
+                .to_string(),
                 palette.muted(),
             ),
         ]));
@@ -2307,7 +2327,13 @@ fn push_turn_activity_log_section(
         lines.push(Line::from(vec![
             Span::styled("     ", palette.muted()),
             Span::styled(
-                format!("... +{hidden} more, {completed} completed, {active} active"),
+                t!(
+                    "app.activity.more_completed_active",
+                    hidden = hidden,
+                    completed = completed,
+                    active = active
+                )
+                .into_owned(),
                 palette.muted(),
             ),
         ]));
@@ -2355,15 +2381,15 @@ fn agent_task_group_title(
     failed: usize,
     pending_continuations: u32,
     is_active_group: bool,
-) -> &'static str {
+) -> String {
     if in_progress {
-        "Orchestrating..."
+        t!("app.activity.orchestrating").to_string()
     } else if is_active_group && pending_continuations > 0 {
-        "Re-entering (continuing)..."
+        t!("app.activity.re_entering").to_string()
     } else if failed > 0 {
-        "Agent task finished with errors"
+        t!("app.activity.finished_errors").to_string()
     } else {
-        "Agent task completed"
+        t!("app.activity.completed").to_string()
     }
 }
 
@@ -2401,21 +2427,27 @@ fn push_agent_task_group(
     // with work outstanding.
     let in_progress = active > 0 || active_subagents > 0;
     let title = agent_task_group_title(in_progress, failed, pending_continuations, is_active_group);
-    let mut metadata = vec![format!("{total} action(s)")];
+    let mut metadata = vec![t!("app.activity.action_count", count = total).into_owned()];
     if active > 0 {
-        metadata.push(format!("{active} active"));
+        metadata.push(t!("app.activity.active_count", count = active).into_owned());
     }
     if completed > 0 {
-        metadata.push(format!("{completed} completed"));
+        metadata.push(t!("app.activity.completed_count", count = completed).into_owned());
     }
     if failed > 0 {
-        metadata.push(format!("{failed} failed"));
+        metadata.push(t!("app.activity.failed_count", count = failed).into_owned());
     }
     if active_subagents > 0 {
-        metadata.push(format!("{active_subagents} sub-agent(s) running"));
+        metadata.push(t!("app.activity.subagents_running", count = active_subagents).into_owned());
     }
     if let Some(turn_id) = turn_id {
-        metadata.push(format!("turn {}", short_id(&turn_id.0.to_string())));
+        metadata.push(
+            t!(
+                "app.activity.turn_label",
+                id = short_id(&turn_id.0.to_string())
+            )
+            .into_owned(),
+        );
     }
 
     // While orchestrating, show the animated octopus "tentacle pulse" spinner;
@@ -2444,7 +2476,7 @@ fn push_agent_task_group(
             Span::styled(prefix, palette.border()),
             Span::styled("◻ ", palette.selected()),
             Span::styled(title.clone(), palette.text()),
-            Span::styled("  running", palette.muted()),
+            Span::styled(format!("  {}", t!("app.activity.running")), palette.muted()),
         ]));
     }
 }
@@ -2483,7 +2515,10 @@ fn compact_activity_spans(item: &ActivityItem, palette: Palette) -> Vec<Span<'st
             Span::styled(format!("  {}", mutation.operation), palette.muted()),
         ];
         if mutation.preview_ready {
-            spans.push(Span::styled("  preview ready", palette.selected()));
+            spans.push(Span::styled(
+                format!("  {}", t!("app.activity.preview_ready")),
+                palette.selected(),
+            ));
         }
         return spans;
     }
@@ -2581,21 +2616,29 @@ fn push_compact_tool_preview(
     }
     if total > shown {
         let action = if expanded {
-            "Ctrl+O collapse"
+            t!("app.hint.ctrl_o_collapse").into_owned()
         } else {
-            "Ctrl+O expand"
+            t!("app.hint.ctrl_o_expand").into_owned()
         };
         lines.push(Line::from(vec![
             Span::styled("     │ ", palette.border()),
             Span::styled(
-                format!("... {} more line(s) hidden ({action})", total - shown),
+                t!(
+                    "app.activity.more_lines_hidden",
+                    count = total - shown,
+                    action = action
+                )
+                .into_owned(),
                 palette.muted(),
             ),
         ]));
     } else if expanded && total > COLLAPSED_TOOL_PREVIEW_LINES {
         lines.push(Line::from(vec![
             Span::styled("     │ ", palette.border()),
-            Span::styled("expanded (Ctrl+O collapse)", palette.muted()),
+            Span::styled(
+                t!("app.activity.expanded_hint").into_owned(),
+                palette.muted(),
+            ),
         ]));
     }
 }
@@ -2674,7 +2717,10 @@ fn push_inline_diff_preview(
     }
     lines.push(Line::from(vec![
         Span::styled("  ", palette.muted()),
-        Span::styled("Diff Preview", palette.title().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            t!("app.diff.title").to_string(),
+            palette.title().add_modifier(Modifier::BOLD),
+        ),
     ]));
 
     if let Some(preview) = &diff.preview {
@@ -2684,7 +2730,7 @@ fn push_inline_diff_preview(
                 preview
                     .title
                     .clone()
-                    .unwrap_or_else(|| "Inline patch".into()),
+                    .unwrap_or_else(|| t!("app.diff.inline_patch").to_string()),
                 palette.text().add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", palette.muted()),
@@ -2702,7 +2748,7 @@ fn push_inline_diff_preview(
         if preview.files.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
-                Span::styled("No file changes", palette.muted()),
+                Span::styled(t!("app.empty.no_file_changes").to_string(), palette.muted()),
             ]));
         }
 
@@ -2710,7 +2756,7 @@ fn push_inline_diff_preview(
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
                 Span::styled(
-                    "[/] select hunk | c stage selected diff context",
+                    t!("app.diff.select_stage_hint").into_owned(),
                     palette.selected(),
                 ),
             ]));
@@ -2730,10 +2776,11 @@ fn push_inline_diff_preview(
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
                 Span::styled(
-                    format!(
-                        "+{} more file(s) hidden (Tab inspector)",
-                        preview.files.len() - 1
-                    ),
+                    t!(
+                        "app.diff.more_files_hidden",
+                        count = preview.files.len() - 1
+                    )
+                    .into_owned(),
                     palette.muted(),
                 ),
             ]));
@@ -2741,7 +2788,7 @@ fn push_inline_diff_preview(
     } else if diff.loading {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("Loading diff preview...", palette.selected()),
+            Span::styled(t!("app.diff.loading").to_string(), palette.selected()),
         ]));
     } else if let Some(error) = &diff.error {
         lines.push(Line::from(vec![
@@ -2751,7 +2798,7 @@ fn push_inline_diff_preview(
     } else {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("No diff preview loaded", palette.muted()),
+            Span::styled(t!("app.empty.no_diff").to_string(), palette.muted()),
         ]));
     }
 }
@@ -2781,7 +2828,10 @@ fn push_diff_file_lines(
     if file.hunks.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
-            Span::styled("line diff unavailable for this mutation", palette.muted()),
+            Span::styled(
+                t!("app.diff.line_unavailable").into_owned(),
+                palette.muted(),
+            ),
         ]));
     }
 
@@ -2816,10 +2866,7 @@ fn push_diff_file_lines(
             lines.push(Line::from(vec![
                 Span::styled("    ", palette.muted()),
                 Span::styled(
-                    format!(
-                        "{} more diff line(s) hidden (Tab inspector)",
-                        hunk.lines.len() - 4
-                    ),
+                    t!("app.diff.more_lines_hidden", count = hunk.lines.len() - 4).into_owned(),
                     palette.muted(),
                 ),
             ]));
@@ -2829,10 +2876,7 @@ fn push_diff_file_lines(
         lines.push(Line::from(vec![
             Span::styled("    ", palette.muted()),
             Span::styled(
-                format!(
-                    "+{} more hunk(s) hidden (Tab inspector)",
-                    file.hunks.len() - 1
-                ),
+                t!("app.diff.more_hunks_hidden", count = file.hunks.len() - 1).into_owned(),
                 palette.muted(),
             ),
         ]));
@@ -2913,9 +2957,12 @@ fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let plan = extract_plan_lines(app);
     let lines = if plan.is_empty() {
         vec![
-            Line::from(Span::styled("No active plan", palette.muted())),
             Line::from(Span::styled(
-                "Plan text is inferred from assistant/live replies.",
+                t!("app.empty.no_plan").to_string(),
+                palette.muted(),
+            )),
+            Line::from(Span::styled(
+                t!("app.empty.no_plan_hint").to_string(),
                 palette.muted(),
             )),
         ]
@@ -2934,7 +2981,15 @@ fn render_plan(app: &AppState, palette: Palette) -> Paragraph<'static> {
     };
 
     Paragraph::new(Text::from(lines))
-        .block(titled_block("Plan", palette, false, Some("live")).border_style(palette.border()))
+        .block(
+            titled_block(
+                t!("app.pane.plan").to_string(),
+                palette,
+                false,
+                Some(t!("app.plan.live").into_owned()),
+            )
+            .border_style(palette.border()),
+        )
         .wrap(Wrap { trim: false })
 }
 
@@ -3098,11 +3153,14 @@ fn normalize_plan_text(text: &str) -> String {
 fn render_workspace(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'static> {
     let mut lines = vec![
         Line::from(vec![
-            Span::styled("root ", palette.muted()),
+            Span::styled(format!("{} ", t!("app.workspace.root")), palette.muted()),
             Span::styled(app.workspace.root.clone(), palette.text()),
         ]),
         Line::from(""),
-        Line::from(Span::styled("contract", palette.title())),
+        Line::from(Span::styled(
+            t!("app.workspace.contract").into_owned(),
+            palette.title(),
+        )),
     ];
 
     for line in &app.workspace.contract {
@@ -3113,7 +3171,10 @@ fn render_workspace(app: &AppState, palette: Palette, area_height: u16) -> Parag
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("tree", palette.title())));
+    lines.push(Line::from(Span::styled(
+        t!("app.workspace.tree").into_owned(),
+        palette.title(),
+    )));
     for (idx, entry) in app.workspace.entries.iter().enumerate() {
         let marker = if idx == app.workspace.selected {
             "›"
@@ -3140,10 +3201,10 @@ fn render_workspace(app: &AppState, palette: Palette, area_height: u16) -> Parag
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Workspace",
+                t!("app.pane.workspace").to_string(),
                 palette,
                 app.focus == FocusPane::Workspace,
-                Some("contract"),
+                Some(t!("app.workspace.contract").into_owned()),
             )
             .border_style(palette.border()),
         )
@@ -3153,22 +3214,28 @@ fn render_workspace(app: &AppState, palette: Palette, area_height: u16) -> Parag
 
 fn render_git(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'static> {
     let mut lines = vec![Line::from(vec![
-        Span::styled("branch ", palette.muted()),
+        Span::styled(format!("{} ", t!("app.git.branch")), palette.muted()),
         Span::styled(app.git.branch.clone(), palette.text()),
     ])];
 
     if let Some(head) = &app.git.head {
         lines.push(Line::from(vec![
-            Span::styled("head   ", palette.muted()),
+            Span::styled(format!("{:<6} ", t!("app.git.head")), palette.muted()),
             Span::styled(head.clone(), palette.text()),
         ]));
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("status", palette.title())));
+    lines.push(Line::from(Span::styled(
+        t!("app.git.status").into_owned(),
+        palette.title(),
+    )));
     let mut selected_idx = 0;
     if app.git.status.is_empty() {
-        lines.push(Line::from(Span::styled("  clean", palette.muted())));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", t!("app.git.clean")),
+            palette.muted(),
+        )));
     } else {
         for item in &app.git.status {
             let selected = app.git.selected == selected_idx;
@@ -3191,9 +3258,15 @@ fn render_git(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'
     }
 
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("history", palette.title())));
+    lines.push(Line::from(Span::styled(
+        t!("app.git.history").into_owned(),
+        palette.title(),
+    )));
     if app.git.history.is_empty() {
-        lines.push(Line::from(Span::styled("  none", palette.muted())));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", t!("app.git.none")),
+            palette.muted(),
+        )));
     } else {
         for item in &app.git.history {
             let selected = app.git.selected == selected_idx;
@@ -3218,10 +3291,10 @@ fn render_git(app: &AppState, palette: Palette, area_height: u16) -> Paragraph<'
     Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Git",
+                t!("app.pane.git").to_string(),
                 palette,
                 app.focus == FocusPane::Git,
-                Some("status/history"),
+                Some(t!("app.git.status_history").into_owned()),
             )
             .border_style(palette.border()),
         )
@@ -3326,10 +3399,13 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
         } else {
             goal.objective.clone()
         };
-        let parenthetical = format!(
-            " ({} · {}/{} tokens)",
-            goal.status, goal.tokens_used, goal.token_budget
-        );
+        let parenthetical = t!(
+            "app.autonomy.goal_meta",
+            status = goal.status,
+            used = goal.tokens_used,
+            budget = goal.token_budget
+        )
+        .into_owned();
         lines.push(Line::from(vec![
             Span::styled(
                 "◆ ",
@@ -3338,7 +3414,10 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
                     .add_modifier(Modifier::BOLD)
                     .bg(palette.surface),
             ),
-            Span::styled("Goal: ", palette.title().bg(palette.surface)),
+            Span::styled(
+                t!("app.autonomy.goal_prefix").to_string(),
+                palette.title().bg(palette.surface),
+            ),
             Span::styled(objective, palette.text().bg(palette.surface)),
             Span::styled(parenthetical, palette.muted().bg(palette.surface)),
         ]));
@@ -3358,7 +3437,7 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette) -> Vec<Line<'stati
                 .bg(palette.surface),
         ));
         spans.push(Span::styled(
-            format!("Loops: {running} running"),
+            t!("app.autonomy.loops_running", count = running).to_string(),
             palette.title().bg(palette.surface),
         ));
         spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
@@ -3454,11 +3533,11 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
     let status = app.orchestration.get(&session_id);
 
     let phase = match status.and_then(|s| s.phase.as_deref()) {
-        Some("orchestrating") => "Orchestrating",
-        Some("re-entering") => "Re-entering",
-        Some("working") => "Working",
-        Some(other) if !other.is_empty() => other,
-        _ => "Working",
+        Some("orchestrating") => t!("app.harness.orchestrating").to_string(),
+        Some("re-entering") => t!("app.harness.re_entering").to_string(),
+        Some("working") => t!("app.harness.working").to_string(),
+        Some(other) if !other.is_empty() => other.to_string(),
+        _ => t!("app.harness.working").to_string(),
     };
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -3478,9 +3557,8 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
         if status.running_agents > 0 {
             spans.push(Span::styled(
                 format!(
-                    " · {} agent{}",
-                    status.running_agents,
-                    if status.running_agents == 1 { "" } else { "s" }
+                    " · {}",
+                    t!("app.statusbar.agents", count = status.running_agents)
                 ),
                 palette.text().bg(palette.surface),
             ));
@@ -3489,7 +3567,7 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
         // whole reason for this row: it must NOT read as done.
         if status.pending_continuations > 0 {
             spans.push(Span::styled(
-                " · re-entering".to_string(),
+                format!(" · {}", t!("app.statusbar.re_entering")),
                 palette.muted().bg(palette.surface),
             ));
         }
@@ -3518,9 +3596,12 @@ fn harness_status_lines(app: &AppState, palette: Palette) -> Vec<Line<'static>> 
     // Retry/backoff (metadata.retry — previously ignored on the wire).
     if let Some(retry) = app.session_retry.get(&session_id) {
         let attempt = match (retry.attempt, retry.max_attempts) {
-            (Some(a), Some(max)) => format!(" · retrying (attempt {a}/{max})"),
-            (Some(a), None) => format!(" · retrying (attempt {a})"),
-            _ => " · retrying".to_string(),
+            (Some(a), Some(max)) => format!(
+                " · {}",
+                t!("app.statusbar.retrying_attempt_max", attempt = a, max = max)
+            ),
+            (Some(a), None) => format!(" · {}", t!("app.statusbar.retrying_attempt", attempt = a)),
+            _ => format!(" · {}", t!("app.statusbar.retrying")),
         };
         spans.push(Span::styled(
             attempt,
@@ -3600,27 +3681,32 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     };
     if !app.pending_messages.is_empty() {
         lines.push(Line::from(vec![Span::styled(
-            format!(
-                "Queued messages ({}) after active turn | Esc interrupt/send | Ctrl+U clear",
-                app.pending_messages.len()
-            ),
+            t!(
+                "app.composer_hint.queued_messages",
+                count = app.pending_messages.len()
+            )
+            .to_string(),
             palette.muted().bg(palette.surface),
         )]));
     } else if matches!(&composer, ComposerPresentation::Collapsed(_)) {
         lines.push(Line::from(vec![Span::styled(
-            "Large paste collapsed | Enter sends full text | Ctrl+U clear",
+            t!("app.composer_hint.large_paste").to_string(),
             palette.muted().bg(palette.surface),
         )]));
     } else if let Some(view) = &input_view
         && (view.hidden_lines > 0 || view.hidden_prefix)
     {
-        let hidden = if view.hidden_lines > 0 {
-            format!("showing tail, {} earlier line(s) hidden", view.hidden_lines)
+        let hint = if view.hidden_lines > 0 {
+            t!(
+                "app.composer_hint.multiline_tail_lines",
+                count = view.hidden_lines
+            )
+            .to_string()
         } else {
-            "showing tail of long line".to_string()
+            t!("app.composer_hint.multiline_tail_line").to_string()
         };
         lines.push(Line::from(vec![Span::styled(
-            format!("Multiline input | {hidden} | Enter sends full text | Ctrl+U clear"),
+            hint,
             palette.muted().bg(palette.surface),
         )]));
     } else {
@@ -3633,7 +3719,10 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
         ComposerPresentation::Empty if onboarding_first_launch_active(app) => {
             lines.push(Line::from(vec![
                 Span::styled(" › ", palette.selected().bg(palette.surface)),
-                Span::styled(" Onboarding setup...", palette.muted().bg(palette.surface)),
+                Span::styled(
+                    format!(" {}", t!("app.banner.onboarding_setup")),
+                    palette.muted().bg(palette.surface),
+                ),
             ]))
         }
         ComposerPresentation::Empty => lines.push(Line::from(vec![
@@ -3674,7 +3763,10 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     match composer {
         ComposerPresentation::Collapsed(collapse) => {
             lines.push(Line::from(vec![
-                Span::styled("   preview: ", palette.muted().bg(palette.surface)),
+                Span::styled(
+                    format!("   {}: ", t!("app.composer.preview_label")),
+                    palette.muted().bg(palette.surface),
+                ),
                 Span::styled(collapse.preview, palette.text().bg(palette.surface)),
             ]));
         }
@@ -3687,10 +3779,10 @@ fn render_composer(app: &AppState, palette: Palette, area: Rect) -> Paragraph<'s
     }
 
     let block = titled_block(
-        "Composer",
+        t!("app.pane.composer").to_string(),
         palette,
         app.focus == FocusPane::Composer,
-        Some("Enter send | Tab inspector"),
+        Some(t!("app.hint.composer_send").into_owned()),
     )
     .border_style(palette.border());
     Paragraph::new(Text::from(lines))
@@ -3921,38 +4013,48 @@ fn cursor_width_for_text(text: &str, width: usize) -> usize {
 
 fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let mode = if app.readonly {
-        "read-only"
+        t!("app.status.read_only").to_string()
     } else {
-        "interactive"
+        t!("app.status.interactive").to_string()
     };
     let turn = app
         .active_turn()
-        .map(|(_, turn_id)| format!("active {}", short_id(&turn_id.0.to_string())))
-        .unwrap_or_else(|| "idle".into());
+        .map(|(_, turn_id)| {
+            t!(
+                "app.status.turn_active",
+                id = short_id(&turn_id.0.to_string())
+            )
+            .to_string()
+        })
+        .unwrap_or_else(|| t!("app.status.turn_idle").to_string());
     let profile = app
         .active_session()
         .and_then(|session| session.profile_id.as_deref())
         .unwrap_or("default");
     let cwd = app.workspace.root.as_str();
     let policy = if app.readonly {
-        "sends disabled"
+        t!("app.status.sends_disabled").to_string()
     } else {
-        "approval gated"
+        t!("app.status.approval_gated").to_string()
     };
     let context = app
         .active_session()
         .map(|session| {
-            format!(
-                "{} msgs/{} tasks",
-                session.messages.len(),
-                session.tasks.len()
+            t!(
+                "app.statusbar.msgs_tasks",
+                msgs = session.messages.len(),
+                tasks = session.tasks.len()
             )
+            .into_owned()
         })
-        .unwrap_or_else(|| "no session".into());
+        .unwrap_or_else(|| t!("app.status.no_session").to_string());
     let work = status_bar_work_text(app);
 
     Paragraph::new(Line::from(vec![
-        Span::styled(" state ", palette.title().bg(palette.surface_alt)),
+        Span::styled(
+            format!(" {} ", t!("app.status.state_label")),
+            palette.title().bg(palette.surface_alt),
+        ),
         Span::styled(
             run_state_marker(&app.run_state).to_string(),
             run_state_style(&app.run_state, palette).bg(palette.surface_alt),
@@ -3980,7 +4082,7 @@ fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
         Span::styled(short_path(cwd), palette.muted().bg(palette.surface_alt)),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(
-            "Tab inspector | Ctrl+O expand",
+            t!("app.hint.statusbar_keys").into_owned(),
             palette.selected().bg(palette.surface_alt),
         ),
     ]))
@@ -4002,15 +4104,15 @@ fn status_bar_work_text(app: &AppState) -> String {
     }
     let background_tasks = active_background_tasks(app);
     if background_tasks > 0 {
-        parts.push(format!("{background_tasks} background task(s)"));
-        parts.push("/ps to view".into());
+        parts.push(t!("app.statusbar.background_tasks", count = background_tasks).into_owned());
+        parts.push(t!("app.statusbar.ps_to_view").into_owned());
     }
     if app.active_turn().is_some() {
-        parts.push("Esc interrupt".into());
-        parts.push("/stop to close".into());
+        parts.push(t!("app.statusbar.esc_interrupt").into_owned());
+        parts.push(t!("app.statusbar.stop_to_close").into_owned());
     }
     if app.expanded_tool_outputs {
-        parts.push("tool output expanded".into());
+        parts.push(t!("app.statusbar.tool_output_expanded").into_owned());
     }
     if parts.is_empty() {
         String::new()
@@ -4019,13 +4121,13 @@ fn status_bar_work_text(app: &AppState) -> String {
     }
 }
 
-fn run_state_status_label(state: &SessionRunState) -> &'static str {
+fn run_state_status_label(state: &SessionRunState) -> String {
     match state {
-        SessionRunState::Idle => "Idle",
-        SessionRunState::InProgress => "Working",
-        SessionRunState::Blocked { .. } => "Blocked",
-        SessionRunState::Success => "Done",
-        SessionRunState::Error { .. } => "Error",
+        SessionRunState::Idle => t!("app.status.idle").to_string(),
+        SessionRunState::InProgress => t!("app.status.working").to_string(),
+        SessionRunState::Blocked { .. } => t!("app.status.blocked").to_string(),
+        SessionRunState::Success => t!("app.status.done").to_string(),
+        SessionRunState::Error { .. } => t!("app.status.error").to_string(),
     }
 }
 
@@ -4084,7 +4186,7 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
     let mut lines = vec![
         Line::from(Span::styled(approval.title.clone(), palette.title())),
         Line::from(vec![
-            Span::styled("tool ", palette.muted()),
+            Span::styled(format!("{} ", t!("app.field.tool")), palette.muted()),
             Span::styled(approval.tool_name.clone(), palette.text()),
         ]),
     ];
@@ -4093,10 +4195,10 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
         let risk = approval
             .risk
             .as_ref()
-            .map(|risk| format!("  risk {risk}"))
+            .map(|risk| format!("  {} {risk}", t!("app.field.risk")))
             .unwrap_or_default();
         lines.push(Line::from(vec![
-            Span::styled("kind ", palette.muted()),
+            Span::styled(format!("{} ", t!("app.field.kind")), palette.muted()),
             Span::styled(kind.clone(), palette.text()),
             Span::styled(risk, palette.muted()),
         ]));
@@ -4111,7 +4213,7 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
                     push_optional_field(
                         &mut lines,
                         palette,
-                        "command",
+                        t!("app.field.command").into_owned(),
                         command.command_line.as_deref(),
                     );
                     push_optional_field(&mut lines, palette, "cwd", command.cwd.as_deref());
@@ -4124,26 +4226,36 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
                     push_optional_field(
                         &mut lines,
                         palette,
-                        "tool call",
+                        t!("app.field.tool_call").into_owned(),
                         command.tool_call_id.as_deref(),
                     );
                 }
                 if let Some(sandbox) = details.sandbox.as_ref() {
-                    push_optional_field(&mut lines, palette, "sandbox", sandbox.mode.as_deref());
                     push_optional_field(
                         &mut lines,
                         palette,
-                        "filesystem",
+                        t!("app.field.sandbox").into_owned(),
+                        sandbox.mode.as_deref(),
+                    );
+                    push_optional_field(
+                        &mut lines,
+                        palette,
+                        t!("app.field.filesystem").into_owned(),
                         sandbox.filesystem_access.as_deref(),
                     );
                     if let Some(network_access) = sandbox.network_access {
-                        push_field(&mut lines, palette, "network", network_access.to_string());
+                        push_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.network").into_owned(),
+                            network_access.to_string(),
+                        );
                     }
                     if !sandbox.writable_roots.is_empty() {
                         push_field(
                             &mut lines,
                             palette,
-                            "writable",
+                            t!("app.field.writable").into_owned(),
                             sandbox.writable_roots.join(", "),
                         );
                     }
@@ -4154,18 +4266,24 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
                     push_field(
                         &mut lines,
                         palette,
-                        "preview",
+                        t!("app.field.preview").into_owned(),
                         diff.preview_id.0.to_string(),
                     );
                     push_optional_field(
                         &mut lines,
                         palette,
-                        "operation",
+                        t!("app.field.operation").into_owned(),
                         diff.operation.as_deref(),
                     );
-                    push_optional_field(&mut lines, palette, "summary", diff.summary.as_deref());
+                    push_optional_field(
+                        &mut lines,
+                        palette,
+                        t!("app.field.summary").into_owned(),
+                        diff.summary.as_deref(),
+                    );
                     let stats = [
-                        diff.file_count.map(|value| format!("{value} files")),
+                        diff.file_count
+                            .map(|value| t!("app.field.files_count", count = value).into_owned()),
                         diff.additions.map(|value| format!("+{value}")),
                         diff.deletions.map(|value| format!("-{value}")),
                     ]
@@ -4174,7 +4292,12 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
                     .collect::<Vec<_>>()
                     .join(" ");
                     if !stats.is_empty() {
-                        push_field(&mut lines, palette, "stats", stats);
+                        push_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.stats").into_owned(),
+                            stats,
+                        );
                     }
                 }
             }
@@ -4183,23 +4306,28 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
                     push_field(
                         &mut lines,
                         palette,
-                        "operation",
+                        t!("app.field.operation").into_owned(),
                         filesystem.operation.clone(),
                     );
                     push_field(
                         &mut lines,
                         palette,
-                        "outside workspace",
+                        t!("app.field.outside_workspace").into_owned(),
                         filesystem.outside_workspace.to_string(),
                     );
                     for path in &filesystem.paths {
-                        push_field(&mut lines, palette, "path", path.clone());
+                        push_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.path").into_owned(),
+                            path.clone(),
+                        );
                     }
                     if !filesystem.writable_roots.is_empty() {
                         push_field(
                             &mut lines,
                             palette,
-                            "writable",
+                            t!("app.field.writable").into_owned(),
                             filesystem.writable_roots.join(", "),
                         );
                     }
@@ -4207,9 +4335,19 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
             }
             approval_kinds::NETWORK => {
                 if let Some(network) = details.network.as_ref() {
-                    push_field(&mut lines, palette, "operation", network.operation.clone());
+                    push_field(
+                        &mut lines,
+                        palette,
+                        t!("app.field.operation").into_owned(),
+                        network.operation.clone(),
+                    );
                     if !network.hosts.is_empty() {
-                        push_field(&mut lines, palette, "hosts", network.hosts.join(", "));
+                        push_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.hosts").into_owned(),
+                            network.hosts.join(", "),
+                        );
                     }
                     if !network.ports.is_empty() {
                         let ports = network
@@ -4218,7 +4356,12 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
                             .map(|port| port.to_string())
                             .collect::<Vec<_>>()
                             .join(", ");
-                        push_field(&mut lines, palette, "ports", ports);
+                        push_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.ports").into_owned(),
+                            ports,
+                        );
                     }
                     for url in &network.urls {
                         push_field(&mut lines, palette, "url", url.clone());
@@ -4228,23 +4371,33 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
             approval_kinds::SANDBOX_ESCALATION => {
                 if let Some(escalation) = details.sandbox_escalation.as_ref() {
                     if let Some(from) = escalation.from.as_ref() {
-                        push_optional_field(&mut lines, palette, "from", from.mode.as_deref());
+                        push_optional_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.from").into_owned(),
+                            from.mode.as_deref(),
+                        );
                     }
                     if let Some(to) = escalation.to.as_ref() {
-                        push_optional_field(&mut lines, palette, "to", to.mode.as_deref());
+                        push_optional_field(
+                            &mut lines,
+                            palette,
+                            t!("app.field.to").into_owned(),
+                            to.mode.as_deref(),
+                        );
                     }
                     if !escalation.requested_permissions.is_empty() {
                         push_field(
                             &mut lines,
                             palette,
-                            "permissions",
+                            t!("app.field.permissions").into_owned(),
                             escalation.requested_permissions.join(", "),
                         );
                     }
                     push_optional_field(
                         &mut lines,
                         palette,
-                        "justification",
+                        t!("app.field.justification").into_owned(),
                         escalation.justification.as_deref(),
                     );
                     if !escalation.suggested_prefix_rule.is_empty() {
@@ -4275,7 +4428,7 @@ fn approval_modal_lines(approval: &ApprovalModalState, palette: Palette) -> Vec<
 fn push_optional_field(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
-    label: &'static str,
+    label: impl Into<String>,
     value: Option<&str>,
 ) {
     if let Some(value) = value.filter(|value| !value.is_empty()) {
@@ -4286,11 +4439,11 @@ fn push_optional_field(
 fn push_field(
     lines: &mut Vec<Line<'static>>,
     palette: Palette,
-    label: &'static str,
+    label: impl Into<String>,
     value: String,
 ) {
     lines.push(Line::from(vec![
-        Span::styled(format!("{label} "), palette.muted()),
+        Span::styled(format!("{} ", label.into()), palette.muted()),
         Span::styled(value, palette.text()),
     ]));
 }
@@ -4313,7 +4466,7 @@ fn render_task_output_modal(
 
     if output.output.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No output loaded for this task yet",
+            t!("app.empty.no_task_output").to_string(),
             palette.muted(),
         )));
     } else {
@@ -4333,10 +4486,10 @@ fn render_task_output_modal(
     let pane = Paragraph::new(Text::from(lines))
         .block(
             titled_block(
-                "Task Output",
+                t!("app.pane.task_output").to_string(),
                 palette,
                 true,
-                Some("o read more | PgUp/PgDn | Esc close"),
+                Some(t!("app.hint.task_output_modal").into_owned()),
             )
             .border_style(palette.selected()),
         )
@@ -4373,8 +4526,13 @@ fn render_artifact_detail_modal(
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Artifact", palette, true, Some("PgUp/PgDn | Esc close"))
-                .border_style(palette.selected()),
+            titled_block(
+                t!("app.pane.artifact_modal").to_string(),
+                palette,
+                true,
+                Some(t!("app.hint.scroll_modal").into_owned()),
+            )
+            .border_style(palette.selected()),
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false });
@@ -4409,8 +4567,13 @@ fn render_thread_graph_detail_modal(
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Threads", palette, true, Some("PgUp/PgDn | Esc close"))
-                .border_style(palette.selected()),
+            titled_block(
+                t!("app.pane.threads").to_string(),
+                palette,
+                true,
+                Some(t!("app.hint.scroll_modal").into_owned()),
+            )
+            .border_style(palette.selected()),
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false });
@@ -4444,8 +4607,13 @@ fn render_turn_state_detail_modal(
 
     let pane = Paragraph::new(Text::from(lines))
         .block(
-            titled_block("Turn", palette, true, Some("PgUp/PgDn | Esc close"))
-                .border_style(palette.selected()),
+            titled_block(
+                t!("app.pane.turn").to_string(),
+                palette,
+                true,
+                Some(t!("app.hint.scroll_modal").into_owned()),
+            )
+            .border_style(palette.selected()),
         )
         .scroll((scroll_top, 0))
         .wrap(Wrap { trim: false });
@@ -4536,12 +4704,12 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 }
 
 fn titled_block<'a>(
-    title: &'a str,
+    title: impl Into<String>,
     palette: Palette,
     focused: bool,
-    suffix: Option<&'a str>,
+    suffix: Option<String>,
 ) -> Block<'a> {
-    let mut spans = vec![Span::styled(title.to_string(), palette.title())];
+    let mut spans = vec![Span::styled(title.into(), palette.title())];
     if let Some(suffix) = suffix {
         spans.push(Span::styled(format!("  {suffix}"), palette.muted()));
     }
@@ -5470,14 +5638,32 @@ mod tests {
             None,
             false,
         );
-        assert!(launch_banner_active(&app), "empty session must show the launch banner");
+        assert!(
+            launch_banner_active(&app),
+            "empty session must show the launch banner"
+        );
         let text = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 100, 30)
-            .content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(text.contains("╭"), "banner must draw a top-left rounded corner");
-        assert!(text.contains("╯"), "banner must draw a bottom-right rounded corner");
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("╭"),
+            "banner must draw a top-left rounded corner"
+        );
+        assert!(
+            text.contains("╯"),
+            "banner must draw a bottom-right rounded corner"
+        );
         assert!(text.contains("octos"), "banner box title");
-        assert!(text.contains("██████╗"), "banner must show the OCTOS figlet");
-        assert!(text.contains("Welcome back — dspfac"), "banner greeting names the profile");
+        assert!(
+            text.contains("██████╗"),
+            "banner must show the OCTOS figlet"
+        );
+        assert!(
+            text.contains("Welcome back — dspfac"),
+            "banner greeting names the profile"
+        );
     }
 
     #[test]
@@ -5496,7 +5682,10 @@ mod tests {
             None,
             false,
         );
-        assert!(!launch_banner_active(&app), "banner must disappear once the conversation starts");
+        assert!(
+            !launch_banner_active(&app),
+            "banner must disappear once the conversation starts"
+        );
     }
 
     #[test]

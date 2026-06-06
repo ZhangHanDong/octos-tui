@@ -154,7 +154,9 @@ impl CommandAvailability {
             ConnectionRequirement::Disconnected
                 if ctx.connection == ConnectionState::Disconnected => {}
             ConnectionRequirement::Connected => {
-                return self.unavailable.status("requires a connected Octos UI server");
+                return self
+                    .unavailable
+                    .status("requires a connected Octos UI server");
             }
             ConnectionRequirement::Disconnected => {
                 return self.unavailable.status("requires disconnected mode");
@@ -181,9 +183,9 @@ impl CommandAvailability {
             ctx.unsupported_method_reason(method).is_some() || !ctx.supports_method(method)
         }) {
             if let Some(reason) = ctx.unsupported_method_reason(method) {
-                return self
-                    .unavailable
-                    .status(format!("Octos UI method `{method}` is unsupported: {reason}"));
+                return self.unavailable.status(format!(
+                    "Octos UI method `{method}` is unsupported: {reason}"
+                ));
             }
             return self
                 .unavailable
@@ -204,8 +206,9 @@ impl CommandAvailability {
                 UnavailablePolicy::Disable
             };
             if let Some(reason) = ctx.unsupported_method_reason(method) {
-                return unavailable
-                    .status(format!("Octos UI method `{method}` is unsupported: {reason}"));
+                return unavailable.status(format!(
+                    "Octos UI method `{method}` is unsupported: {reason}"
+                ));
             }
             return unavailable.status(format!("Octos UI method `{method}` is not available"));
         }
@@ -226,9 +229,9 @@ impl CommandAvailability {
                 ctx.unsupported_method_reason(method)
                     .map(|reason| (*method, reason))
             }) {
-                return self
-                    .unavailable
-                    .status(format!("Octos UI method `{method}` is unsupported: {reason}"));
+                return self.unavailable.status(format!(
+                    "Octos UI method `{method}` is unsupported: {reason}"
+                ));
             }
 
             let methods = self
