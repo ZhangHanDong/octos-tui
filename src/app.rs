@@ -1,6 +1,6 @@
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph, Wrap},
@@ -119,56 +119,97 @@ const ONBOARDING_LOGO_ART: &str = "\
  ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
 const ONBOARDING_LOGO_TAGLINE: &str = "Welcome to Octos — Your Coding Buddy";
 
-/// True only on the onboarding WELCOME / local-profile entry screen, where the
-/// splash logo takes over the main window. Discriminated by the welcome menu's
-/// stable first-item id (`onboard.local.status`) rather than the display title:
-/// the post-profile-creation provider-setup screen shares the `MENU_ONBOARD`
-/// id but leads with `onboard.provider.*` items. Keying on the id (not the
-/// title) keeps this correct once titles are translated (i18n) — a title-text
-/// comparison would silently break under a non-English locale.
-fn onboarding_welcome_active(app: &AppState) -> bool {
-    matches!(
-        app.active_menu.as_ref(),
-        Some(crate::menu::MenuBuildResult::Ready(spec))
-            if spec.items.first().map(|item| item.id.as_str()) == Some("onboard.local.status")
-    )
+/// Display width of the figlet wordmark (max over its lines), measured with
+/// `unicode-width` so the box-drawing glyphs are counted by display columns.
+fn onboarding_logo_art_width() -> usize {
+    ONBOARDING_LOGO_ART
+        .lines()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0)
 }
 
-/// Rows to spend on the onboarding logo, taken ONLY from the surplus above what
-/// the menu itself needs (`menu_needed`) — so the entry menu and its Continue
-/// action are never clipped on short terminals. Full figlet when there is room,
-/// else a one-line tagline, else nothing.
-fn onboarding_logo_height(area_height: u16, area_width: u16, menu_needed: u16) -> u16 {
-    const ART_WIDTH: u16 = 43;
+/// UX2 A.1: rows to spend on the OCTOS banner HEADER across the top of every
+/// onboarding step. Taken ONLY from the surplus above what the menu itself
+/// needs (`menu_needed`) so the step list, its inputs, and the explanation pane
+/// are never clipped on short terminals. Full bordered figlet box when there is
+/// room, else a compact one-line bordered tagline box, else nothing.
+///
+/// Layout (full): top border + blank + 6 art rows + blank + tagline + bottom
+/// border = 11 rows. Compact: top border + tagline + bottom border = 3 rows.
+fn onboarding_header_height(area_height: u16, area_width: u16, menu_needed: u16) -> u16 {
+    let art_width = onboarding_logo_art_width() as u16;
     let surplus = area_height.saturating_sub(menu_needed);
-    if area_width >= ART_WIDTH + 2 && surplus >= 9 {
-        9 // 1 pad + 6 art rows + 1 blank + 1 tagline
-    } else if surplus >= 2 {
-        2 // tagline only (figlet would crowd the menu)
+    if area_width >= art_width + 4 && surplus >= 11 {
+        11
+    } else if surplus >= 3 {
+        3
     } else {
         0
     }
 }
 
-fn render_onboarding_logo(height: u16, palette: Palette) -> Paragraph<'static> {
-    let mut lines: Vec<Line> = Vec::new();
-    if height >= 9 {
-        lines.push(Line::from(""));
-        for art in ONBOARDING_LOGO_ART.lines() {
-            lines.push(Line::from(Span::styled(
-                art,
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            )));
-        }
-        lines.push(Line::from(""));
+/// UX2 A.1: render the OCTOS wordmark as a bordered window/header spanning the
+/// top of the onboarding screen. `height >= 11` draws the full figlet; a
+/// shorter box draws just the tagline. The box content is centered using
+/// `unicode-width` column math so the CJK tagline and the box-drawing art stay
+/// aligned. Mirrors `render_launch_banner`'s centering primitive.
+fn render_onboarding_header(area: Rect, palette: Palette) -> Paragraph<'static> {
+    let width = area.width as usize;
+    if width < 4 {
+        return Paragraph::new(Text::default());
     }
+    let inner_w = width - 2;
+    let border = Style::default().fg(palette.frame);
+    let accent = Style::default()
+        .fg(palette.accent)
+        .add_modifier(Modifier::BOLD);
+    let highlight = Style::default().fg(palette.highlight);
+
+    // `│` + centered content (display width `content_w`) + `│`.
+    let centered = |content: Vec<Span<'static>>, content_w: usize| -> Line<'static> {
+        let pad = inner_w.saturating_sub(content_w);
+        let left = pad / 2;
+        let right = pad - left;
+        let mut spans = vec![Span::styled("│", border), Span::raw(" ".repeat(left))];
+        spans.extend(content);
+        spans.push(Span::raw(" ".repeat(right)));
+        spans.push(Span::styled("│", border));
+        Line::from(spans)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("╭", border),
+        Span::styled(format!("{}╮", "─".repeat(inner_w)), border),
+    ]));
+    let show_figlet = area.height >= 11 && inner_w >= onboarding_logo_art_width();
+    if show_figlet {
+        let fig_w = onboarding_logo_art_width();
+        lines.push(centered(vec![], 0));
+        for art in ONBOARDING_LOGO_ART.lines() {
+            // Pad each art line to the wordmark width so all rows align inside
+            // the box regardless of trailing-space trimming.
+            let pad_cols = fig_w.saturating_sub(art.width());
+            lines.push(centered(
+                vec![Span::styled(
+                    format!("{art}{}", " ".repeat(pad_cols)),
+                    accent,
+                )],
+                fig_w,
+            ));
+        }
+        lines.push(centered(vec![], 0));
+    }
+    lines.push(centered(
+        vec![Span::styled(ONBOARDING_LOGO_TAGLINE, highlight)],
+        ONBOARDING_LOGO_TAGLINE.width(),
+    ));
     lines.push(Line::from(Span::styled(
-        ONBOARDING_LOGO_TAGLINE,
-        Style::default().fg(palette.highlight),
+        format!("╰{}╯", "─".repeat(inner_w)),
+        border,
     )));
-    Paragraph::new(Text::from(lines)).alignment(Alignment::Center)
+    Paragraph::new(Text::from(lines))
 }
 
 fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, palette: Palette) {
@@ -183,28 +224,24 @@ fn render_onboarding_first_launch_layout(frame: &mut Frame<'_>, app: &AppState, 
         .split(frame.area());
 
     let menu = active_menu_surface(app);
-    // On the onboarding WELCOME screen, show the OCTOS logo in the main window
-    // above the menu. The wizard menu now carries a right-side progress
-    // checklist (`Setup progress`) as its preview; the selection view renders it
-    // beside the items on wide terminals, so the splash sits above and the
-    // checklist sits to the right. Logo rows come only from the surplus above
-    // the menu's own needs (which includes the preview rows), so the menu is
-    // never clipped — and only on the welcome step, not provider setup.
-    let menu_area = if onboarding_welcome_active(app) {
-        let menu_needed = menu
-            .as_ref()
-            .map_or(0, |m| menu_render::height_hint(m, root[0].width));
-        let logo_height = onboarding_logo_height(root[0].height, root[0].width, menu_needed);
-        if logo_height > 0 {
-            let split = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(logo_height), Constraint::Min(0)])
-                .split(root[0]);
-            frame.render_widget(render_onboarding_logo(logo_height, palette), split[0]);
-            split[1]
-        } else {
-            root[0]
-        }
+    // UX2 A.1: three-region onboarding layout. TOP = the OCTOS banner header
+    // (shown on EVERY step, not just the welcome screen); MAIN = the wizard menu
+    // (the numbered step list + the active step's inputs/rows on the left); RIGHT
+    // = the per-step explanation/teaching panel, carried as the menu's preview so
+    // the selection view renders it beside the items on wide terminals. Header
+    // rows come only from the surplus above the menu's own needs, so the steps
+    // and the explanation pane are never clipped on short terminals.
+    let menu_needed = menu
+        .as_ref()
+        .map_or(0, |m| menu_render::height_hint(m, root[0].width));
+    let header_height = onboarding_header_height(root[0].height, root[0].width, menu_needed);
+    let menu_area = if header_height > 0 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(header_height), Constraint::Min(0)])
+            .split(root[0]);
+        frame.render_widget(render_onboarding_header(split[0], palette), split[0]);
+        split[1]
     } else {
         root[0]
     };
@@ -226,6 +263,7 @@ fn onboarding_first_launch_active(app: &AppState) -> bool {
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
+                    | crate::menu::registry::MENU_ONBOARD_WORKSPACE
             )
         })
 }
@@ -653,7 +691,10 @@ fn render_launch_banner(frame: &mut Frame<'_>, app: &AppState, palette: Palette,
         None => "Welcome to Octos".to_string(),
     };
     let greeting_w = greeting.width();
-    lines.push(centered(vec![Span::styled(greeting, highlight)], greeting_w));
+    lines.push(centered(
+        vec![Span::styled(greeting, highlight)],
+        greeting_w,
+    ));
     let cwd = short_path(app.workspace.root.as_str());
     let cwd_w = cwd.width();
     lines.push(centered(vec![Span::styled(cwd, palette.muted())], cwd_w));
@@ -5470,14 +5511,32 @@ mod tests {
             None,
             false,
         );
-        assert!(launch_banner_active(&app), "empty session must show the launch banner");
+        assert!(
+            launch_banner_active(&app),
+            "empty session must show the launch banner"
+        );
         let text = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 100, 30)
-            .content.iter().map(|c| c.symbol()).collect::<String>();
-        assert!(text.contains("╭"), "banner must draw a top-left rounded corner");
-        assert!(text.contains("╯"), "banner must draw a bottom-right rounded corner");
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(
+            text.contains("╭"),
+            "banner must draw a top-left rounded corner"
+        );
+        assert!(
+            text.contains("╯"),
+            "banner must draw a bottom-right rounded corner"
+        );
         assert!(text.contains("octos"), "banner box title");
-        assert!(text.contains("██████╗"), "banner must show the OCTOS figlet");
-        assert!(text.contains("Welcome back — dspfac"), "banner greeting names the profile");
+        assert!(
+            text.contains("██████╗"),
+            "banner must show the OCTOS figlet"
+        );
+        assert!(
+            text.contains("Welcome back — dspfac"),
+            "banner greeting names the profile"
+        );
     }
 
     #[test]
@@ -5496,7 +5555,10 @@ mod tests {
             None,
             false,
         );
-        assert!(!launch_banner_active(&app), "banner must disappear once the conversation starts");
+        assert!(
+            !launch_banner_active(&app),
+            "banner must disappear once the conversation starts"
+        );
     }
 
     #[test]
@@ -6092,22 +6154,79 @@ mod tests {
         );
     }
 
-    /// The onboarding logo only consumes rows ABOVE what the menu needs, so the
-    /// entry menu (incl. its Continue action) is never clipped — the regression
-    /// codex flagged for short terminals. Figlet only when there is real
-    /// surplus AND it fits the width; otherwise tagline-only, then nothing.
+    /// UX2 A.1: the OCTOS banner header only consumes rows ABOVE what the menu
+    /// needs, so the step list, its inputs, and the explanation pane are never
+    /// clipped on short terminals. Full figlet box (11 rows) only with real
+    /// surplus AND width; otherwise the compact tagline box (3 rows), then
+    /// nothing.
     #[test]
-    fn onboarding_logo_height_takes_only_menu_surplus() {
-        // Tall terminal, menu needs 14 rows → ample surplus → full figlet.
-        assert_eq!(onboarding_logo_height(37, 120, 14), 9);
+    fn onboarding_header_height_takes_only_menu_surplus() {
+        // Tall terminal, menu needs 14 rows → ample surplus → full figlet box.
+        assert_eq!(onboarding_header_height(37, 120, 14), 11);
         // Short terminal (root[0] ~16-17 rows, menu needs 14): surplus 2-3 →
-        // tagline only, so the menu keeps all 14 of its rows.
-        assert_eq!(onboarding_logo_height(16, 120, 14), 2);
-        assert_eq!(onboarding_logo_height(17, 120, 14), 2);
-        // No surplus → no logo at all (the menu takes everything).
-        assert_eq!(onboarding_logo_height(14, 120, 14), 0);
-        // Narrow terminal → never the wide figlet; tagline at most.
-        assert_eq!(onboarding_logo_height(40, 40, 5), 2);
+        // compact box only once there are 3 surplus rows; below that, nothing.
+        assert_eq!(onboarding_header_height(17, 120, 14), 3);
+        assert_eq!(onboarding_header_height(16, 120, 14), 0);
+        // No surplus → no header at all (the menu takes everything).
+        assert_eq!(onboarding_header_height(14, 120, 14), 0);
+        // Narrow terminal → never the wide figlet; compact box at most.
+        assert_eq!(onboarding_header_height(40, 40, 5), 3);
+    }
+
+    /// UX2 A: the three-region onboarding layout renders end-to-end on a wide
+    /// terminal — TOP figlet banner header, MAIN step list, and the RIGHT
+    /// teaching panel with the current step's explanatory prose (not a bare
+    /// checklist). Asserts against the i18n source so it tracks wording/locale.
+    #[test]
+    fn render_first_launch_onboarding_shows_header_steps_and_explanation_pane() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "AppUI connected".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+
+        let text =
+            rendered_buffer_with_size(&store.state, Palette::for_theme(ThemeName::Slate), 140, 44)
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+
+        // TOP: figlet banner header (a characteristic block-letter row) + the
+        // bordered box corner.
+        assert!(text.contains("██████╗"), "figlet header at top:\n{text}");
+        assert!(text.contains('╭'), "header is a bordered window:\n{text}");
+        // RIGHT: the teaching panel title + the current step's explanatory
+        // prose. Assert against the i18n source (NOT a hardcoded literal) so the
+        // test tracks wording/locale changes.
+        let panel_title = t!("onboarding.wizard.explain_title", locale = "en");
+        assert!(
+            text.contains(&*panel_title),
+            "teaching panel title in the right pane:\n{text}"
+        );
+        // The Profile-step explanation is a multi-line source string; assert on
+        // its first word so soft-wrapping in the pane can't flake it.
+        let explain_first_word = crate::menu::wizard::WizardStep::Profile
+            .explanation()
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !explain_first_word.is_empty() && text.contains(&explain_first_word),
+            "current-step explanation prose in the right pane (`{explain_first_word}`):\n{text}"
+        );
     }
 
     #[test]

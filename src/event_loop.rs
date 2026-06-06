@@ -54,11 +54,16 @@ pub fn run(cli: Cli) -> Result<()> {
     // `/theme` menu mutates this field, so the palette below is recomputed each
     // frame from `store.state.theme` rather than captured once at startup.
     store.state.theme = cli.theme;
-    // Seed the onboarding workspace candidate from an explicit `--cwd` so the
-    // first-launch workspace probe validates the launch cwd. Without this the
-    // top-level `--cwd` reaches `session/open` but never the onboarding probe
-    // (which reads the transport label), so `/onboard finish` stays blocked on
-    // an unvalidated workspace and the profile runtime never bootstraps.
+    // Seed the onboarding workspace candidate so the first-launch workspace
+    // probe validates a real directory. The explicit `--cwd` wins; when it is
+    // absent the store falls back to the process working directory (for
+    // transport-local launches), so the documented `octos serve --stdio --solo`
+    // launch — which carries no `--cwd` and whose transport label resolves to
+    // `"stdio"`/empty — still validates out of the box instead of dead-ending on
+    // "no usable workspace cwd". Without this the onboarding probe (which reads
+    // the transport label, not the top-level `--cwd` that only reaches
+    // `session/open`) leaves `/onboard finish` blocked on an unvalidated
+    // workspace and the profile runtime never bootstraps.
     store.seed_onboarding_workspace_cwd(
         cli.cwd
             .as_ref()
@@ -1402,7 +1407,10 @@ mod tests {
         // `/t` -> `/`: popup stays open over the bare slash.
         handle_key(&mut store, key(KeyCode::Backspace));
         assert_eq!(store.state.composer, "/");
-        assert!(store.state.menu_stack.is_active(), "popup stays open on `/`");
+        assert!(
+            store.state.menu_stack.is_active(),
+            "popup stays open on `/`"
+        );
 
         // `/` -> empty: the slash draft is gone, so the popup closes.
         handle_key(&mut store, key(KeyCode::Backspace));

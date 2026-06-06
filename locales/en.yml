@@ -50,6 +50,26 @@ onboarding:
       save: "Save the verified provider into your profile so it persists."
       workspace: "Choose and validate the folder Octos may read and edit while coding."
       activate: "Activate the workspace: open the coding session and start working."
+    # Right-pane TEACHING panel (A.3). `explain_title` heads the pane;
+    # `explain_progress` is the compact progress line; `explain_now` heads the
+    # current-step prose. Each `explain.<step>` is multi-line prose ("\n" breaks)
+    # describing what the step is for, what to do, and why it matters.
+    explain_title: "About this step"
+    explain_progress: "Setup progress — step %{number} of %{total}"
+    explain_now: "Now: %{title}"
+    explain:
+      profile: "Octos needs a local identity to attach your settings, providers, and history to.\nFill in your name, a short username, and an email (kept locally as metadata — no code is sent), then continue.\nThis profile stays on this machine."
+      provider: "Choose which AI model powers Octos.\nPick a model family (e.g. GPT, Claude), then a specific model, then the provider route that serves it (official or an alternative).\nThis decides who Octos talks to and how good the coding help is — you can change it later."
+      connect: "Prove the model actually answers before you rely on it.\nPaste your provider API key, then run the live test. Octos sends one small request and reports success or the exact error.\nThis catches a bad key or wrong route now, not mid-task."
+      save: "Persist the verified provider into your profile JSON so it survives restarts.\nSave it as your primary provider (or add it as a fallback). Until you save, the route lives only in this session.\nAfter saving, the workspace step unlocks."
+      workspace: "Pick the project folder Octos may read and edit while coding.\nIt defaults to the folder you launched from; override it with `/onboard workspace <path>` (try `.` for the current folder). Then validate — Octos checks the path exists, is a directory, and is writable.\nA valid workspace is required before you can activate."
+      activate: "Open the coding session and drop into the working surface.\nEverything above is done: profile created, provider saved and tested, workspace validated. Press Enter on Activate to start.\nThis is the finish line — after it you are coding with Octos."
+    # Workspace step screen (B.2): its own title + the row on the provider
+    # screen that opens it.
+    workspace_title: "Octos Setup — Workspace"
+    workspace_open_label: "Continue to Workspace →"
+    workspace_open_description: "Stage and validate the project folder Octos will code in, then activate."
+    workspace_locked_reason: "save a provider first"
     # Activate row (provider-setup screen) label + description.
     activate_ready_label: "▶ Activate workspace — open coding session (Enter)"
     activate_blocked_label: "Activate workspace — open coding session"

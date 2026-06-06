@@ -58,6 +58,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::OnboardFamily,
         Provider::OnboardModel,
         Provider::OnboardRoute,
+        Provider::OnboardWorkspace,
         Provider::Login,
         Provider::Theme,
         Provider::Thinking,
@@ -88,6 +89,7 @@ enum Provider {
     OnboardFamily,
     OnboardModel,
     OnboardRoute,
+    OnboardWorkspace,
     Login,
     Theme,
     Thinking,
@@ -113,6 +115,7 @@ impl MenuProvider for Provider {
             Self::OnboardFamily => crate::menu::registry::MENU_ONBOARD_FAMILY,
             Self::OnboardModel => crate::menu::registry::MENU_ONBOARD_MODEL,
             Self::OnboardRoute => crate::menu::registry::MENU_ONBOARD_ROUTE,
+            Self::OnboardWorkspace => crate::menu::registry::MENU_ONBOARD_WORKSPACE,
             Self::Login => MENU_LOGIN,
             Self::Theme => MENU_THEME,
             Self::Thinking => crate::menu::registry::MENU_THINKING,
@@ -138,6 +141,7 @@ impl MenuProvider for Provider {
             Self::OnboardFamily => onboarding_family_menu(ctx),
             Self::OnboardModel => onboarding_model_menu(ctx),
             Self::OnboardRoute => onboarding_route_menu(ctx),
+            Self::OnboardWorkspace => onboarding_workspace_menu(ctx),
             Self::Login => login_menu(ctx),
             Self::Theme => MenuBuildResult::Ready(theme_menu(ctx)),
             Self::Thinking => MenuBuildResult::Ready(thinking_menu(ctx)),
@@ -975,10 +979,77 @@ fn onboarding_provider_setup_menu(
             state,
             APPUI_METHOD_PROFILE_LLM_UPSERT,
         )),
-        // M22-C: workspace step. Surfaces the staged candidate (or
-        // the active workspace root), its validation status, and
-        // gives the user an explicit re-validate row. Finish is
-        // disabled until validation reports `Valid`.
+        // UX2 B.2: workspace staging + validation moved to its OWN step screen
+        // (`MENU_ONBOARD_WORKSPACE`). This provider menu now configures the LLM
+        // provider/model only; the user continues to the workspace screen,
+        // which also owns the final Activate action. Disabled until a provider
+        // is saved so the steps stay ordered.
+        {
+            let blocked = (!onboarding_has_saved_primary_provider(ctx, state, current_profile))
+                .then(|| t!("onboarding.wizard.workspace_locked_reason").into_owned());
+            MenuItem::new(
+                "onboard.workspace.open",
+                t!("onboarding.wizard.workspace_open_label"),
+                MenuAction::OpenMenu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE)),
+            )
+            .with_description(t!("onboarding.wizard.workspace_open_description"))
+            .with_state(MenuItemState::required(
+                state.workspace_validation.is_valid(),
+            ))
+            .maybe_disabled(blocked)
+        },
+    ]);
+
+    for (idx, item) in items.iter_mut().enumerate() {
+        if let Some(shortcut) = numeric_shortcut(idx) {
+            item.shortcut = Some(shortcut);
+        }
+    }
+
+    // Wizard framing: compute the coarse step (Provider → Connect → Save →
+    // Workspace → Activate) so the subtitle, footer, and right-side teaching
+    // panel all stay in lock-step with the granular rows above.
+    let progress = crate::menu::wizard::WizardProgress::from_state(
+        state,
+        current_profile,
+        local_profile_create_supported(ctx),
+    );
+    let next_action = onboarding_next_action_hint(ctx, state, current_profile);
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(MENU_ONBOARD),
+        title: t!("onboarding.wizard.setup_title").into_owned(),
+        subtitle: Some(progress.subtitle()),
+        items,
+        tabs: Vec::new(),
+        searchable: true,
+        search_placeholder: Some("Filter setup actions".into()),
+        footer_hint: Some(progress.footer_hint(&next_action)),
+        preview: Some(progress.explanation_preview()),
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// UX2 B.2: the WORKSPACE step screen, split out of the provider-setup menu so
+/// LLM provider/model config and workspace staging+validation live on separate
+/// screens. This screen owns the workspace candidate display, validation
+/// status, the explicit re-validate action, the staged permission profile, and
+/// the final ACTIVATE action (open the coding session). Activate gating is
+/// unchanged — it still requires a saved provider AND a `Valid` workspace via
+/// `onboarding_open_session_disabled_reason`.
+fn onboarding_workspace_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let default_state;
+    let state = if let Some(state) = ctx.app.onboarding {
+        state
+    } else {
+        default_state = OnboardingWizardState::default();
+        &default_state
+    };
+    let current_profile = ctx.app.current_profile;
+
+    let mut items = vec![
+        // Surface the staged candidate (or the active workspace root) and its
+        // validation status.
         MenuItem::new(
             "onboard.workspace.current",
             format!(
@@ -987,7 +1058,9 @@ fn onboarding_provider_setup_menu(
             ),
             MenuAction::Noop,
         )
-        .with_description("Stage with /onboard workspace <path>; default is the active workspace root.")
+        .with_description(
+            "Stage with /onboard workspace <path> (try `.` for the current folder); defaults to the launch directory.",
+        )
         .with_state(MenuItemState::required(
             state.workspace_validation.is_valid(),
         )),
@@ -1002,10 +1075,10 @@ fn onboarding_provider_setup_menu(
             "Validate workspace",
             MenuAction::Local(LocalAction::Onboarding(OnboardingAction::ValidateWorkspace)),
         )
-        .with_description("Probe the staged path; required before /onboard finish."),
-        // M22-D: permission profile staging row. The wizard only
-        // displays the staged choice — the server confirms it via
-        // the runtime policy stamp after `session/open`.
+        .with_description("Probe the staged path; required before you can activate."),
+        // M22-D: permission profile staging row. The wizard only displays the
+        // staged choice — the server confirms it via the runtime policy stamp
+        // after `session/open`.
         MenuItem::new(
             "onboard.permissions.staged",
             onboarding_permission_profile_label(state),
@@ -1017,11 +1090,9 @@ fn onboarding_provider_setup_menu(
         .with_state(MenuItemState::required(
             state.staged_permission_profile.is_some(),
         )),
-        // Issue #2/#4: the final ACTIVATE step. After model config + test +
-        // save succeed and the workspace validates, this is the one explicit
-        // action that opens the coding session and drops the user into the
-        // working surface. The label + description spell out exactly what to do
-        // ("press Enter") so the activation step is never a mystery.
+        // The final ACTIVATE step: after model config + test + save succeed and
+        // the workspace validates, this is the one explicit action that opens
+        // the coding session and drops the user into the working surface.
         {
             let activate_blocked =
                 onboarding_open_session_disabled_reason(ctx, state, current_profile);
@@ -1046,7 +1117,7 @@ fn onboarding_provider_setup_menu(
             .with_state(MenuItemState::required(activate_blocked.is_none()))
             .maybe_disabled(activate_blocked)
         },
-    ]);
+    ];
 
     for (idx, item) in items.iter_mut().enumerate() {
         if let Some(shortcut) = numeric_shortcut(idx) {
@@ -1054,9 +1125,6 @@ fn onboarding_provider_setup_menu(
         }
     }
 
-    // Wizard framing: compute the coarse step (Provider → Connect → Save →
-    // Workspace → Activate) so the subtitle, footer, and right-side checklist
-    // all stay in lock-step with the granular rows above.
     let progress = crate::menu::wizard::WizardProgress::from_state(
         state,
         current_profile,
@@ -1065,15 +1133,15 @@ fn onboarding_provider_setup_menu(
     let next_action = onboarding_next_action_hint(ctx, state, current_profile);
 
     MenuBuildResult::Ready(MenuSpec {
-        id: MenuId::from(MENU_ONBOARD),
-        title: t!("onboarding.wizard.setup_title").into_owned(),
+        id: MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE),
+        title: t!("onboarding.wizard.workspace_title").into_owned(),
         subtitle: Some(progress.subtitle()),
         items,
         tabs: Vec::new(),
-        searchable: true,
-        search_placeholder: Some("Filter setup actions".into()),
+        searchable: false,
+        search_placeholder: None,
         footer_hint: Some(progress.footer_hint(&next_action)),
-        preview: Some(progress.checklist_preview()),
+        preview: Some(progress.explanation_preview()),
         mode: MenuMode::SingleSelect,
     })
 }
@@ -1186,9 +1254,9 @@ fn onboarding_local_profile_menu(state: &OnboardingWizardState) -> MenuBuildResu
         footer_hint: Some(progress.footer_hint(next_action.as_ref())),
         // The first-run OCTOS splash renders in the MAIN window (see
         // `render_onboarding_first_launch_layout` in app.rs); the right pane now
-        // carries the wizard progress checklist so the user always sees where
-        // they are and what's left.
-        preview: Some(progress.checklist_preview()),
+        // carries the per-step TEACHING panel (explanatory prose + progress) so
+        // the user always sees where they are, what's left, and what to do.
+        preview: Some(progress.explanation_preview()),
         mode: MenuMode::SingleSelect,
     })
 }
@@ -4874,19 +4942,34 @@ mod tests {
         // Assert via the i18n key (NOT a hardcoded English literal) so the test
         // tracks the source string and stays correct across locales.
         assert_eq!(spec.title, t!("onboarding.wizard.setup_title"));
-        // The provider/setup phase now carries the wizard progress checklist as
-        // its right-side preview pane.
+        // UX2 A.3: the provider/setup phase now carries the per-step TEACHING
+        // panel (explanatory prose + progress) as its right-side preview pane.
         assert!(
             matches!(
                 spec.preview,
-                Some(crate::menu::types::MenuPreview::KeyValues { .. })
+                Some(crate::menu::types::MenuPreview::Text { .. })
             ),
-            "provider setup menu should show the wizard progress checklist"
+            "provider setup menu should show the per-step explanation panel"
         );
         assert!(
             spec.items
                 .iter()
                 .any(|item| item.id == "onboard.provider.key")
+        );
+        // UX2 B.2: workspace staging lives on its OWN step screen now, reached
+        // via the "continue to workspace" row — it is NOT in the provider menu.
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "onboard.workspace.open"),
+            "provider menu routes to the workspace step"
+        );
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.workspace.validate"),
+            "workspace validation row moved off the provider menu"
         );
 
         let MenuBuildResult::Ready(family_spec) = registry.build(
@@ -4976,6 +5059,98 @@ mod tests {
             selection.route.api_key_env.as_deref(),
             Some("AUTODL_API_KEY")
         );
+    }
+
+    /// UX2 B.2: the workspace step is its OWN menu (`MENU_ONBOARD_WORKSPACE`),
+    /// not part of the provider-setup screen. It owns the workspace candidate,
+    /// validation status, the re-validate action, the staged permission row,
+    /// and the final ACTIVATE action — and carries the per-step teaching panel.
+    #[test]
+    fn onboarding_workspace_menu_owns_workspace_validation_and_activate() {
+        let registry = core_menu_registry();
+        let capabilities = CapabilitySet::from_methods([
+            APPUI_METHOD_AUTH_STATUS,
+            APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        // Profile resolved, provider saved, workspace validated → Activate is
+        // unblocked on the workspace screen.
+        let onboarding = OnboardingWizardState {
+            profile_id: Some("ada".into()),
+            provider: LlmSelectionConfig {
+                family_id: "moonshot".into(),
+                model_id: "kimi-k2.5".into(),
+                route: LlmRouteConfig {
+                    route_id: "moonshot".into(),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            api_key: Some(crate::model::SecretString::new("sk-test")),
+            provider_tested: true,
+            provider_saved: true,
+            workspace_validation: crate::model::OnboardingWorkspaceValidation::Valid {
+                canonical: "/tmp/ws".into(),
+                writable: true,
+                has_workspace_toml: false,
+            },
+            ..OnboardingWizardState::default()
+        };
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                current_profile: Some("ada"),
+                onboarding: Some(&onboarding),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(
+            &MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE),
+            &ctx,
+        ) else {
+            panic!("expected workspace step menu");
+        };
+        assert_eq!(spec.title, t!("onboarding.wizard.workspace_title"));
+        // Workspace + validation + activate rows live HERE, not on the provider
+        // screen.
+        for id in [
+            "onboard.workspace.current",
+            "onboard.workspace.status",
+            "onboard.workspace.validate",
+            "onboard.permissions.staged",
+            "onboard.finish",
+        ] {
+            assert!(
+                spec.items.iter().any(|item| item.id == id),
+                "workspace menu must contain `{id}`"
+            );
+        }
+        // Provider config rows do NOT bleed into the workspace screen.
+        assert!(
+            !spec
+                .items
+                .iter()
+                .any(|item| item.id == "onboard.provider.key"),
+            "provider rows stay on the provider screen"
+        );
+        // Activate is unblocked given saved provider + valid workspace.
+        let activate = spec
+            .items
+            .iter()
+            .find(|item| item.id == "onboard.finish")
+            .expect("activate row");
+        assert!(
+            activate.is_enabled(),
+            "activate is unblocked with provider saved + workspace valid"
+        );
+        // The teaching panel rides along.
+        assert!(matches!(
+            spec.preview,
+            Some(crate::menu::types::MenuPreview::Text { .. })
+        ));
     }
 
     #[test]
@@ -5275,14 +5450,15 @@ mod tests {
         assert_eq!(spec.title, "Welcome to Octos");
         // The first-run splash renders in the MAIN window (app.rs
         // render_onboarding_first_launch_layout); the welcome menu now also
-        // carries the wizard progress checklist as its preview so the user sees
-        // the full Step-N-of-M path from the first screen.
+        // carries the per-step TEACHING panel (explanatory prose + progress) as
+        // its preview so the user sees the full Step-N-of-M path plus what to do
+        // from the first screen.
         assert!(
             matches!(
                 spec.preview,
-                Some(crate::menu::types::MenuPreview::KeyValues { .. })
+                Some(crate::menu::types::MenuPreview::Text { .. })
             ),
-            "welcome menu should show the wizard progress checklist"
+            "welcome menu should show the per-step explanation panel"
         );
         assert!(
             !spec

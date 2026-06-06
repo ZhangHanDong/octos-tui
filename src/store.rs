@@ -208,15 +208,29 @@ impl Store {
     ///
     /// Seeding the candidate from the explicit `--cwd` (the same path
     /// `session/open` uses) lets the probe validate it. `get_or_insert` keeps
-    /// a later explicit `/onboard workspace <path>` authoritative, and an
-    /// empty/absent cwd is a no-op — preserving the prior label-based behavior
-    /// for launches without `--cwd` (e.g. remote/WS workspaces whose root
-    /// lives on the server, not the local cwd).
+    /// a later explicit `/onboard workspace <path>` authoritative.
+    ///
+    /// UX2 (#1377 follow-up): when no `--cwd` is supplied the candidate now
+    /// falls back to the process working directory (the `octos-tui --cwd`
+    /// default the help text already documents), so the documented launch
+    /// `octos serve --stdio --solo` — which carries NO `--cwd` and whose
+    /// transport label resolves to `"stdio"`/empty — still validates a genuine
+    /// directory out of the box instead of dead-ending on
+    /// "no usable workspace cwd". The fallback is skipped for remote/WS
+    /// transports, where the workspace root lives on the server and the local
+    /// cwd would be wrong.
     pub fn seed_onboarding_workspace_cwd(&mut self, cwd: Option<String>) {
-        if let Some(cwd) = cwd {
-            if !cwd.trim().is_empty() {
-                self.state.onboarding.workspace_candidate.get_or_insert(cwd);
-            }
+        let resolved =
+            resolve_launch_workspace_cwd(cwd, !self.is_remote_transport_target(), || {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned())
+            });
+        if let Some(resolved) = resolved {
+            self.state
+                .onboarding
+                .workspace_candidate
+                .get_or_insert(resolved);
         }
     }
 
@@ -2300,11 +2314,12 @@ impl Store {
             self.state.onboarding.workspace_validation =
                 crate::model::OnboardingWorkspaceValidation::Invalid {
                     reason: format!(
-                        "no usable workspace cwd resolved from `{raw_target}`. Use /onboard workspace <path>."
+                        "could not resolve a project folder from `{raw_target}`. Stage one with `/onboard workspace <path>` (e.g. `/onboard workspace .` for the current folder), or relaunch with `--cwd <dir>`."
                     ),
                 };
             self.state.status =
-                "Workspace cwd invalid; stage a path with /onboard workspace <path>".into();
+                "Set a project folder: /onboard workspace <path> (try `.` for the current folder)"
+                    .into();
             self.refresh_active_menu_if_open();
             return;
         }
@@ -2475,6 +2490,11 @@ impl Store {
                     | crate::menu::registry::MENU_ONBOARD_FAMILY
                     | crate::menu::registry::MENU_ONBOARD_MODEL
                     | crate::menu::registry::MENU_ONBOARD_ROUTE
+                    // UX2 B.2: Activate now lives on the workspace step screen,
+                    // so pressing it there must also tear the wizard down (drop
+                    // the user into the coding surface), not leave the workspace
+                    // menu stacked over the chat.
+                    | crate::menu::registry::MENU_ONBOARD_WORKSPACE
             )
         })
     }
@@ -6847,6 +6867,35 @@ fn non_empty_string(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Resolve the workspace cwd to seed the onboarding candidate from at launch.
+///
+/// Precedence:
+///   1. an explicit, non-empty `--cwd` (always wins, including remote launches
+///      where the user named a server-side path on purpose);
+///   2. otherwise — only for transport-local launches (stdio / `ws://localhost`),
+///      gated by `allow_process_cwd_fallback` — the process working directory
+///      via `process_cwd`.
+///
+/// Returns `None` when neither yields a non-empty path (e.g. a remote launch
+/// with no `--cwd`), preserving the prior label/root-based behavior for
+/// remote/WS workspaces whose root lives on the server. `process_cwd` is
+/// injected so the fallback is deterministic under test.
+fn resolve_launch_workspace_cwd(
+    explicit: Option<String>,
+    allow_process_cwd_fallback: bool,
+    process_cwd: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    if let Some(explicit) = explicit {
+        if !explicit.trim().is_empty() {
+            return Some(explicit);
+        }
+    }
+    if !allow_process_cwd_fallback {
+        return None;
+    }
+    process_cwd().filter(|cwd| !cwd.trim().is_empty())
+}
+
 fn onboarding_workspace_cwd(value: &str) -> Option<String> {
     let value = value.trim();
     if let Some(command) = value.strip_prefix("stdio:") {
@@ -8295,6 +8344,103 @@ mod tests {
         assert!(store.state.onboarding.workspace_candidate.is_none());
         store.seed_onboarding_workspace_cwd(Some("   ".into()));
         assert!(store.state.onboarding.workspace_candidate.is_none());
+    }
+
+    /// UX2 B.1: the documented `octos serve --stdio --solo` launch carries no
+    /// `--cwd` and its transport label resolves to `"stdio"`/empty. With the
+    /// process-cwd fallback the onboarding candidate is seeded to the launch
+    /// directory, so the first-launch probe validates a genuine folder instead
+    /// of dead-ending on "no usable workspace cwd".
+    #[test]
+    fn stdio_launch_without_cwd_falls_back_to_process_cwd() {
+        let stdio_label = "stdio:/abs/octos serve --stdio --solo";
+        let mut store = Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![],
+            selected_session: 0,
+            status: "ready".into(),
+            target: Some(stdio_label.into()),
+            readonly: false,
+        });
+        // Pre-seed deterministically (the public seed reads the real process
+        // cwd; the resolver itself is unit-tested below with an injected cwd).
+        let resolved = resolve_launch_workspace_cwd(None, true, || Some("/launch/dir".into()));
+        store.state.onboarding.workspace_candidate = resolved;
+        assert_eq!(
+            store.state.onboarding.workspace_candidate.as_deref(),
+            Some("/launch/dir"),
+        );
+        let root = store.state.workspace.root.clone();
+        assert_eq!(
+            store.state.onboarding.workspace_target(&root),
+            "/launch/dir",
+        );
+    }
+
+    /// UX2 B.1: the real `seed_onboarding_workspace_cwd` path resolves a usable
+    /// directory for an stdio launch with no `--cwd`. The seeded candidate must
+    /// be a genuine, existing directory so the probe would validate it (here we
+    /// just assert it is non-empty and exists, since the process cwd at test
+    /// time is the crate root).
+    #[test]
+    fn seed_without_cwd_resolves_a_real_directory_for_local_transport() {
+        let mut store = Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![],
+            selected_session: 0,
+            status: "ready".into(),
+            target: Some("stdio:/abs/octos serve --stdio --solo".into()),
+            readonly: false,
+        });
+        store.seed_onboarding_workspace_cwd(None);
+        let candidate = store
+            .state
+            .onboarding
+            .workspace_candidate
+            .clone()
+            .expect("stdio launch without --cwd seeds the process cwd");
+        assert!(!candidate.trim().is_empty());
+        assert!(
+            std::path::Path::new(&candidate).is_dir(),
+            "seeded candidate must be an existing directory: {candidate}"
+        );
+    }
+
+    /// UX2 B.1: an explicit `--cwd` override always wins, even over the
+    /// process-cwd fallback, and a remote transport without `--cwd` still
+    /// resolves to nothing (the server owns the workspace root).
+    #[test]
+    fn resolve_launch_workspace_cwd_precedence() {
+        // Explicit override wins regardless of fallback availability.
+        assert_eq!(
+            resolve_launch_workspace_cwd(Some("/explicit".into()), true, || Some(
+                "/fallback".into()
+            )),
+            Some("/explicit".into()),
+        );
+        // Blank explicit falls through to the process cwd for local transports.
+        assert_eq!(
+            resolve_launch_workspace_cwd(Some("   ".into()), true, || Some("/fallback".into())),
+            Some("/fallback".into()),
+        );
+        // No explicit + local transport → process cwd.
+        assert_eq!(
+            resolve_launch_workspace_cwd(None, true, || Some("/fallback".into())),
+            Some("/fallback".into()),
+        );
+        // Remote transport (fallback disallowed) + no explicit → None.
+        assert_eq!(
+            resolve_launch_workspace_cwd(None, false, || Some("/fallback".into())),
+            None,
+        );
+        // Remote transport + explicit cwd still honors the explicit path.
+        assert_eq!(
+            resolve_launch_workspace_cwd(Some("/explicit".into()), false, || None),
+            Some("/explicit".into()),
+        );
+        // Empty process cwd is treated as no fallback.
+        assert_eq!(
+            resolve_launch_workspace_cwd(None, true, || Some("  ".into())),
+            None,
+        );
     }
 
     #[test]
@@ -9809,7 +9955,16 @@ mod tests {
 
         match &store.state.onboarding.workspace_validation {
             crate::model::OnboardingWorkspaceValidation::Invalid { reason } => {
-                assert!(reason.contains("no usable workspace cwd"));
+                // The error is actionable: it names the override command and
+                // the `.`-for-current-folder shortcut.
+                assert!(
+                    reason.contains("could not resolve a project folder"),
+                    "reason should explain no folder resolved: {reason}"
+                );
+                assert!(
+                    reason.contains("/onboard workspace"),
+                    "reason should name the override command: {reason}"
+                );
             }
             other => panic!("expected Invalid, got: {other:?}"),
         }
@@ -9975,6 +10130,34 @@ mod tests {
             store.state.menu_stack.is_active(),
             "a non-onboarding menu stays open across session open"
         );
+    }
+
+    /// UX2 B.2: Activate moved to the WORKSPACE step screen, so opening a
+    /// session while THAT menu is active must also tear the wizard down (drop
+    /// the user into the coding surface) — the same as the other onboarding
+    /// menus. Without `MENU_ONBOARD_WORKSPACE` in `active_menu_is_onboarding`,
+    /// the workspace menu would stay stacked over the chat after activation.
+    #[test]
+    fn session_opened_tears_down_workspace_step_menu() {
+        use octos_core::SessionKey;
+        use octos_core::ui_protocol::SessionOpened;
+
+        let mut store = store_with_empty_session();
+        store.open_menu(MenuId::from(crate::menu::registry::MENU_ONBOARD_WORKSPACE));
+        assert!(store.state.menu_stack.is_active());
+
+        let opened: SessionOpened = serde_json::from_value(serde_json::json!({
+            "session_id": SessionKey("alice:local:tui#coding".into()),
+            "active_profile_id": "alice",
+        }))
+        .expect("session/opened payload");
+        store.apply_event(AppUiEvent::Protocol(UiNotification::SessionOpened(opened)));
+
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "the workspace step menu is torn down once the session opens"
+        );
+        assert_eq!(store.state.focus, FocusPane::Composer);
     }
 
     #[test]

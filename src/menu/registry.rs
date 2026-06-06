@@ -17,6 +17,9 @@ pub const MENU_ONBOARD: &str = "onboard";
 pub const MENU_ONBOARD_FAMILY: &str = "onboard-family";
 pub const MENU_ONBOARD_MODEL: &str = "onboard-model";
 pub const MENU_ONBOARD_ROUTE: &str = "onboard-route";
+/// UX2 B.2: workspace staging + validation lives on its OWN onboarding step
+/// screen (the "Set Up LLM Provider" menu now configures provider/model only).
+pub const MENU_ONBOARD_WORKSPACE: &str = "onboard-workspace";
 pub const MENU_LOGIN: &str = "login";
 pub const MENU_PROVIDER: &str = "provider";
 pub const MENU_MODEL: &str = "model";

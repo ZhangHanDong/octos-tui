@@ -88,6 +88,14 @@ impl WizardStep {
     pub fn purpose(self) -> Cow<'static, str> {
         t!(format!("onboarding.wizard.purpose.{}", self.key()))
     }
+
+    /// Multi-line explanatory prose for the right-side teaching panel: what
+    /// this step is for, what the user should do, and why it matters. The
+    /// source string embeds `\n` line breaks (see `locales/{en,zh}.yml`); the
+    /// menu render surface handles wrapping and CJK width.
+    pub fn explanation(self) -> Cow<'static, str> {
+        t!(format!("onboarding.wizard.explain.{}", self.key()))
+    }
 }
 
 /// Computed snapshot of the wizard's progress, derived from the wizard state.
@@ -172,6 +180,55 @@ impl WizardProgress {
     /// Footer hint naming the next concrete action.
     pub fn footer_hint(&self, next_action: &str) -> String {
         t!("onboarding.wizard.footer", next = next_action).into_owned()
+    }
+
+    /// UX2 A.3: the right-side TEACHING panel. Replaces the sparse
+    /// checklist-only pane ("little information… waste of space") with genuinely
+    /// explanatory prose that updates per step:
+    ///
+    ///   * a compact progress line (`Step N of M`) + the per-step checklist so
+    ///     the user always sees where they are and what is left,
+    ///   * a blank separator,
+    ///   * the current step's title, then multi-line prose explaining what the
+    ///     step is for, what to do, and why it matters.
+    ///
+    /// Rendered as `MenuPreview::Text` so the body is free-flowing prose the
+    /// menu surface wraps (CJK width handled there), not `[label]: [value]`
+    /// rows. The `\n`-joined body keeps all width math in the render surface.
+    pub fn explanation_preview(&self) -> MenuPreview {
+        let mut body = String::new();
+        body.push_str(&t!(
+            "onboarding.wizard.explain_progress",
+            number = self.current.number(),
+            total = WizardStep::ALL.len(),
+        ));
+        body.push('\n');
+        for (step, &complete) in WizardStep::ALL.iter().zip(self.done.iter()) {
+            let marker = if *step == self.current {
+                "▸"
+            } else if complete {
+                "✓"
+            } else {
+                "·"
+            };
+            body.push('\n');
+            body.push_str(marker);
+            body.push(' ');
+            body.push_str(step.number().to_string().as_str());
+            body.push_str(". ");
+            body.push_str(&step.short_title());
+        }
+        body.push_str("\n\n");
+        body.push_str(&t!(
+            "onboarding.wizard.explain_now",
+            title = self.current.short_title(),
+        ));
+        body.push('\n');
+        body.push_str(&self.current.explanation());
+        MenuPreview::Text {
+            title: Some(t!("onboarding.wizard.explain_title").into_owned()),
+            body,
+        }
     }
 
     /// Right-side checklist preview: one row per step, current marked `>`,
@@ -289,6 +346,32 @@ mod tests {
         assert!(rows[0].label.starts_with("[x]"), "profile done");
         assert!(rows[1].label.starts_with('>'), "provider current");
         assert!(rows[2].label.starts_with("[ ]"), "connect pending");
+    }
+
+    /// UX2 A.3: the teaching panel is explanatory prose (not `[ ]/[x]` rows).
+    /// It must carry a progress line, the per-step list with a current marker,
+    /// and the current step's multi-line explanation body.
+    #[test]
+    fn explanation_preview_is_prose_with_progress_and_current_step() {
+        let progress = WizardProgress::from_state(&state_with_profile(), None, true);
+        let MenuPreview::Text { title, body } = progress.explanation_preview() else {
+            panic!("expected free-text teaching panel");
+        };
+        assert!(title.is_some(), "teaching panel has a title");
+        // The current step (Provider) explanation prose is present and the
+        // current-step marker appears. Assert via the same i18n source so the
+        // test tracks wording/locale changes instead of a hardcoded literal.
+        assert!(
+            body.contains(WizardStep::Provider.explanation().as_ref()),
+            "current step explanation prose is shown: {body}"
+        );
+        assert!(body.contains('▸'), "current step is marked: {body}");
+        assert!(body.contains('✓'), "completed step is marked: {body}");
+        // Genuinely explanatory: the prose is more than a one-line label.
+        assert!(
+            body.lines().count() >= WizardStep::ALL.len() + 2,
+            "panel is multi-line teaching prose, not a bare checklist: {body}"
+        );
     }
 
     #[test]
