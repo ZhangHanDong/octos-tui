@@ -1,21 +1,26 @@
-use std::io::{self, Stdout};
+use std::io;
 use std::time::{Duration, Instant};
 
+#[cfg(not(test))]
 use crossterm::{
     cursor::Show,
+    event::{DisableBracketedPaste, DisableFocusChange},
+    terminal::disable_raw_mode,
+};
+use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        self, EnableBracketedPaste, EnableFocusChange, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{
         BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
-        disable_raw_mode, enable_raw_mode,
+        enable_raw_mode,
     },
 };
 use eyre::Result;
 use octos_core::app_ui::AppUiEvent;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 
 use crate::{
     app,
@@ -34,6 +39,8 @@ use crate::{
 /// on change (see `draw_dirty`), not on this tick, so this does not cause the
 /// 40×/sec repaint that wiped selections in the old alt-screen model.
 const UI_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const INITIAL_CAPABILITIES_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1500);
+const INITIAL_CAPABILITIES_HANDSHAKE_POLL: Duration = Duration::from_millis(10);
 /// Redraw cadence while a turn is active, so the spinner/status animates without
 /// a fixed-rate repaint when nothing is happening.
 const ANIMATION_INTERVAL: Duration = Duration::from_millis(120);
@@ -64,6 +71,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut terminal = InlineTerminal::new(backend)?;
     let mut guard = TerminalGuard {
         mode: RenderMode::Inline,
+        saved_inline_viewport: None,
     };
 
     // i18n: select the UI language before the first render. `t!()` reads this
@@ -97,6 +105,9 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut scrollback = ScrollbackTracker::new();
     // Force a draw on the first iteration.
     let mut dirty = true;
+    if drain_initial_startup_events(backend.as_mut(), &mut store)? {
+        dirty = true;
+    }
     let mut last_animation = Instant::now();
 
     loop {
@@ -164,12 +175,15 @@ pub fn run(cli: Cli) -> Result<()> {
 /// into the bottom inline viewport. For full-screen overlays it switches to the
 /// alternate screen and renders the legacy full layout (codex does the same for
 /// its transient overlays).
-fn draw(
-    terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+fn draw<B>(
+    terminal: &mut InlineTerminal<B>,
     guard: &mut TerminalGuard,
     store: &mut Store,
     scrollback: &mut ScrollbackTracker,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
     let palette = Palette::for_theme(store.state.theme);
 
     if app::wants_fullscreen_overlay(&store.state) {
@@ -177,7 +191,13 @@ fn draw(
         guard.enter_alt_screen(terminal)?;
         let size = terminal.size()?;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-        terminal.set_viewport_area(area);
+        let resized = size != terminal.last_known_screen_size || terminal.viewport_area != area;
+        if resized {
+            terminal.set_viewport_area(area);
+            terminal.clear_visible_screen()?;
+            terminal.invalidate_viewport();
+            terminal.last_known_screen_size = size;
+        }
         terminal.draw(|frame| {
             // `render_inline_overlay` is generic over `FrameLike`, so it renders
             // the legacy full-screen layout straight into the inline `Frame`'s
@@ -228,13 +248,16 @@ fn draw(
     }
 }
 
-fn draw_inline_frame(
-    terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
+fn draw_inline_frame<B>(
+    terminal: &mut InlineTerminal<B>,
     state: &crate::model::AppState,
     palette: Palette,
     height: u16,
     lines_to_insert: Vec<ratatui::text::Line<'static>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
     terminal.resize_viewport_to(height)?;
     if !lines_to_insert.is_empty() {
         insert_history_lines(terminal, lines_to_insert)?;
@@ -244,10 +267,13 @@ fn draw_inline_frame(
     Ok(())
 }
 
-fn synchronized_terminal_update(
-    terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
-    operations: impl FnOnce(&mut InlineTerminal<CrosstermBackend<Stdout>>) -> Result<()>,
-) -> Result<()> {
+fn synchronized_terminal_update<B>(
+    terminal: &mut InlineTerminal<B>,
+    operations: impl FnOnce(&mut InlineTerminal<B>) -> Result<()>,
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
     execute!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
     let operation_result = operations(terminal);
     let end_result = execute!(terminal.backend_mut(), EndSynchronizedUpdate);
@@ -305,6 +331,28 @@ fn drain_backend_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Re
 
     drain_pending_autonomy_hydration(backend, store);
     Ok(applied)
+}
+
+/// Give the initial protocol capabilities probe a bounded chance to land before
+/// the first frame. First-launch onboarding is capability-gated, so drawing
+/// before this handshake can flash or stick on an empty inline composer.
+fn drain_initial_startup_events(backend: &mut dyn AppUiBackend, store: &mut Store) -> Result<bool> {
+    let deadline = Instant::now() + INITIAL_CAPABILITIES_HANDSHAKE_TIMEOUT;
+    let mut applied = false;
+    while should_wait_for_initial_capabilities(store) {
+        applied |= drain_backend_events(backend, store)?;
+        if !should_wait_for_initial_capabilities(store) || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(INITIAL_CAPABILITIES_HANDSHAKE_POLL);
+    }
+    Ok(applied)
+}
+
+fn should_wait_for_initial_capabilities(store: &Store) -> bool {
+    store.state.sessions.is_empty()
+        && store.state.capabilities.is_none()
+        && !store.state.menu_stack.is_active()
 }
 
 fn apply_client_event_and_send_followup(
@@ -1209,7 +1257,12 @@ mod tests {
             UserQuestionOption, UserQuestionRequestedEvent, approval_scopes,
         },
     };
+    use ratatui::{
+        backend::{ClearType, WindowSize},
+        layout::{Position, Rect, Size},
+    };
     use std::collections::VecDeque;
+    use std::io::Write;
 
     struct FakeBackend {
         events: VecDeque<ClientEvent>,
@@ -1222,6 +1275,85 @@ mod tests {
                 events: events.into(),
                 sent: Vec::new(),
             }
+        }
+    }
+
+    struct RecordingBackend {
+        buf: Vec<u8>,
+        size: Size,
+        cursor: Position,
+        clears: Vec<ClearType>,
+    }
+
+    impl RecordingBackend {
+        fn new(width: u16, height: u16) -> Self {
+            Self {
+                buf: Vec::new(),
+                size: Size::new(width, height),
+                cursor: Position { x: 0, y: 0 },
+                clears: Vec::new(),
+            }
+        }
+    }
+
+    impl Write for RecordingBackend {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Backend for RecordingBackend {
+        fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+        {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> io::Result<Position> {
+            Ok(self.cursor)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+            self.cursor = position.into();
+            Ok(())
+        }
+
+        fn clear(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.clears.push(clear_type);
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::new(0, 0),
+            })
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -1280,6 +1412,18 @@ mod tests {
         Store {
             state: AppState::new(vec![session], 0, "ready".into(), None, false),
         }
+    }
+
+    fn onboarding_capabilities_event() -> ClientEvent {
+        ClientEvent::Capabilities(crate::client_event::CapabilitiesClientEvent {
+            result: crate::model::ConfigCapabilitiesListResult {
+                capabilities: UiProtocolCapabilities::new(
+                    &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+                    &[],
+                ),
+            },
+            message: "AppUI capabilities refreshed: 1 method".into(),
+        })
     }
 
     #[test]
@@ -1450,6 +1594,82 @@ mod tests {
 
         assert!(backend.events.is_empty());
         assert_eq!(store.state.status, "three");
+    }
+
+    #[test]
+    fn startup_capabilities_render_onboarding_before_first_frame() {
+        let mut backend = FakeBackend::new(vec![onboarding_capabilities_event()]);
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "starting".into(),
+                Some("stdio:octos serve --stdio --solo".into()),
+                false,
+            ),
+        };
+
+        let applied =
+            drain_initial_startup_events(&mut backend, &mut store).expect("startup drain");
+
+        assert!(applied);
+        assert!(app::wants_fullscreen_overlay(&store.state));
+
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+        draw(&mut terminal, &mut guard, &mut store, &mut scrollback)
+            .expect("draw onboarding overlay");
+
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert!(
+            written.contains("Welcome to Octos"),
+            "onboarding should render before the first frame; wrote {written:?}"
+        );
+    }
+
+    #[test]
+    fn overlay_transition_restores_inline_viewport_for_resize_clear() {
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(80, 24)).expect("recording terminal");
+        terminal.set_viewport_area(Rect::new(0, 20, 80, 4));
+        terminal.last_known_screen_size = Size::new(80, 24);
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+        };
+
+        guard
+            .enter_alt_screen(&mut terminal)
+            .expect("enter alt screen");
+        assert_eq!(guard.mode, RenderMode::AltScreen);
+        assert_eq!(terminal.viewport_area, Rect::new(0, 0, 80, 24));
+        assert_eq!(terminal.backend().clears, vec![ClearType::All]);
+
+        terminal.backend_mut().size = Size::new(60, 20);
+        guard
+            .leave_alt_screen(&mut terminal)
+            .expect("leave alt screen");
+        assert_eq!(guard.mode, RenderMode::Inline);
+        assert_eq!(terminal.viewport_area, Rect::new(0, 20, 80, 4));
+
+        terminal
+            .resize_viewport_to(4)
+            .expect("resize restored inline viewport");
+        assert_eq!(terminal.viewport_area, Rect::new(0, 16, 60, 4));
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 16 });
+        assert_eq!(
+            terminal.backend().clears,
+            vec![ClearType::All, ClearType::AfterCursor]
+        );
+
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert!(written.contains("\u{1b}[?1049h"));
+        assert!(written.contains("\u{1b}[?1049l"));
     }
 
     #[test]
@@ -2510,43 +2730,45 @@ mod tests {
 /// Tracks the current screen model and restores terminal state on drop.
 struct TerminalGuard {
     mode: RenderMode,
+    saved_inline_viewport: Option<ratatui::layout::Rect>,
 }
 
 impl TerminalGuard {
     /// Switch into the alternate screen for a full-screen overlay (if not
     /// already there). The viewport is resized to the full screen by the caller.
-    fn enter_alt_screen(
-        &mut self,
-        terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
+    fn enter_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
         if self.mode == RenderMode::AltScreen {
             return Ok(());
         }
+        self.saved_inline_viewport = Some(terminal.viewport_area);
         execute!(terminal.backend_mut(), EnterAlternateScreen)?;
+        let size = terminal.size()?;
+        terminal.set_viewport_area(ratatui::layout::Rect::new(0, 0, size.width, size.height));
+        terminal.clear_visible_screen()?;
         terminal.invalidate_viewport();
+        terminal.last_known_screen_size = size;
         self.mode = RenderMode::AltScreen;
         Ok(())
     }
 
     /// Return to the inline-viewport model (normal scrollback). On the way back
     /// we force the next inline draw to repaint the whole viewport.
-    fn leave_alt_screen(
-        &mut self,
-        terminal: &mut InlineTerminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
+    fn leave_alt_screen<B>(&mut self, terminal: &mut InlineTerminal<B>) -> Result<()>
+    where
+        B: Backend + io::Write,
+    {
         if self.mode == RenderMode::Inline {
             return Ok(());
         }
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        // Re-anchor the inline viewport at the current cursor row so history
-        // insertion and viewport draws land in the right place.
-        let size = terminal.size()?;
-        terminal.set_viewport_area(ratatui::layout::Rect::new(
-            0,
-            size.height.saturating_sub(1),
-            size.width,
-            1,
-        ));
+        let fallback = {
+            let size = terminal.size()?;
+            ratatui::layout::Rect::new(0, size.height.saturating_sub(1), size.width, 1)
+        };
+        terminal.set_viewport_area(self.saved_inline_viewport.take().unwrap_or(fallback));
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
         Ok(())
@@ -2555,11 +2777,14 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let mut stdout: Stdout = io::stdout();
-        if self.mode == RenderMode::AltScreen {
-            let _ = execute!(stdout, LeaveAlternateScreen);
+        #[cfg(not(test))]
+        {
+            let mut stdout = io::stdout();
+            if self.mode == RenderMode::AltScreen {
+                let _ = execute!(stdout, LeaveAlternateScreen);
+            }
+            let _ = disable_raw_mode();
+            let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
         }
-        let _ = disable_raw_mode();
-        let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
     }
 }

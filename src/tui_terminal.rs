@@ -223,30 +223,41 @@ where
     }
 
     fn resize_viewport_to_size(&mut self, height: u16, size: Size) -> io::Result<()> {
-        let mut area = self.viewport_area;
+        let old_area = self.viewport_area;
         let target = self.target_viewport_area(height, size);
-        area.x = target.x;
-        area.width = target.width;
-        area.height = target.height;
-        if area.bottom() > size.height {
-            let scroll_by = area.bottom() - size.height;
-            // Push the rows above the viewport up into scrollback so the
-            // viewport fits at the bottom, using a DECSTBM scroll region over
-            // the rows above the (old) viewport bottom + Index (`ESC D`). We emit
-            // the escapes directly so we don't depend on ratatui's optional
-            // `scrolling-regions` Backend feature.
-            scroll_region_up(&mut self.backend, area.top(), scroll_by)?;
-        }
-        // Always re-pin the viewport to the bottom `height` rows. When the live
-        // UI SHRINKS (a turn completes, a menu closes) the old bottom no longer
-        // overflows the screen, so without this the smaller viewport would
-        // repaint at the old (higher) top and leave blank rows below the
-        // composer until later history shifted it down (codex P2). `clear()`
-        // below clears from the OLD viewport top to end-of-screen, so the rows
-        // the viewport vacates are blanked rather than left stale.
-        if target != self.viewport_area {
-            self.clear()?;
+        let terminal_height_shrank = size.height < self.last_known_screen_size.height;
+
+        if target != old_area {
+            let old_bottom_with_new_height = old_area
+                .y
+                .saturating_add(target.height)
+                .saturating_sub(size.height);
+            if old_bottom_with_new_height > 0 && !terminal_height_shrank && !old_area.is_empty() {
+                // Push the rows above the viewport up into scrollback so the
+                // viewport fits at the bottom, using a DECSTBM scroll region
+                // over the rows above the old viewport top + Index (`ESC D`).
+                // On a real terminal shrink the old y can be below the new
+                // screen; scrolling that stale region corrupts the resized
+                // screen, so shrink reflow just clears and repaints.
+                scroll_region_up(
+                    &mut self.backend,
+                    old_area.top(),
+                    old_bottom_with_new_height,
+                )?;
+            }
+
+            // A terminal shrink can leave `old_area.y` outside the new visible
+            // screen. Clear from the earlier visible top of the old/new
+            // viewport so rows vacated by either layout cannot survive as a
+            // second composer or fragmented overlay.
+            let clear_y = if old_area.is_empty() {
+                target.y
+            } else {
+                old_area.y.min(target.y)
+            }
+            .min(size.height.saturating_sub(1));
             self.set_viewport_area(target);
+            self.clear_after_position(Position { x: 0, y: clear_y })?;
         }
         self.last_known_screen_size = size;
         Ok(())
@@ -365,9 +376,24 @@ where
         if self.viewport_area.is_empty() {
             return Ok(());
         }
-        self.backend
-            .set_cursor_position(self.viewport_area.as_position())?;
+        self.clear_after_position(self.viewport_area.as_position())
+    }
+
+    /// Clear from `position` through the end of the visible screen and force a
+    /// full repaint on the next draw.
+    pub(crate) fn clear_after_position(&mut self, position: Position) -> io::Result<()> {
+        self.backend.set_cursor_position(position)?;
         self.backend.clear_region(ClearType::AfterCursor)?;
+        self.previous_buffer_mut().reset();
+        Ok(())
+    }
+
+    /// Clear the whole visible screen and force a full repaint on the next draw.
+    pub(crate) fn clear_visible_screen(&mut self) -> io::Result<()> {
+        let home = Position { x: 0, y: 0 };
+        self.backend.set_cursor_position(home)?;
+        self.backend.clear_region(ClearType::All)?;
+        self.backend.set_cursor_position(home)?;
         self.previous_buffer_mut().reset();
         Ok(())
     }
@@ -535,6 +561,7 @@ mod tests {
         buf: Vec<u8>,
         size: Size,
         cursor: Position,
+        clears: Vec<ClearType>,
     }
 
     impl RecordingBackend {
@@ -543,6 +570,7 @@ mod tests {
                 buf: Vec::new(),
                 size: Size::new(width, height),
                 cursor: Position { x: 0, y: 0 },
+                clears: Vec::new(),
             }
         }
     }
@@ -581,7 +609,8 @@ mod tests {
         fn clear(&mut self) -> io::Result<()> {
             Ok(())
         }
-        fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
+        fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+            self.clears.push(clear_type);
             Ok(())
         }
         fn size(&self) -> io::Result<Size> {
@@ -709,5 +738,38 @@ mod tests {
             terminal.backend().buf.len() > before,
             "a real content change must repaint"
         );
+    }
+
+    #[test]
+    fn terminal_shrink_reanchors_and_clears_from_new_viewport_top() {
+        let mut terminal = Terminal::new(RecordingBackend::new(200, 50)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 46, 200, 4));
+        terminal.last_known_screen_size = Size::new(200, 50);
+        terminal.backend_mut().size = Size::new(130, 38);
+
+        terminal.resize_viewport_to(4).expect("resize viewport");
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, 34, 130, 4));
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 34 });
+        assert_eq!(terminal.backend().clears, vec![ClearType::AfterCursor]);
+        let written = String::from_utf8_lossy(&terminal.backend().buf);
+        assert!(
+            !written.contains("\u{1b}D"),
+            "terminal shrink must not scroll a stale off-screen region; wrote {written:?}"
+        );
+    }
+
+    #[test]
+    fn width_resize_clears_from_existing_viewport_top() {
+        let mut terminal = Terminal::new(RecordingBackend::new(200, 50)).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 45, 200, 5));
+        terminal.last_known_screen_size = Size::new(200, 50);
+        terminal.backend_mut().size = Size::new(130, 50);
+
+        terminal.resize_viewport_to(5).expect("resize viewport");
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, 45, 130, 5));
+        assert_eq!(terminal.backend().cursor, Position { x: 0, y: 45 });
+        assert_eq!(terminal.backend().clears, vec![ClearType::AfterCursor]);
     }
 }
