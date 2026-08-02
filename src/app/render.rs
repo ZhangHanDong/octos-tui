@@ -1851,7 +1851,18 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
         .filter(|(active, paused)| *active > 0 || *paused > 0)
         .map(|(active, paused)| {
             if active > 0 {
-                t!("app.statusbar.loops_active", count = active).into_owned()
+                // Compact live chip (spec task-loop-liveness-indicator): the
+                // countdown is the liveness signal; the old static hint was
+                // long AND said nothing about whether the loop was moving.
+                match crate::app::active_loop_countdown(app) {
+                    Some(remaining) => t!(
+                        "app.statusbar.loops_active_countdown",
+                        count = active,
+                        remaining = remaining
+                    )
+                    .into_owned(),
+                    None => t!("app.statusbar.loops_active", count = active).into_owned(),
+                }
             } else {
                 t!("app.statusbar.loops_paused", count = paused).into_owned()
             }

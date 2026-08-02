@@ -10383,6 +10383,17 @@ impl Store {
                 // on turn so a stale/continuation TurnStarted for a DIFFERENT
                 // turn cannot drop a newer staged submit's gate.
                 self.release_staged_gate_for_turn(&event.session_id, &event.turn_id);
+                // Spec task-loop-liveness-indicator: an armed loop fire claims
+                // THIS turn, so its activity group renders the ↻ attribution.
+                if self
+                    .state
+                    .pending_loop_attribution
+                    .remove(&event.session_id)
+                {
+                    self.state
+                        .loop_attributed_turns
+                        .insert((event.session_id.clone(), event.turn_id.clone()));
+                }
                 // The pre-first-token window is over for this session — the
                 // live_reply bound below carries the in-progress signal now.
                 self.state.pre_token_turns.remove(&event.session_id);
@@ -10904,6 +10915,17 @@ impl Store {
                     self.state
                         .upsert_session_loop(&event.session_id, loop_state);
                 }
+                // Spec task-loop-liveness-indicator: count the fire (the
+                // server keeps no such counter) and arm attribution so the
+                // turn this fire starts is marked as loop-driven.
+                *self
+                    .state
+                    .loop_fire_counts
+                    .entry((event.session_id.clone(), event.loop_id.clone()))
+                    .or_insert(0) += 1;
+                self.state
+                    .pending_loop_attribution
+                    .insert(event.session_id.clone());
                 self.state.push_activity(ActivityItem::new(
                     ActivityKind::Progress,
                     event.loop_id,

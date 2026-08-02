@@ -4486,6 +4486,17 @@ pub struct AppState {
     /// task-quota-exhausted-card): the status bar shows an amber Quota state
     /// instead of the generic red Error. Cleared when the next turn starts.
     pub quota_exhausted: bool,
+    /// Client-side per-loop fire counter (spec task-loop-liveness-indicator):
+    /// how many times each loop has fired in this session. The server carries
+    /// no such counter, so this is a session-local approximation that resets
+    /// on restart — enough to answer "is it still going, and how far in".
+    pub loop_fire_counts: std::collections::HashMap<(SessionKey, String), u32>,
+    /// Turns known to have been started by a loop firing, so their activity
+    /// group can carry the `↻` attribution prefix.
+    pub loop_attributed_turns: std::collections::HashSet<(SessionKey, TurnId)>,
+    /// Session whose NEXT turn should be attributed to a loop: set when
+    /// `loop/fired` arrives, consumed when that session's next turn starts.
+    pub pending_loop_attribution: std::collections::HashSet<SessionKey>,
     /// Path of the `--config` file this session launched from, retained so
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
@@ -6571,6 +6582,9 @@ impl AppState {
             pending_decision_bell: false,
             task_first_seen: std::collections::HashMap::new(),
             quota_exhausted: false,
+            loop_fire_counts: std::collections::HashMap::new(),
+            loop_attributed_turns: std::collections::HashSet::new(),
+            pending_loop_attribution: std::collections::HashSet::new(),
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,

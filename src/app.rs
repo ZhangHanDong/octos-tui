@@ -2507,6 +2507,32 @@ fn spinner_frame() -> &'static str {
     SPINNER_FRAMES[(elapsed / 160) as usize % SPINNER_FRAMES.len()]
 }
 
+/// Frame period of the turn spinner, in milliseconds. Exposed so the loop
+/// indicator can prove it animates on a calmer cadence.
+pub(crate) fn turn_spinner_period_ms() -> u128 {
+    160
+}
+
+/// Frame period of the LOOP indicator's rotation. The autonomy row is
+/// permanently visible while a loop is armed, so it rotates ~3x slower than
+/// the turn spinner — liveness without visual noise (spec
+/// task-loop-liveness-indicator).
+pub(crate) fn loop_spinner_period_ms() -> u128 {
+    520
+}
+
+const LOOP_SPINNER_FRAMES: [&str; 4] = ["↻", "↺", "↻", "↺"];
+
+/// Current loop-rotation frame, riding the same process clock as
+/// `spinner_frame` but on the slower `loop_spinner_period_ms` cadence.
+fn loop_spinner_frame() -> &'static str {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static START: OnceLock<Instant> = OnceLock::new();
+    let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
+    LOOP_SPINNER_FRAMES[(elapsed / loop_spinner_period_ms()) as usize % LOOP_SPINNER_FRAMES.len()]
+}
+
 /// Seconds since process start — the same process clock `spinner_frame` rides,
 /// so a wave keyed off it advances on every ~25ms animation redraw without
 /// threading a phase counter through `AppState`.
@@ -3441,6 +3467,100 @@ fn autonomy_loop_cadence(record: &octos_core::ui_protocol::UiLoopRecord) -> Stri
     }
 }
 
+/// Coarse duration for loop chips: hours+minutes past an hour, else the
+/// existing minute/second form. `format_elapsed_secs` alone renders three
+/// hours as "179m 59s", which reads as noise on a permanently visible row.
+fn format_loop_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format_elapsed_secs(secs)
+    }
+}
+
+/// Milliseconds from now until `at_ms`, or `None` when the instant is absent
+/// or already past (a stale countdown is worse than none).
+fn millis_until(at_ms: Option<i64>) -> Option<u64> {
+    let target = at_ms?;
+    let now = chrono::Utc::now().timestamp_millis();
+    (target > now).then(|| (target - now) as u64)
+}
+
+/// Seconds until the loop's next run, when it has one scheduled.
+fn loop_next_run_secs(record: &octos_core::ui_protocol::UiLoopRecord) -> Option<u64> {
+    millis_until(record.next_run_at_ms).map(|ms| ms / 1000)
+}
+
+/// Seconds until the loop expires on its own.
+fn loop_expiry_secs(record: &octos_core::ui_protocol::UiLoopRecord) -> Option<u64> {
+    millis_until(Some(record.expires_at_ms)).map(|ms| ms / 1000)
+}
+
+/// The live detail suffix for a loop chip (spec task-loop-liveness-indicator):
+/// ` · 第 N 轮 · 下次 2m 14s · 剩 3h 0m`. Every segment is derived from real
+/// record data and omitted when that data is absent — no invented progress.
+fn autonomy_loop_detail(app: &AppState, record: &octos_core::ui_protocol::UiLoopRecord) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let fires = app
+        .loop_fire_counts
+        .get(&(record.session_id.clone(), record.loop_id.clone()))
+        .copied()
+        .unwrap_or(0);
+    if fires > 0 {
+        parts.push(t!("app.autonomy.loop_iteration", count = fires).into_owned());
+    }
+    if autonomy_loop_is_active(record) {
+        match loop_next_run_secs(record) {
+            Some(secs) => parts.push(
+                t!(
+                    "app.autonomy.loop_next_run",
+                    remaining = format_loop_duration(secs)
+                )
+                .into_owned(),
+            ),
+            None => parts.push(t!("app.autonomy.loop_next_run_pending").into_owned()),
+        }
+    }
+    if let Some(secs) = loop_expiry_secs(record) {
+        parts.push(
+            t!(
+                "app.autonomy.loop_expires_in",
+                remaining = format_loop_duration(secs)
+            )
+            .into_owned(),
+        );
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+/// Shortest next-run countdown across the active session's active loops,
+/// pre-formatted for the status bar chip. `None` when no active loop has a
+/// scheduled next run (a self-paced loop mid-turn).
+pub(crate) fn active_loop_countdown(app: &AppState) -> Option<String> {
+    active_session_autonomy(app)?
+        .loops
+        .iter()
+        .filter(|record| autonomy_loop_is_active(record))
+        .filter_map(loop_next_run_secs)
+        .min()
+        .map(format_loop_duration)
+}
+
+/// Whether this turn was started by a loop firing, so its activity group can
+/// carry the `↻` attribution prefix (spec task-loop-liveness-indicator).
+pub(crate) fn turn_is_loop_attributed(
+    app: &AppState,
+    session_id: &SessionKey,
+    turn_id: &octos_core::ui_protocol::TurnId,
+) -> bool {
+    app.loop_attributed_turns
+        .contains(&(session_id.clone(), turn_id.clone()))
+}
+
 /// True when a loop is in the runnable `"active"` state. Paused / deleted
 /// loops still appear in the chip row but are dimmed.
 fn autonomy_loop_is_active(record: &octos_core::ui_protocol::UiLoopRecord) -> bool {
@@ -3572,7 +3692,16 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
             .count();
         let paused = state.loops.iter().filter(|l| l.status == "paused").count();
         spans.push(Span::styled(
-            "↻ ",
+            // Slow rotation (spec task-loop-liveness-indicator): a permanently
+            // visible row must read as alive without becoming noise.
+            format!(
+                "{} ",
+                if running > 0 {
+                    loop_spinner_frame()
+                } else {
+                    "↻"
+                }
+            ),
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD)
@@ -3590,7 +3719,12 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
         for record in &state.loops {
             let label = autonomy_loop_label(record);
             let cadence = autonomy_loop_cadence(record);
-            let chip = format!("[{cadence} {label}]");
+            let detail = autonomy_loop_detail(app, record);
+            let chip = if detail.is_empty() {
+                format!("[{cadence} {label}]")
+            } else {
+                format!("[{cadence}{detail} {label}]")
+            };
             let chip_style = if autonomy_loop_is_active(record) {
                 palette.text().bg(palette.surface)
             } else {

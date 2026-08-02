@@ -7483,6 +7483,129 @@ mod tests {
         );
     }
 
+    fn loop_record(
+        loop_id: &str,
+        next_in_secs: i64,
+        expires_in_secs: i64,
+    ) -> octos_core::ui_protocol::UiLoopRecord {
+        let now = chrono::Utc::now().timestamp_millis();
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("kimi".into()),
+            prompt: "请你完成这本书".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: Some(now + next_in_secs * 1000),
+            last_run_at_ms: None,
+            expires_at_ms: now + expires_in_secs * 1000,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    fn app_with_active_loop() -> AppState {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("kimi".into()),
+                messages: vec![Message::user("write the book")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.upsert_session_loop(
+            &SessionKey("local:test".into()),
+            loop_record("loop-1", 134, 3 * 3600),
+        );
+        app
+    }
+
+    #[test]
+    fn loop_row_shows_countdown_iteration_and_expiry() {
+        // Spec task-loop-liveness-indicator: the loop row was static text —
+        // no countdown, no iteration, no expiry — so a running loop looked
+        // identical to a dead one.
+        let mut app = app_with_active_loop();
+        app.loop_fire_counts
+            .insert((SessionKey("local:test".into()), "loop-1".to_string()), 7);
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("7"), "iteration count present: {text}");
+        assert!(
+            text.contains("2m 14s") || text.contains("2m 13s"),
+            "next-run countdown present: {text}"
+        );
+        assert!(text.contains("2h 59m"), "expiry remaining present: {text}");
+    }
+
+    #[test]
+    fn loop_spinner_advances_slower_than_the_turn_spinner() {
+        // A permanently visible row must not spin at the turn spinner's
+        // 160ms cadence — that reads as noise, not liveness.
+        assert!(
+            crate::app::loop_spinner_period_ms() >= 3 * crate::app::turn_spinner_period_ms(),
+            "loop spinner must be at least 3x slower than the turn spinner"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_compact_loop_chip_with_countdown() {
+        let app = app_with_active_loop();
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("loop"),
+            "status bar keeps a loop chip: {text}"
+        );
+        assert!(
+            text.contains("2m 14s") || text.contains("2m 13s"),
+            "chip carries the countdown: {text}"
+        );
+        assert!(
+            !text.contains("/loop pause to stop"),
+            "the verbose static hint is replaced: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_triggered_turn_group_carries_attribution_prefix() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        app.loop_attributed_turns
+            .insert((session_id.clone(), turn_id.clone()));
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("↻"),
+            "loop-triggered turn group is attributed: {text}"
+        );
+    }
+
+    #[test]
+    fn manual_turn_group_has_no_attribution_prefix() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let app = capsule_app(&session_id, &turn_id);
+
+        let text = rendered_text(&app);
+
+        assert!(
+            !text.contains("↻"),
+            "a manual turn must not be attributed to a loop: {text}"
+        );
+    }
+
     #[test]
     fn status_bar_shows_quota_state_after_quota_terminal() {
         // Spec task-quota-exhausted-card: quota exhaustion is a distinct
@@ -9749,8 +9872,10 @@ mod tests {
         assert!(text.contains("Goal:"));
         assert!(text.contains("finish OAuth refactor"));
         assert!(text.contains("Loops: 2 active"));
-        assert!(text.contains("5m deploy-check"));
-        assert!(text.contains("self-paced PR-watch"));
+        // Loop chips now carry a live detail segment between cadence and
+        // label (spec task-loop-liveness-indicator), so assert on the parts.
+        assert!(text.contains("5m") && text.contains("deploy-check"));
+        assert!(text.contains("self-paced") && text.contains("PR-watch"));
     }
 
     #[test]

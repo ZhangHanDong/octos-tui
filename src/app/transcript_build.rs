@@ -2705,6 +2705,7 @@ pub(super) fn push_activity_section_with_finalization(
                     app.expanded_tool_outputs,
                     true,
                     false,
+                    last_turn.is_some_and(|turn| loop_attributed_turn_in_any_session(app, turn)),
                     wrap_width,
                 );
                 group.clear();
@@ -2726,6 +2727,7 @@ pub(super) fn push_activity_section_with_finalization(
             app.expanded_tool_outputs,
             true,
             false,
+            last_turn.is_some_and(|turn| loop_attributed_turn_in_any_session(app, turn)),
             wrap_width,
         );
     }
@@ -2825,6 +2827,7 @@ pub(super) fn push_turn_activity_log_section(
             app.expanded_tool_outputs,
             collapse_settled,
             false,
+            loop_attributed_turn_in_any_session(app, &log.turn_id),
             wrap_width,
         );
         if full.len() > shown.len() {
@@ -2965,6 +2968,7 @@ pub(super) fn push_finalized_activity_items_section(
         // Scrollback flush path: the archive never collapses.
         false,
         continuation,
+        turn_id.is_some_and(|turn| loop_attributed_turn_in_any_session(app, turn)),
         wrap_width,
     );
 }
@@ -2995,6 +2999,9 @@ pub(super) fn push_agent_task_group(
     // second header. `first`-child connectors are suppressed too: the `⎿`
     // elbow belongs to the header line these rows attach under.
     append_children_only: bool,
+    // This turn was started by a loop firing (spec
+    // task-loop-liveness-indicator) — render the `↻` attribution prefix.
+    loop_attributed: bool,
     wrap_width: usize,
 ) {
     let active_subagents = subagent_titles.len();
@@ -3049,12 +3056,19 @@ pub(super) fn push_agent_task_group(
     // a settled chip keeps the static bullet. Both are 1 col wide so the title
     // stays aligned whether running or done.
     let icon = if in_progress { spinner_frame() } else { "•" };
+    // Loop attribution (spec task-loop-liveness-indicator): a turn started by
+    // a loop firing is marked so unattended runs are distinguishable from the
+    // operator's own prompts.
+    let loop_prefix = if loop_attributed { "↻ " } else { "" };
     // Role-contrast: runtime/tool activity is the LOW tier of the transcript's
     // visual hierarchy — muted header (bold kept for grouping), status icons
     // keep their state colors (spinner/✓/✗ carry information).
     let spans = vec![
         Span::styled(format!("{icon} "), palette.selected()),
-        Span::styled(title, palette.muted().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{loop_prefix}{title}"),
+            palette.muted().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
     lines.push(Line::from(spans));
@@ -3098,6 +3112,18 @@ pub(super) fn push_agent_task_group(
         );
         lines.push(Line::from(spans));
     }
+}
+
+/// Whether ANY session attributes this turn to a loop fire. The group
+/// renderer has no session id in scope; turn ids are unique, so matching on
+/// the turn alone is exact (spec task-loop-liveness-indicator).
+fn loop_attributed_turn_in_any_session(
+    app: &AppState,
+    turn_id: &octos_core::ui_protocol::TurnId,
+) -> bool {
+    app.loop_attributed_turns
+        .iter()
+        .any(|(_, attributed)| attributed == turn_id)
 }
 
 /// A tool row with no invocation text — the only kind that may run-length
