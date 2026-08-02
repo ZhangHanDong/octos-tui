@@ -4067,6 +4067,9 @@ fn catalog_choice_rank(choice: &CatalogChoice) -> (u8, String) {
     let route_id = choice.selection.route.route_id.as_str();
     let family = choice.selection.family_id.as_str();
     let score = match (family, route_id) {
+        // Kimi Code subscription route (k3 / kimi-for-coding) ties with the
+        // AutoDL kimi proxy at the top of the picker.
+        ("moonshot", "kimi-code") => 0,
         ("moonshot", "autodl") => 0,
         ("minimax", "wisemodel") => 1,
         ("deepseek", "autodl") => 2,

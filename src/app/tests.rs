@@ -3147,6 +3147,40 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_wraps_instead_of_clipping_on_narrow_terminals() {
+        // Screenshot bug (2026-08-02): the bottom status bar was a fixed
+        // one-row Paragraph, so on narrow terminals the tail — often the key
+        // hints — silently clipped off the right edge. It must word-wrap into
+        // extra reserved rows instead (capped so it can never eat the screen).
+        let app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("a-rather-long-profile-name".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "Configured providers refreshed: none".into(),
+            None,
+            false,
+        );
+
+        let narrow = crate::app::render::status_bar_height(&app, 60);
+        assert!(
+            narrow > 1,
+            "a status line wider than 60 cols must reserve extra rows"
+        );
+        assert!(narrow <= 3, "wrap growth is capped at 3 rows");
+        assert_eq!(
+            crate::app::render::status_bar_height(&app, 600),
+            1,
+            "a wide terminal keeps the single-row bar"
+        );
+    }
+
+    #[test]
     fn render_status_uses_static_idle_label_without_spinner() {
         let app = AppState::new(
             vec![SessionView {
@@ -7402,6 +7436,183 @@ mod tests {
     }
 
     #[test]
+    fn running_subagent_row_shows_elapsed_time() {
+        // Spec task-approval-ux-salience: "Orchestrating… Spawn" sat frozen
+        // for 5 minutes with zero feedback. The chip row must show the task
+        // is at least aging.
+        let turn_id = TurnId::new();
+        let task_id = TaskId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("write the book")],
+                tasks: vec![TaskView {
+                    id: task_id.clone(),
+                    title: "写第3章".into(),
+                    state: TaskRuntimeState::Running,
+                    runtime_detail: None,
+                    output_tail: String::new(),
+                    turn_id: Some(turn_id.clone()),
+                }],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        // The chip needs at least one activity item to render its group.
+        app.activity
+            .push(capsule_tool_item(&turn_id, "c1", "cargo build"));
+        app.task_first_seen.insert(
+            task_id,
+            std::time::Instant::now() - std::time::Duration::from_secs(272),
+        );
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("4m 32s"),
+            "sub-agent row carries elapsed time: {text}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_quota_state_after_quota_terminal() {
+        // Spec task-quota-exhausted-card: quota exhaustion is a distinct
+        // amber state, not the generic red Error.
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("kimi".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        app.run_state = SessionRunState::Error {
+            message: "quota".into(),
+        };
+        app.quota_exhausted = true;
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("Quota") || text.contains("额度"),
+            "state chip must read Quota, not generic Error: {text}"
+        );
+    }
+
+    #[test]
+    fn spawn_originated_approval_flips_state_to_waiting() {
+        // Spec task-approval-ux-salience regression pin: approvals arrive on
+        // the MASTER session (live log 2026-08-02:
+        // session_id=kimi:local:tui#coding), so a visible approval during an
+        // in-progress turn must show Waiting, never Working.
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "working".into(),
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        app.approval = Some(ApprovalModalState {
+            session_id: SessionKey("local:test".into()),
+            approval_id: ApprovalId::new(),
+            turn_id,
+            tool_name: "bash".into(),
+            title: "Run build".into(),
+            body: "approve?".into(),
+            approval_kind: Some("command".into()),
+            risk: None,
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("Waiting"),
+            "a visible approval for the active session must show Waiting: {text}"
+        );
+    }
+
+    #[test]
+    fn approval_card_renders_bordered_with_risk_chip() {
+        // Spec task-approval-ux-salience: the old card was loose muted text
+        // that blended into the stream ("授权 ui 做的很不好"). It must render
+        // as a bordered card with an explicit risk chip.
+        let turn_id = TurnId::new();
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("run the thing")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: "working".into(),
+                }),
+            }],
+            0,
+            "Working".into(),
+            None,
+            false,
+        );
+        app.approval = Some(ApprovalModalState {
+            session_id: SessionKey("local:test".into()),
+            approval_id: ApprovalId::new(),
+            turn_id,
+            tool_name: "shell".into(),
+            title: "Delete the database".into(),
+            body: "approve?".into(),
+            approval_kind: Some("command".into()),
+            risk: Some("high".into()),
+            typed_details: None,
+            render_hints: None,
+            visible: true,
+        });
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("┌"), "card has a top border: {text}");
+        assert!(text.contains("└"), "card has a bottom border: {text}");
+        assert!(
+            text.contains("risk: high") || text.contains("风险: high"),
+            "risk renders as an explicit chip: {text}"
+        );
+        assert!(
+            text.contains("Approval Requested"),
+            "title survives the restyle: {text}"
+        );
+    }
+
+    #[test]
     fn pending_decision_card_stays_visible_when_the_live_tail_overflows() {
         // The reported trap: a turn parked on an approval streams a wall of output
         // that pushes the (top-rendered) card off the height-clipped live tail, so
@@ -7442,8 +7653,11 @@ mod tests {
             visible: true,
         });
 
-        // A short viewport forces the live tail to clip.
-        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 120, 16);
+        // A short viewport forces the live tail to clip. (18 rows: +1 for the
+        // wrapped status bar at 120 cols, +1 for the bordered approval card's
+        // bottom cap — the card-survival property needs the same net tail
+        // budget as the original 16-row fixture.)
+        let buffer = rendered_buffer_with_size(&app, Palette::for_theme(ThemeName::Slate), 120, 18);
         let rows = rendered_rows(&buffer);
         let screen = rows.join("\n");
 
@@ -10009,8 +10223,12 @@ mod tests {
 
         let layout = chat_layout_areas(&app, area);
 
-        assert_eq!(layout.status.y, area.y + area.height - 1);
-        assert_eq!(layout.status.height, 1);
+        // The status bar word-wraps on narrow terminals (2026-08-02), so its
+        // height is measured, not fixed — the invariants are that it hugs the
+        // bottom edge and the composer sits directly above it.
+        let status_height = crate::app::render::status_bar_height(&app, area.width);
+        assert_eq!(layout.status.y, area.y + area.height - status_height);
+        assert_eq!(layout.status.height, status_height);
         assert_eq!(
             layout.composer.y + layout.composer.height,
             layout.status.y,
@@ -10030,6 +10248,10 @@ mod tests {
 
         let layout = chat_layout_areas(&app, area);
 
+        // The wrapped status bar takes its extra rows from the transcript's
+        // slack above `Min(8)` at this geometry, so the menu clamp is
+        // unchanged; the bottom-anchoring below tracks the measured height.
+        let status_height = crate::app::render::status_bar_height(&app, area.width);
         assert_eq!(
             layout.menu.height, 4,
             "large menus are clamped by the available surface budget"
@@ -10038,7 +10260,7 @@ mod tests {
             layout.transcript.height >= min_transcript_height(area.height),
             "menu must not steal the transcript's minimum height"
         );
-        assert_eq!(layout.status.y, area.y + area.height - 1);
+        assert_eq!(layout.status.y, area.y + area.height - status_height);
         assert_eq!(layout.composer.y + layout.composer.height, layout.status.y);
     }
 
@@ -11114,6 +11336,7 @@ mod tests {
             100,
             &previous,
             &next,
+            false,
         ));
         let body = rendered
             .iter()
@@ -11491,6 +11714,7 @@ mod tests {
             wrap_width,
             &mid,
             &next,
+            false,
         );
         let texts = line_texts(&second_batch);
         assert!(
@@ -11514,6 +11738,253 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn capsule_tool_item(turn_id: &TurnId, call_id: &str, command: &str) -> ActivityItem {
+        ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_turn(turn_id.clone())
+            .with_tool_call(call_id)
+            .with_detail(command)
+            .with_success(true)
+    }
+
+    fn capsule_app(session_id: &SessionKey, turn_id: &TurnId) -> AppState {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::user("explore the repo")],
+                tasks: vec![],
+                live_reply: Some(crate::model::LiveReply {
+                    turn_id: turn_id.clone(),
+                    text: String::new(),
+                }),
+            }],
+            0,
+            "Thinking".into(),
+            None,
+            false,
+        );
+        app.set_run_state_in_progress();
+        // The delta-flush lane reads the LIVE activity list, not the archived
+        // turn logs.
+        app.activity
+            .push(capsule_tool_item(turn_id, "call-1", "cargo build"));
+        app
+    }
+
+    fn bare_tool_item(turn_id: &TurnId, call_id: &str) -> ActivityItem {
+        ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+            .with_turn(turn_id.clone())
+            .with_tool_call(call_id)
+            .with_success(true)
+    }
+
+    #[test]
+    fn consecutive_bare_tool_rows_merge_into_one_run_length_line() {
+        // Spec task-activity-compact-fold: five argument-less Bash rows are
+        // one "⏺ Bash ×5" line, not five identical lines.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        app.activity.clear();
+        for id in ["c1", "c2", "c3", "c4", "c5"] {
+            app.activity.push(bare_tool_item(&turn_id, id));
+        }
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("×5"), "run-length merged row: {text}");
+        assert_eq!(
+            text.matches("⏺ Bash").count(),
+            1,
+            "exactly one merged Bash row: {text}"
+        );
+    }
+
+    #[test]
+    fn harness_row_summarizes_live_action_count() {
+        // Spec task-activity-compact-fold: the harness row carries a live
+        // action count so a silent agentic turn still shows a pulse.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        for id in ["c2", "c3", "c4"] {
+            app.activity.push(bare_tool_item(&turn_id, id));
+        }
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("4 actions") || text.contains("4 个动作"),
+            "harness row carries the running action count: {text}"
+        );
+    }
+
+    #[test]
+    fn folded_activity_renders_prominent_more_row_with_expand_hint() {
+        // Spec task-activity-compact-fold: the fold row must read as an
+        // affordance (◈ + Ctrl+O hint), not a dim afterthought.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        app.activity.clear();
+        for i in 0..15 {
+            app.activity
+                .push(capsule_tool_item(&turn_id, &format!("c{i}"), &format!("cmd-{i}")));
+        }
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("◈"), "fold row uses the ◈ glyph: {text}");
+        assert!(text.contains("more") || text.contains("还有"), "fold row counts the rest: {text}");
+        assert!(text.contains("Ctrl+O"), "fold row advertises expand: {text}");
+    }
+
+    #[test]
+    fn rows_with_invocations_never_merge() {
+        // The command IS the information — rows with invocation text always
+        // render individually.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        app.activity.clear();
+        app.activity
+            .push(capsule_tool_item(&turn_id, "c1", "cargo build"));
+        app.activity
+            .push(capsule_tool_item(&turn_id, "c2", "cargo test"));
+
+        let text = rendered_text(&app);
+
+        assert!(text.contains("cargo build") && text.contains("cargo test"));
+        assert!(!text.contains("×2"), "distinct invocations stay separate: {text}");
+    }
+
+    /// Capsule flush (2026-08-02, kimi k3): an agentic turn settles tools in
+    /// many small batches, and each delta flush used to write a FULL group
+    /// block — blank + "Agent task completed (1 action(s) …)" header + child —
+    /// so one 19-action turn spammed ~16 headers into scrollback. When the
+    /// scrollback tail is already this turn's activity group, a continuation
+    /// batch must append ONLY child rows under the existing header.
+    #[test]
+    fn same_turn_activity_delta_appends_children_without_repeating_the_header() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        let palette = Palette::for_theme(ThemeName::Slate);
+
+        let baseline = LiveTurnFinalization::new(&session_id, &turn_id);
+        let first = next_live_turn_finalization(&app, None).expect("first watermark");
+        let batch1 = line_texts(&finalized_live_turn_lines_between(
+            &app, palette, 100, &baseline, &first, false,
+        ));
+        assert!(
+            batch1.iter().any(|line| line.contains("Agent task completed")),
+            "first flush opens the group with its header: {batch1:#?}"
+        );
+
+        app.activity
+            .push(capsule_tool_item(&turn_id, "call-2", "cargo test"));
+        let second = next_live_turn_finalization(&app, Some(&first)).expect("second watermark");
+        let batch2 = line_texts(&finalized_live_turn_lines_between(
+            &app, palette, 100, &first, &second, true,
+        ));
+
+        assert!(
+            !batch2.iter().any(|line| line.contains("Agent task completed")),
+            "continuation flush must not repeat the group header: {batch2:#?}"
+        );
+        assert!(
+            batch2.iter().any(|line| line.contains("cargo test")),
+            "continuation flush still records the new child: {batch2:#?}"
+        );
+        assert!(
+            batch2.first().is_some_and(|line| !line.trim().is_empty()),
+            "continuation rows attach to the group above — no blank gap: {batch2:#?}"
+        );
+    }
+
+    #[test]
+    fn continuation_batch_of_bare_successes_flushes_as_one_digest_line() {
+        // Spec task-activity-compact-fold: >=3 settled, successful,
+        // invocation-less rows in one continuation batch compress to a single
+        // `⏺ Bash ×4` digest line in the immutable scrollback.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let first = next_live_turn_finalization(&app, None).expect("first watermark");
+
+        for id in ["c2", "c3", "c4", "c5"] {
+            app.activity.push(bare_tool_item(&turn_id, id));
+        }
+        let second = next_live_turn_finalization(&app, Some(&first)).expect("second watermark");
+        let batch = line_texts(&finalized_live_turn_lines_between(
+            &app, palette, 100, &first, &second, true,
+        ));
+
+        assert_eq!(
+            batch.len(),
+            1,
+            "4 bare successes flush as ONE digest row: {batch:#?}"
+        );
+        assert!(batch[0].contains("Bash ×4"), "digest names the tools: {batch:#?}");
+    }
+
+    #[test]
+    fn continuation_batch_with_a_failure_keeps_per_row_detail() {
+        // Any failure forbids the digest — the immutable archive is the
+        // audit trail.
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        let palette = Palette::for_theme(ThemeName::Slate);
+        let first = next_live_turn_finalization(&app, None).expect("first watermark");
+
+        for id in ["c2", "c3"] {
+            app.activity.push(bare_tool_item(&turn_id, id));
+        }
+        app.activity.push(
+            ActivityItem::new(ActivityKind::Tool, "shell", "complete")
+                .with_turn(turn_id.clone())
+                .with_tool_call("c4")
+                .with_success(false),
+        );
+        let second = next_live_turn_finalization(&app, Some(&first)).expect("second watermark");
+        let batch = line_texts(&finalized_live_turn_lines_between(
+            &app, palette, 100, &first, &second, true,
+        ));
+
+        assert!(
+            batch.len() >= 2,
+            "a failed row forbids the digest — detail survives: {batch:#?}"
+        );
+    }
+
+    /// When something else reached scrollback since the group header (reply
+    /// text, a committed message — signalled by `append_to_flushed_group =
+    /// false`), the next activity batch re-opens with a fresh header so child
+    /// rows are never orphaned under unrelated content.
+    #[test]
+    fn interleaved_scrollback_content_forces_a_fresh_group_header() {
+        let turn_id = TurnId::new();
+        let session_id = SessionKey("local:test".into());
+        let mut app = capsule_app(&session_id, &turn_id);
+        let palette = Palette::for_theme(ThemeName::Slate);
+
+        let first = next_live_turn_finalization(&app, None).expect("first watermark");
+        app.activity
+            .push(capsule_tool_item(&turn_id, "call-2", "cargo test"));
+        let second = next_live_turn_finalization(&app, Some(&first)).expect("second watermark");
+        let batch2 = line_texts(&finalized_live_turn_lines_between(
+            &app, palette, 100, &first, &second, false,
+        ));
+
+        assert!(
+            batch2.iter().any(|line| line.contains("Agent task completed")),
+            "non-contiguous continuation re-opens with a header: {batch2:#?}"
+        );
     }
 
     /// Regression guard: the other roles keep their own prefix systems — no
@@ -11671,16 +12142,27 @@ mod tests {
             .enumerate()
             .filter_map(|(idx, text)| text.contains("Agent task completed").then_some(idx))
             .collect::<Vec<_>>();
+        // Capsule contract (2026-08-02): same-turn settle batches share ONE
+        // header; the second batch appends its child row directly under the
+        // first card instead of opening a blank-separated sibling card.
         assert_eq!(
             cards.len(),
-            2,
-            "both completions flush as their own scrollback card: {texts:#?}"
+            1,
+            "same-turn completions share one scrollback card: {texts:#?}"
         );
         assert!(
-            texts[cards[0] + 1..cards[1]]
+            texts.iter().any(|text| text.contains("first task")),
+            "first child recorded: {texts:#?}"
+        );
+        let second_child = texts
+            .iter()
+            .position(|text| text.contains("second task"))
+            .expect("second child recorded");
+        assert!(
+            texts[cards[0] + 1..second_child]
                 .iter()
-                .any(|text| text.trim().is_empty()),
-            "consecutive scrollback agent-task cards must be blank-separated: {texts:#?}"
+                .all(|text| !text.trim().is_empty()),
+            "continuation children attach without a blank gap: {texts:#?}"
         );
     }
 
@@ -11720,6 +12202,7 @@ mod tests {
             80,
             &previous,
             &fence,
+            false,
         );
         streamed.extend(finalized_live_turn_lines_between(
             &app,
@@ -11727,6 +12210,7 @@ mod tests {
             80,
             &fence,
             &next,
+            false,
         ));
 
         let rendered = streamed

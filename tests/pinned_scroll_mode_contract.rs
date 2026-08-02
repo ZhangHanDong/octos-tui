@@ -170,8 +170,11 @@ fn pinned_mode_wheel_up_enters_pager() {
         .iter()
         .position(|row| row.contains("Composer"))
         .expect("composer rendered");
+    // Margin allows for the word-wrapped status bar (2026-08-02): at 60 cols
+    // the status line takes up to 3 rows, lifting the composer accordingly —
+    // it still sits directly above the status region.
     assert!(
-        composer_row >= rows.len() - 6,
+        composer_row >= rows.len() - 8,
         "composer must sit in the bottom rows, found at row {composer_row}"
     );
 }

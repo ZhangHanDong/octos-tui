@@ -620,6 +620,7 @@ fn chat_layout_areas_for_menu(
     let harness_height = harness_status_height(app);
     let decision_height = decision_banner_height(app);
     let agent_strip_height = agent_strip_height(app, area.height);
+    let status_height = render::status_bar_height(app, area.width);
     let surface_budget = area.height.saturating_sub(
         min_transcript_height(area.height)
             + session_strip_height
@@ -628,7 +629,7 @@ fn chat_layout_areas_for_menu(
             + harness_height
             + decision_height
             + agent_strip_height
-            + 1,
+            + status_height,
     );
     let menu_height = desired_menu_height.min(surface_budget);
     let root = Layout::default()
@@ -642,7 +643,7 @@ fn chat_layout_areas_for_menu(
             Constraint::Length(decision_height),
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(area);
 
@@ -3016,7 +3017,18 @@ fn running_subagent_titles_for_chip(
             Some(task_turn) => task_turn == chip_turn,
             None => owns_unattributed,
         })
-        .map(|task| task.title.clone())
+        .map(|task| {
+            // Elapsed suffix (spec task-approval-ux-salience): the chip row
+            // must show a long-running sub-agent is aging, not frozen. The
+            // live chip repaints on the animation cadence, so this refreshes
+            // for free while the turn is active.
+            let elapsed = app
+                .task_first_seen
+                .get(&task.id)
+                .map(|seen| format!(" · {}", format_elapsed_secs(seen.elapsed().as_secs())))
+                .unwrap_or_default();
+            format!("{}{elapsed}", task.title)
+        })
         .collect()
 }
 
@@ -4545,6 +4557,17 @@ fn harness_status_lines(
         &stops,
         palette.surface,
     ));
+
+    // Live action count (spec task-activity-compact-fold): a silent agentic
+    // turn (zero interleaved text) still shows a pulse here. Independent of
+    // the orchestration status block below.
+    let action_count = flow_activity_items(app).len();
+    if action_count > 0 {
+        spans.push(Span::styled(
+            format!(" · {}", t!("app.statusbar.actions", count = action_count)),
+            palette.muted().bg(palette.surface),
+        ));
+    }
 
     if let Some(status) = status {
         if status.running_agents > 0 {

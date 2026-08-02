@@ -4468,6 +4468,24 @@ pub struct AppState {
     /// Pending Vim multi-key prefix in Normal mode (`g`/`d`/`c`), resolved or
     /// cleared by the next key. `None` when no sequence is in progress.
     pub composer_vim_pending: Option<char>,
+    /// Armed by an idle Ctrl+C (nothing to interrupt); the next consecutive
+    /// Ctrl+C quits the TUI. Any other key press disarms. Escape hatch for
+    /// surfaces that eat plain keys (onboarding wizard, menus), where `q` and
+    /// `/exit` type into a filter instead of quitting.
+    pub ctrl_c_quit_armed: bool,
+    /// Armed when an approval or AskUserQuestion ARRIVES (live server event);
+    /// the event loop drains it by writing BEL to the terminal exactly once.
+    /// Store stays I/O-free — same pattern as the pending-clipboard flush.
+    pub pending_decision_bell: bool,
+    /// Client-side first-seen clock per task id, for the sub-agent chip's
+    /// elapsed display (server events carry no wall-clock the TUI can trust
+    /// across hosts — same rationale as `PeerMeta.created`). Populated when a
+    /// task first shows up pending/running.
+    pub task_first_seen: std::collections::HashMap<TaskId, std::time::Instant>,
+    /// The last turn terminal was quota exhaustion (spec
+    /// task-quota-exhausted-card): the status bar shows an amber Quota state
+    /// instead of the generic red Error. Cleared when the next turn starts.
+    pub quota_exhausted: bool,
     /// Path of the `--config` file this session launched from, retained so
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
@@ -6549,6 +6567,10 @@ impl AppState {
             steer_mid_turn: false,
             composer_mode: ComposerMode::Insert,
             composer_vim_pending: None,
+            ctrl_c_quit_armed: false,
+            pending_decision_bell: false,
+            task_first_seen: std::collections::HashMap::new(),
+            quota_exhausted: false,
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,
@@ -8869,6 +8891,9 @@ impl AppState {
         if !self.run_state.is_active() {
             self.run_state_started_at = Some(Instant::now());
         }
+        // A new turn supersedes the quota terminal (spec
+        // task-quota-exhausted-card).
+        self.quota_exhausted = false;
         self.run_state = SessionRunState::InProgress;
     }
 

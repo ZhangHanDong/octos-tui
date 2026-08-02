@@ -85,10 +85,11 @@ pub fn render_viewport_with_finalization(
     // (originally composer+status only) let a tall slash menu overcommit the
     // layout, so Ratatui compressed a fixed row — the tail floor included, since
     // `Min(1)` yields before a `Length` when space is short.
+    let status_height = status_bar_height(app, area.width);
     let menu_available = area.height.saturating_sub(
         1 // Min(1) live-tail floor
             + composer_height
-            + 1 // status
+            + status_height
             + autonomy_height
             + harness_height
             + decision_height
@@ -108,7 +109,7 @@ pub fn render_viewport_with_finalization(
             Constraint::Length(composer_height),
             Constraint::Length(agent_strip_height),
             Constraint::Length(peer_strip_height),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(area);
 
@@ -476,12 +477,13 @@ pub(super) fn render_onboarding_first_launch_layout(
     palette: Palette,
 ) {
     let composer_height = composer_height_for_size(app, frame.area().width, frame.area().height);
+    let status_height = status_bar_height(app, frame.area().width);
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(8),
             Constraint::Length(composer_height),
-            Constraint::Length(1),
+            Constraint::Length(status_height),
         ])
         .split(frame.area());
 
@@ -1818,6 +1820,16 @@ pub(super) fn render_composer(app: &AppState, palette: Palette, area: Rect) -> P
         .block(block)
 }
 
+/// Rows the bottom status bar needs at `width`. The bar word-wraps instead of
+/// clipping (the tail — usually the key hints — used to silently vanish on
+/// narrow terminals), capped at 3 rows so a pathological status can never eat
+/// the viewport. Styling does not affect wrap width, so the app's current
+/// theme palette is fine for measurement.
+pub(super) fn status_bar_height(app: &AppState, width: u16) -> u16 {
+    let palette = Palette::for_theme(app.theme);
+    (render_status(app, palette).line_count(width.max(1)) as u16).clamp(1, 3)
+}
+
 pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'static> {
     let profile = app
         .active_session()
@@ -1891,6 +1903,16 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
             t!("app.status.thinking").to_string(),
             run_state_style(&app.run_state, palette),
         )
+    } else if matches!(app.run_state, SessionRunState::Error { .. }) && app.quota_exhausted {
+        // Quota exhaustion is an expected resource state (spec
+        // task-quota-exhausted-card): amber, not the generic red Error.
+        (
+            "⏳".to_string(),
+            t!("app.status.quota").to_string(),
+            Style::default()
+                .fg(palette.highlight)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         (
             run_state_marker(&app.run_state).to_string(),
@@ -1931,6 +1953,7 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(key_hint, palette.selected().bg(palette.surface_alt)),
     ]))
+    .wrap(Wrap { trim: false })
     .style(Style::default().fg(palette.text).bg(palette.surface_alt))
 }
 

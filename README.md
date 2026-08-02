@@ -374,7 +374,8 @@ Alt+A      re-show the pending approval prompt
 [ / ]      select previous / next inline diff hunk
 c          stage the selected hunk as next-turn context
 Ctrl+U     clear the composer
-Ctrl+C     interrupt the active turn
+Ctrl+C     interrupt the active turn; with nothing to interrupt, press twice to quit
+Ctrl+Q     quit immediately, from any surface (incl. wizard/menus)
 Esc        with no active turn: cancel the first running background task
 q          quit
 ```

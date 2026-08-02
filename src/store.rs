@@ -340,6 +340,47 @@ impl SlashDispatchOutcome {
 /// until it is explicitly classified safe. Resolution is alias-aware, which is
 /// exactly what the earlier raw-token denylist missed (`/auth`=`/login`,
 /// `/setup`=`/onboard`).
+/// Parsed quota-exhaustion details (spec task-quota-exhausted-card).
+struct QuotaFailure {
+    /// `provider@route/model` chip parsed from the message's `(…)` segment.
+    provider_model: Option<String>,
+    /// First `http(s)://…` URL in the message (the provider's top-up link).
+    link: Option<String>,
+}
+
+/// Classify a turn failure as quota exhaustion: terminal code `rate_limited`
+/// or `quota`, or a message carrying "quota exhausted" (case-insensitive).
+/// Everything else keeps the legacy error rendering.
+fn classify_quota_failure(code: &str, message: &str) -> Option<QuotaFailure> {
+    let is_quota = matches!(code, "rate_limited" | "quota")
+        || message.to_lowercase().contains("quota exhausted");
+    if !is_quota {
+        return None;
+    }
+    let provider_model = message.split_once('(').and_then(|(_, rest)| {
+        let inner = rest.split_once(')')?.0;
+        // Only accept a provider-ish chip (has @ or /), never arbitrary text.
+        (inner.contains('@') || inner.contains('/')).then(|| inner.to_string())
+    });
+    let link = message
+        .find("http://")
+        .or_else(|| message.find("https://"))
+        .map(|start| {
+            message[start..]
+                .split(|ch: char| ch.is_whitespace() || ch == '"' || ch == '}' || ch == ')')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(['.', ','])
+                .to_string()
+        })
+        .filter(|url| !url.is_empty());
+    Some(QuotaFailure {
+        provider_model,
+        link,
+    })
+}
+
+
 fn should_record_in_history(prompt: &str) -> bool {
     if prompt.is_empty() || prompt.starts_with('!') {
         return false;
@@ -884,6 +925,9 @@ impl Store {
             }
             CommandResolution::Unknown { invocation } => {
                 self.show_unknown_slash_command(&format!("/{}", invocation.name), draft);
+                // Keep the draft: a typo ("/heelp") should be correctable in
+                // place, not silently discarded along with the warning.
+                self.state.set_composer_text(draft);
                 SlashDispatchOutcome::Rejected
             }
             CommandResolution::NotCommand => SlashDispatchOutcome::Rejected,
@@ -10125,6 +10169,17 @@ impl Store {
                     profile_id: event.profile_id,
                 })
             }
+            // Core 34d971d7: `peer/closed` decodes to this typed variant on
+            // newer cores. Route to the same handler the raw-frame intercept
+            // uses (mirror of the PeerStaged dual path above).
+            UiNotification::PeerClosed(event) => {
+                self.apply_peer_closed_event(crate::model::PeerClosedParams {
+                    session_id: event.session_id,
+                    topic: event.topic,
+                    slug: event.slug,
+                    profile_id: event.profile_id,
+                })
+            }
             UiNotification::SessionOpened(event) => {
                 let session_id = event.session_id.clone();
                 // Bug 2: a `session/opened` for a peer we JUST closed (its
@@ -10549,6 +10604,9 @@ impl Store {
                 let diff_preview_id = approval.diff_preview_id();
                 let diff_preview_turn_id = approval.turn_id.clone();
                 self.state.approval = Some(approval);
+                // Salience (spec task-approval-ux-salience): a live decision
+                // arrival rings the terminal bell once via the event loop.
+                self.state.pending_decision_bell = true;
                 self.state.focus = FocusPane::Composer;
                 self.state.set_run_state_blocked(title.clone());
                 self.state.status = t!("status.approval_requested", title = title).into_owned();
@@ -11680,6 +11738,8 @@ impl Store {
                         let error = error.unwrap_or_else(|| {
                             let (code, message) = if is_interrupted {
                                 ("interrupted", "Turn interrupted.")
+                            } else if outcome == TurnTerminalOutcome::RateLimited {
+                                ("rate_limited", "Provider rate limited the turn.")
                             } else {
                                 ("turn_errored", "Turn errored.")
                             };
@@ -11924,6 +11984,9 @@ impl Store {
         picker.visible = true;
         self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
+        // Salience (spec task-approval-ux-salience): a live decision arrival
+        // rings the terminal bell once via the event loop.
+        self.state.pending_decision_bell = true;
         // A mid-turn question must interrupt whatever the main pane is showing:
         // exit any sub-agent peek so the picker owns the screen and its keys
         // reach `handle_user_question_key`, not `handle_agent_peek_key`.
@@ -11986,6 +12049,17 @@ impl Store {
     }
 
     fn apply_task_update(&mut self, event: TaskUpdatedEvent) {
+        // First-seen clock for the sub-agent chip's elapsed display (spec
+        // task-approval-ux-salience). Recorded before the session borrow.
+        if matches!(
+            task_state_label(event.state),
+            "pending" | "running"
+        ) {
+            self.state
+                .task_first_seen
+                .entry(event.task_id.clone())
+                .or_insert_with(std::time::Instant::now);
+        }
         let Some(session) = self.find_session_mut(&event.session_id) else {
             return;
         };
@@ -12329,6 +12403,11 @@ impl Store {
     }
 
     fn fail_live_reply(&mut self, event: TurnErrorEvent) -> Option<AppUiCommand> {
+        // Spec task-quota-exhausted-card: mark quota terminals so the status
+        // bar renders the amber Quota state instead of the generic Error.
+        if classify_quota_failure(&event.code, &event.message).is_some() {
+            self.state.quota_exhausted = true;
+        }
         self.state.pre_token_turns.remove(&event.session_id);
         // The interrupt landed (this IS its terminal), so the withheld-output
         // flag has done its job — drop it so it can never outlive the turn. No
@@ -13237,6 +13316,19 @@ impl Store {
     }
 
     fn turn_error_fallback_message(&self, turn_id: &TurnId, code: &str, message: &str) -> String {
+        // Spec task-quota-exhausted-card: quota exhaustion is an expected
+        // resource state, not a crash — render the friendly card (provider
+        // chip + top-up link + next actions) instead of the raw error dump.
+        if let Some(quota) = classify_quota_failure(code, message) {
+            let provider = quota
+                .provider_model
+                .unwrap_or_else(|| t!("status.quota_card_provider_unknown").into_owned());
+            let link = quota
+                .link
+                .map(|url| format!("  {url}"))
+                .unwrap_or_default();
+            return t!("status.quota_card", provider = provider, link = link).into_owned();
+        }
         let summary = self.summarize_turn_activity(turn_id);
         let failed = format_limited_list(&summary.failures, &t!("status.summary_none_recorded"));
         t!(
@@ -25228,7 +25320,9 @@ now analyzing the bus module"
         let command = store.compose_command();
 
         assert!(command.is_none());
-        assert!(store.state.composer.is_empty());
+        // Draft-kept contract (2026-08-02): the typo stays in the composer for
+        // in-place correction instead of being discarded with the warning.
+        assert_eq!(store.state.composer, "/wat");
         assert!(store.state.pending_messages.is_empty());
         assert!(store.state.sessions[0].messages.is_empty());
         assert_eq!(
@@ -25238,6 +25332,95 @@ now analyzing the bus module"
         let activity = store.state.activity.last().expect("local warning activity");
         assert_eq!(activity.kind, ActivityKind::Warning);
         assert_eq!(activity.title, "local slash command");
+    }
+
+    #[test]
+    fn quota_error_renders_friendly_card_without_raw_json() {
+        // Spec task-quota-exhausted-card: quota exhaustion is an expected
+        // resource state, not a crash — no truncated raw JSON, and the card
+        // must carry the provider chip, the top-up link, and next actions.
+        let store = store_with_empty_session();
+        let text = store.turn_error_fallback_message(
+            &TurnId::new(),
+            "quota",
+            "Provider quota exhausted (moonshot@api/k3) — top up or switch provider \
+             (HTTP 403 - {\"error\":{\"message\":\"You've reached your usage limit for this \
+             billing cycle. To continue now, purchase extra usage or upgrade your plan: \
+             https://www.kimi.com/code/console\"}})",
+        );
+
+        assert!(text.contains("⏳"), "quota card glyph: {text}");
+        assert!(text.contains("moonshot@api/k3"), "provider chip: {text}");
+        assert!(
+            text.contains("https://www.kimi.com/code/console"),
+            "extracted top-up link: {text}"
+        );
+        assert!(text.contains("/model"), "switch-model action: {text}");
+        assert!(
+            !text.contains("HTTP 403") && !text.contains("{\"error\""),
+            "raw JSON tail must be dropped: {text}"
+        );
+    }
+
+    #[test]
+    fn rate_limited_code_renders_friendly_card() {
+        let store = store_with_empty_session();
+        let text = store.turn_error_fallback_message(
+            &TurnId::new(),
+            "rate_limited",
+            "Provider rate limited the turn.",
+        );
+        assert!(text.contains("⏳"), "rate_limited also gets the card: {text}");
+    }
+
+    #[test]
+    fn generic_error_keeps_legacy_summary() {
+        let store = store_with_empty_session();
+        let text = store.turn_error_fallback_message(
+            &TurnId::new(),
+            "runtime_error",
+            "something broke",
+        );
+        assert!(text.contains("Session Summary"), "legacy shape: {text}");
+        assert!(!text.contains("⏳"), "no quota card for generic errors: {text}");
+    }
+
+    #[test]
+    fn pathlike_slash_prompt_is_sent_as_plain_message_not_swallowed() {
+        // Observed live (2026-08-02): typing a filesystem path ("/Users/…")
+        // resolved as an unknown slash command and was swallowed — the user
+        // saw no reaction at all. A command token containing another '/' can
+        // never be a registered command name, so it is message text.
+        let mut store = store_with_empty_session();
+        store.state.composer = "/Users/zhangalex/Work/Projects 看看这个目录".into();
+
+        let command = store.compose_command();
+
+        assert!(
+            command.is_some(),
+            "a path-like draft must submit as a plain prompt"
+        );
+        assert!(store.state.composer.is_empty());
+        assert!(
+            !store.state.status.contains("Unknown slash"),
+            "no unknown-command warning for message text: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn unknown_slash_command_keeps_the_draft_for_correction() {
+        let mut store = store_with_empty_session();
+        store.state.composer = "/heelp".into();
+
+        let command = store.compose_command();
+
+        assert!(command.is_none());
+        assert_eq!(
+            store.state.composer, "/heelp",
+            "the typo draft must survive the warning so it can be corrected, not retyped"
+        );
+        assert!(store.state.status.contains("Unknown slash command"));
     }
 
     #[test]

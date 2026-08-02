@@ -101,7 +101,7 @@ fn closed_fence_flushes_as_complete_block() {
 
     let previous_empty = octoscode::app::LiveTurnFinalization::default();
     let lines =
-        finalized_live_turn_lines_between(&store.state, palette(), 80, &previous_empty, &next);
+        finalized_live_turn_lines_between(&store.state, palette(), 80, &previous_empty, &next, false);
     let rendered = lines_text(&lines);
     let opens = rendered.iter().filter(|l| l.contains("┌─")).count();
     let closes = rendered.iter().filter(|l| l.contains("└─")).count();
@@ -143,6 +143,7 @@ fn only_first_batch_carries_prose_marker() {
         80,
         &empty,
         &next,
+        false,
     ));
     assert!(
         first_batch.iter().any(|l| l.contains("• ")),
@@ -158,6 +159,7 @@ fn only_first_batch_carries_prose_marker() {
         80,
         &mid,
         &next,
+        false,
     ));
     assert!(
         !second_batch.iter().any(|l| l.contains("• ")),
@@ -219,6 +221,7 @@ fn code_fence_separator_survives_stream_and_commit_boundaries() {
         80,
         &LiveTurnFinalization::default(),
         &fence_coverage,
+        false,
     ));
     streamed.extend(lines_text(&finalized_live_turn_lines_between(
         &store.state,
@@ -226,6 +229,7 @@ fn code_fence_separator_survives_stream_and_commit_boundaries() {
         80,
         &fence_coverage,
         &next,
+        false,
     )));
     let close = streamed
         .iter()

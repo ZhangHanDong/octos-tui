@@ -249,6 +249,16 @@ pub fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        // Decision-arrival bell (spec task-approval-ux-salience): drained
+        // here so the store stays I/O-free. BEL is audible/visual per the
+        // user's terminal settings and harmless when bells are disabled.
+        if store.state.pending_decision_bell {
+            store.state.pending_decision_bell = false;
+            use std::io::Write as _;
+            let _ = write!(io::stdout(), "\x07");
+            let _ = io::stdout().flush();
+        }
+
         if flush_pending_clipboard(&mut store) {
             // The OSC 52 write does not touch the rendered frame, but staging it
             // changed status text; redraw so the status line reflects the copy.
@@ -760,8 +770,24 @@ pub(crate) fn handle_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         } else {
             store.interrupt_command()
         };
-        return command.map_or(KeyAction::Continue, KeyAction::send);
+        if let Some(command) = command {
+            store.state.ctrl_c_quit_armed = false;
+            return KeyAction::send(command);
+        }
+        // Nothing to interrupt. A silent no-op here left users trapped on
+        // surfaces that eat plain keys (onboarding wizard/menus, where `q` and
+        // `/exit` type into the filter) with kill -9 as the only exit. Double
+        // press quits; the first press says so in the status line.
+        if store.state.ctrl_c_quit_armed {
+            return KeyAction::Quit;
+        }
+        store.state.ctrl_c_quit_armed = true;
+        store.state.status = t!("status.ctrl_c_quit_hint").into_owned();
+        return KeyAction::Continue;
     }
+    // Any other key press means the user moved on — the next idle Ctrl+C
+    // hints again instead of quitting out from under them.
+    store.state.ctrl_c_quit_armed = false;
 
     // A live sub-agent peek OWNS the keyboard, exactly like a modal: routed here
     // — after the always-on quit/interrupt keys but BEFORE every composer /
@@ -3702,6 +3728,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decision_arrival_arms_the_terminal_bell() {
+        // Spec task-approval-ux-salience: an approval materialized after 5
+        // silent minutes with zero salience. Arrival must arm exactly one
+        // bell; unrelated events must not re-arm after the drain.
+        let (mut store, _approval_id) = store_with_visible_approval();
+        assert!(
+            store.state.pending_decision_bell,
+            "approval arrival must arm the bell"
+        );
+        store.state.pending_decision_bell = false;
+        store.state.status = "tick".into();
+        assert!(
+            !store.state.pending_decision_bell,
+            "unrelated state changes must not re-arm"
+        );
+
+        let (question_store, _question_id) = store_with_visible_user_question();
+        assert!(
+            question_store.state.pending_decision_bell,
+            "question arrival must arm the bell too"
+        );
+    }
+
     fn store_with_visible_approval() -> (Store, ApprovalId) {
         let mut store = store_with_sessions(1);
         let approval_id = ApprovalId::new();
@@ -3887,6 +3937,93 @@ mod tests {
         assert!(
             matches!(sent_command(action), AppUiCommand::InterruptTurn(_)),
             "Ctrl+C on a parked decision must interrupt, not no-op"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_with_nothing_to_interrupt_shows_quit_hint_not_silent_noop() {
+        // Trap seen live: gateway down → onboarding wizard up → no active turn,
+        // no pending decision. Ctrl+C used to return Continue with NO feedback,
+        // and with plain keys eaten by the wizard filter the only way out was
+        // the undocumented Ctrl+Q (or kill -9). First press must say how to quit.
+        let mut store = store_with_sessions(1);
+        assert!(store.state.active_turn().is_none());
+
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(matches!(action, KeyAction::Continue));
+        assert_ne!(
+            store.state.status, "ready",
+            "first idle Ctrl+C must surface a quit hint in the status line"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_double_press_quits_when_nothing_to_interrupt() {
+        let mut store = store_with_sessions(1);
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            matches!(action, KeyAction::Quit),
+            "second consecutive idle Ctrl+C must quit the TUI"
+        );
+    }
+
+    #[test]
+    fn any_other_key_disarms_the_pending_ctrl_c_quit() {
+        let mut store = store_with_sessions(1);
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        handle_key(&mut store, key(KeyCode::Char('x')));
+        let action = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "a key between the two Ctrl+C presses must re-arm instead of quitting"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_interrupt_of_a_live_turn_never_arms_the_quit() {
+        let turn_id = TurnId::new();
+        let mut store = store_with_sessions(1);
+        store.state.sessions[0].live_reply = Some(LiveReply {
+            turn_id: turn_id.clone(),
+            text: "streaming".into(),
+        });
+
+        let first = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(sent_command(first), AppUiCommand::InterruptTurn(_)));
+
+        // Turn still live (server hasn't confirmed the interrupt): a second
+        // Ctrl+C must interrupt again, not fall through to Quit.
+        let second = handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            matches!(sent_command(second), AppUiCommand::InterruptTurn(_)),
+            "Ctrl+C while a turn is live must keep interrupting, never quit"
         );
     }
 
@@ -5519,7 +5656,9 @@ mod tests {
             KeyAction::Continue
         ));
 
-        assert!(store.state.composer.is_empty());
+        // Draft-kept contract (2026-08-02): the typo stays in the composer for
+        // in-place correction instead of being discarded with the warning.
+        assert_eq!(store.state.composer, "/wat");
         assert!(store.state.sessions[0].messages.is_empty());
         assert_eq!(
             store.state.status,
