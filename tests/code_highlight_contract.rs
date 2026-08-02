@@ -163,7 +163,8 @@ fn streaming_flush_and_pager_highlight_consistently() {
 
     let next = next_live_turn_finalization(&store.state, None).expect("watermark");
     let empty = LiveTurnFinalization::default();
-    let streamed = finalized_live_turn_lines_between(&store.state, palette(), 100, &empty, &next, false);
+    let streamed =
+        finalized_live_turn_lines_between(&store.state, palette(), 100, &empty, &next, false);
 
     // Committed path: same content as a finished message.
     let committed = committed_lines(RUST_BLOCK);

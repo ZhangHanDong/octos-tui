@@ -4013,7 +4013,10 @@ mod tests {
             &mut store,
             modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
-        assert!(matches!(sent_command(first), AppUiCommand::InterruptTurn(_)));
+        assert!(matches!(
+            sent_command(first),
+            AppUiCommand::InterruptTurn(_)
+        ));
 
         // Turn still live (server hasn't confirmed the interrupt): a second
         // Ctrl+C must interrupt again, not fall through to Quit.

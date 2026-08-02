@@ -12051,10 +12051,7 @@ impl Store {
     fn apply_task_update(&mut self, event: TaskUpdatedEvent) {
         // First-seen clock for the sub-agent chip's elapsed display (spec
         // task-approval-ux-salience). Recorded before the session borrow.
-        if matches!(
-            task_state_label(event.state),
-            "pending" | "running"
-        ) {
+        if matches!(task_state_label(event.state), "pending" | "running") {
             self.state
                 .task_first_seen
                 .entry(event.task_id.clone())
@@ -13323,10 +13320,7 @@ impl Store {
             let provider = quota
                 .provider_model
                 .unwrap_or_else(|| t!("status.quota_card_provider_unknown").into_owned());
-            let link = quota
-                .link
-                .map(|url| format!("  {url}"))
-                .unwrap_or_default();
+            let link = quota.link.map(|url| format!("  {url}")).unwrap_or_default();
             return t!("status.quota_card", provider = provider, link = link).into_owned();
         }
         let summary = self.summarize_turn_activity(turn_id);
@@ -25370,19 +25364,22 @@ now analyzing the bus module"
             "rate_limited",
             "Provider rate limited the turn.",
         );
-        assert!(text.contains("⏳"), "rate_limited also gets the card: {text}");
+        assert!(
+            text.contains("⏳"),
+            "rate_limited also gets the card: {text}"
+        );
     }
 
     #[test]
     fn generic_error_keeps_legacy_summary() {
         let store = store_with_empty_session();
-        let text = store.turn_error_fallback_message(
-            &TurnId::new(),
-            "runtime_error",
-            "something broke",
-        );
+        let text =
+            store.turn_error_fallback_message(&TurnId::new(), "runtime_error", "something broke");
         assert!(text.contains("Session Summary"), "legacy shape: {text}");
-        assert!(!text.contains("⏳"), "no quota card for generic errors: {text}");
+        assert!(
+            !text.contains("⏳"),
+            "no quota card for generic errors: {text}"
+        );
     }
 
     #[test]

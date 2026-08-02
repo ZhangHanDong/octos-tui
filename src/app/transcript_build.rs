@@ -3161,7 +3161,15 @@ fn push_agent_task_children(
             lines.push(Line::from(spans));
         } else {
             let first = emitted == 0 && !suppress_first_connector;
-            push_agent_task_child(lines, palette, item, first, expanded, wrap_width, show_output);
+            push_agent_task_child(
+                lines,
+                palette,
+                item,
+                first,
+                expanded,
+                wrap_width,
+                show_output,
+            );
         }
         emitted += 1;
         idx += run;

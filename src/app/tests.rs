@@ -11831,15 +11831,24 @@ mod tests {
         let mut app = capsule_app(&session_id, &turn_id);
         app.activity.clear();
         for i in 0..15 {
-            app.activity
-                .push(capsule_tool_item(&turn_id, &format!("c{i}"), &format!("cmd-{i}")));
+            app.activity.push(capsule_tool_item(
+                &turn_id,
+                &format!("c{i}"),
+                &format!("cmd-{i}"),
+            ));
         }
 
         let text = rendered_text(&app);
 
         assert!(text.contains("◈"), "fold row uses the ◈ glyph: {text}");
-        assert!(text.contains("more") || text.contains("还有"), "fold row counts the rest: {text}");
-        assert!(text.contains("Ctrl+O"), "fold row advertises expand: {text}");
+        assert!(
+            text.contains("more") || text.contains("还有"),
+            "fold row counts the rest: {text}"
+        );
+        assert!(
+            text.contains("Ctrl+O"),
+            "fold row advertises expand: {text}"
+        );
     }
 
     #[test]
@@ -11858,7 +11867,10 @@ mod tests {
         let text = rendered_text(&app);
 
         assert!(text.contains("cargo build") && text.contains("cargo test"));
-        assert!(!text.contains("×2"), "distinct invocations stay separate: {text}");
+        assert!(
+            !text.contains("×2"),
+            "distinct invocations stay separate: {text}"
+        );
     }
 
     /// Capsule flush (2026-08-02, kimi k3): an agentic turn settles tools in
@@ -11880,7 +11892,9 @@ mod tests {
             &app, palette, 100, &baseline, &first, false,
         ));
         assert!(
-            batch1.iter().any(|line| line.contains("Agent task completed")),
+            batch1
+                .iter()
+                .any(|line| line.contains("Agent task completed")),
             "first flush opens the group with its header: {batch1:#?}"
         );
 
@@ -11892,7 +11906,9 @@ mod tests {
         ));
 
         assert!(
-            !batch2.iter().any(|line| line.contains("Agent task completed")),
+            !batch2
+                .iter()
+                .any(|line| line.contains("Agent task completed")),
             "continuation flush must not repeat the group header: {batch2:#?}"
         );
         assert!(
@@ -11929,7 +11945,10 @@ mod tests {
             1,
             "4 bare successes flush as ONE digest row: {batch:#?}"
         );
-        assert!(batch[0].contains("Bash ×4"), "digest names the tools: {batch:#?}");
+        assert!(
+            batch[0].contains("Bash ×4"),
+            "digest names the tools: {batch:#?}"
+        );
     }
 
     #[test]
@@ -11982,7 +12001,9 @@ mod tests {
         ));
 
         assert!(
-            batch2.iter().any(|line| line.contains("Agent task completed")),
+            batch2
+                .iter()
+                .any(|line| line.contains("Agent task completed")),
             "non-contiguous continuation re-opens with a header: {batch2:#?}"
         );
     }
