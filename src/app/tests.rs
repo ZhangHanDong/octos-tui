@@ -7528,6 +7528,25 @@ mod tests {
     }
 
     #[test]
+    fn loop_duration_rolls_over_into_days() {
+        // Spec task-loop-duration-days: a week-long expiry rendered as
+        // "167h 58m", forcing the reader to divide by 24.
+        assert_eq!(crate::app::format_loop_duration(604_680), "6d 23h");
+    }
+
+    #[test]
+    fn loop_duration_under_a_day_keeps_hours() {
+        let text = crate::app::format_loop_duration(10_800);
+        assert!(text.contains("3h"), "hours kept: {text}");
+        assert!(!text.contains('d'), "no day unit under 24h: {text}");
+    }
+
+    #[test]
+    fn loop_duration_under_an_hour_keeps_minutes() {
+        assert_eq!(crate::app::format_loop_duration(134), "2m 14s");
+    }
+
+    #[test]
     fn loop_row_shows_countdown_iteration_and_expiry() {
         // Spec task-loop-liveness-indicator: the loop row was static text —
         // no countdown, no iteration, no expiry — so a running loop looked

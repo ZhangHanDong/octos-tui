@@ -3470,8 +3470,10 @@ fn autonomy_loop_cadence(record: &octos_core::ui_protocol::UiLoopRecord) -> Stri
 /// Coarse duration for loop chips: hours+minutes past an hour, else the
 /// existing minute/second form. `format_elapsed_secs` alone renders three
 /// hours as "179m 59s", which reads as noise on a permanently visible row.
-fn format_loop_duration(secs: u64) -> String {
-    if secs >= 3600 {
+pub(crate) fn format_loop_duration(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
         format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
     } else {
         format_elapsed_secs(secs)
