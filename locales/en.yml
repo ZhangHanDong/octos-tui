@@ -812,6 +812,8 @@ status:
   goal_cleared: "Goal cleared"
   goal_clear_rejected: "Goal clear rejected"
   loop_created: "Loop %{id} created (%{mode})"
+  loop_list_title: "↻ Loops"
+  loop_list_empty_hint: "No loops in this session. Create one with /loop <prompt> (self-paced) or /loop every 10m <prompt>."
   loop_list_refreshed: "Loop list refreshed: %{count} loop(s)"
   loop_mutation: "Loop %{id} %{verb} %{outcome}"
   cannot_transition_no_goal: "Cannot transition: server reports no goal."

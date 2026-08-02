@@ -7829,6 +7829,10 @@ impl Store {
                 // `set_session_loops`), not the raw response length —
                 // otherwise the acknowledgment can claim "N loop(s)"
                 // while the indicator shows fewer (codex P2).
+                // Spec task-loop-list-transcript: render the list INTO the
+                // transcript — a bare status-bar count left loop ids
+                // unobtainable, so every id-taking verb was unusable.
+                let block = crate::app::format_loop_list_block(&result.loops);
                 let count = self
                     .state
                     .set_session_loops(&result.session_id, result.loops);
@@ -7842,6 +7846,12 @@ impl Store {
                 // (and to keep the `status contains "N loop"` contract).
                 self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
+                self.push_local_activity(
+                    ActivityKind::Progress,
+                    t!("status.loop_list_title").into_owned(),
+                    t!("status.loop_list_refreshed", count = count).into_owned(),
+                    Some(block),
+                );
             }
             AutonomyResult::LoopMutation { method, result } => {
                 let loop_id = result.loop_id.clone();
@@ -25348,6 +25358,100 @@ now analyzing the bus module"
         let activity = store.state.activity.last().expect("local warning activity");
         assert_eq!(activity.kind, ActivityKind::Warning);
         assert_eq!(activity.title, "local slash command");
+    }
+
+    fn list_loop_record(
+        loop_id: &str,
+        prompt: &str,
+        status: &str,
+    ) -> octos_core::ui_protocol::UiLoopRecord {
+        let now = chrono::Utc::now().timestamp_millis();
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: SessionKey("local:test".into()),
+            profile_id: Some("kimi".into()),
+            prompt: prompt.into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: status.into(),
+            next_run_at_ms: Some(now + 90_000),
+            last_run_at_ms: None,
+            expires_at_ms: now + 3_600_000,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    fn apply_loop_list(store: &mut Store, loops: Vec<octos_core::ui_protocol::UiLoopRecord>) {
+        store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
+            result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
+                session_id: SessionKey("local:test".into()),
+                loops,
+            }),
+        });
+    }
+
+    #[test]
+    fn loop_list_pushes_transcript_entry_with_ids() {
+        // Spec task-loop-list-transcript: `/loop list` used to store the
+        // result and print a bare count, so loop ids were unobtainable and
+        // /loop pause|resume|delete|fire-now were unusable.
+        let mut store = store_with_empty_session();
+        apply_loop_list(
+            &mut store,
+            vec![
+                list_loop_record("loop-aaa", "写书", "active"),
+                list_loop_record("loop-bbb", "查 CI", "paused"),
+            ],
+        );
+
+        let item = store.state.activity.last().expect("transcript entry");
+        let text = format!(
+            "{} {} {}",
+            item.title,
+            item.status,
+            item.detail.clone().unwrap_or_default()
+        );
+        assert!(text.contains("loop-aaa"), "first id listed: {text}");
+        assert!(text.contains("loop-bbb"), "second id listed: {text}");
+        assert!(
+            text.contains("active") && text.contains("paused"),
+            "statuses listed: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_list_entry_shows_cadence_and_prompt() {
+        let mut store = store_with_empty_session();
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "请你完成这本书", "active")],
+        );
+
+        let item = store.state.activity.last().expect("transcript entry");
+        let text = item.detail.clone().unwrap_or_default();
+        assert!(text.contains("self-paced"), "cadence shown: {text}");
+        assert!(
+            text.contains("请你完成这本书"),
+            "prompt summary shown: {text}"
+        );
+    }
+
+    #[test]
+    fn empty_loop_list_still_explains_how_to_create() {
+        let mut store = store_with_empty_session();
+        apply_loop_list(&mut store, vec![]);
+
+        let item = store.state.activity.last().expect("transcript entry");
+        let text = format!(
+            "{} {}",
+            item.status,
+            item.detail.clone().unwrap_or_default()
+        );
+        assert!(
+            text.contains("/loop"),
+            "empty list explains creation: {text}"
+        );
     }
 
     #[test]

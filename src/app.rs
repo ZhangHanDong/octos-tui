@@ -3537,6 +3537,41 @@ fn autonomy_loop_detail(app: &AppState, record: &octos_core::ui_protocol::UiLoop
     }
 }
 
+/// Render the `/loop list` result as transcript lines (spec
+/// task-loop-list-transcript). Each row leads with the loop id — the four
+/// id-taking verbs (`pause` / `resume` / `delete` / `fire-now`) had no other
+/// source for it, which made them unusable from the UI.
+pub(crate) fn format_loop_list_block(loops: &[octos_core::ui_protocol::UiLoopRecord]) -> String {
+    if loops.is_empty() {
+        return t!("status.loop_list_empty_hint").into_owned();
+    }
+    loops
+        .iter()
+        .map(|record| {
+            let mut segments = vec![autonomy_loop_cadence(record)];
+            if let Some(secs) =
+                loop_next_run_secs(record).filter(|_| autonomy_loop_is_active(record))
+            {
+                segments.push(
+                    t!(
+                        "app.autonomy.loop_next_run",
+                        remaining = format_loop_duration(secs)
+                    )
+                    .into_owned(),
+                );
+            }
+            format!(
+                "{}  {}  {}  {}",
+                record.loop_id,
+                record.status,
+                segments.join(" · "),
+                autonomy_loop_label(record)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Shortest next-run countdown across the active session's active loops,
 /// pre-formatted for the status bar chip. `None` when no active loop has a
 /// scheduled next run (a self-paced loop mid-turn).
