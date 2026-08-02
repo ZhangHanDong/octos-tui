@@ -87,6 +87,7 @@ app:
     more_hunks_hidden: "还有 %{count} 个代码块已隐藏（Ctrl+O 展开）"
   autonomy:
     goal_prefix: "目标："
+    loops_overflow: "+%{count} 个"
     loop_iteration: "第 %{count} 轮"
     loop_next_run: "下次 %{remaining}"
     loop_next_run_pending: "本轮结束后"

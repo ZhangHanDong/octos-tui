@@ -3753,6 +3753,18 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
             palette.title().bg(palette.surface),
         ));
         spans.push(Span::styled("   ", palette.text().bg(palette.surface)));
+        // Width accounting for the whole-chip fit (spec
+        // task-loop-row-overflow): reserve room for the worst-case overflow
+        // hint so adding it can never push the row past `width`.
+        let mut used_width: usize = spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let mut dropped_chips = 0usize;
+        let overflow_reserve = UnicodeWidthStr::width(
+            t!("app.autonomy.loops_overflow", count = state.loops.len()).as_ref(),
+        ) + 1;
+        let budget = (width as usize).saturating_sub(overflow_reserve);
         for record in &state.loops {
             let label = autonomy_loop_label(record);
             let cadence = autonomy_loop_cadence(record);
@@ -3767,6 +3779,15 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
             } else {
                 palette.muted().bg(palette.surface)
             };
+            // Spec task-loop-row-overflow: fit WHOLE chips. A chip that would
+            // not fit is folded into a trailing `+N more` instead of being
+            // hard-cut by ratatui, which used to drop its tail silently.
+            let chip_width = UnicodeWidthStr::width(chip.as_str()) + 1;
+            if used_width + chip_width > budget {
+                dropped_chips += 1;
+                continue;
+            }
+            used_width += chip_width;
             spans.push(Span::styled(chip, chip_style));
             spans.push(Span::styled(" ", palette.text().bg(palette.surface)));
         }
@@ -3774,7 +3795,16 @@ fn autonomy_indicator_lines(app: &AppState, palette: Palette, width: u16) -> Vec
         if matches!(spans.last(), Some(s) if s.content == " ") {
             spans.pop();
         }
-        lines.push(Line::from(spans));
+        if dropped_chips > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " {}",
+                    t!("app.autonomy.loops_overflow", count = dropped_chips)
+                ),
+                palette.muted().bg(palette.surface),
+            ));
+        }
+        lines.push(Line::from(clip_line_spans(spans, width as usize)));
     }
     if let Some(plan) = state.plan.as_ref() {
         lines.extend(plan_indicator_lines(plan, palette));

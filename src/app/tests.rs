@@ -7527,6 +7527,79 @@ mod tests {
         app
     }
 
+    fn multi_loop_app(count: usize) -> AppState {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("kimi".into()),
+                messages: vec![Message::user("go")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        for idx in 0..count {
+            let mut record = loop_record(&format!("loop-{idx}"), 134, 3 * 3600);
+            record.prompt = format!("目标编号 {idx} 的一段较长提示词内容");
+            app.upsert_session_loop(&SessionKey("local:test".into()), record);
+        }
+        app
+    }
+
+    fn loops_row_text(app: &AppState, width: u16) -> String {
+        autonomy_indicator_lines(app, Palette::for_theme(ThemeName::Slate), width)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|text| text.contains("Loops"))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn loop_row_replaces_overflowing_chips_with_a_count() {
+        // Spec task-loop-row-overflow: a too-narrow row used to be hard-cut
+        // by ratatui — the tail of the last chip vanished with no hint that
+        // anything was missing.
+        let app = multi_loop_app(3);
+
+        let text = loops_row_text(&app, 60);
+
+        assert!(text.contains("more"), "overflow hint present: {text}");
+        assert!(
+            UnicodeWidthStr::width(text.as_str()) <= 60,
+            "row fits the width: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_row_without_overflow_has_no_more_hint() {
+        let app = multi_loop_app(1);
+
+        let text = loops_row_text(&app, 200);
+
+        assert!(
+            !text.contains("more"),
+            "no hint when everything fits: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_row_keeps_header_when_chips_overflow() {
+        let app = multi_loop_app(3);
+
+        let text = loops_row_text(&app, 34);
+
+        assert!(text.contains("Loops"), "header survives: {text}");
+    }
+
     #[test]
     fn loop_duration_rolls_over_into_days() {
         // Spec task-loop-duration-days: a week-long expiry rendered as

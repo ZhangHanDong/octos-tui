@@ -96,6 +96,7 @@ app:
     more_hunks_hidden: "+%{count} more hunk(s) hidden (Ctrl+O expand)"
   autonomy:
     goal_prefix: "Goal: "
+    loops_overflow: "+%{count} more"
     loop_iteration: "run %{count}"
     loop_next_run: "next %{remaining}"
     loop_next_run_pending: "next after this turn"
