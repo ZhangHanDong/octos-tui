@@ -2282,18 +2282,31 @@ impl Store {
 
     fn dispatch_loop_command(&mut self, cmd: crate::autonomy::LoopCommand) -> Option<AppUiCommand> {
         use crate::autonomy::{LoopCadence, LoopCommand};
+
+        // `/loop list` 是全局查询，不需要绑定到当前 session。
+        // 如果没有活跃 session，使用空 session_id 表示查询所有 loop。
+        if matches!(cmd, LoopCommand::List) {
+            if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
+                return None;
+            }
+            self.state.status = t!("status.listing_loops").into_owned();
+            let session_id = self
+                .active_session()
+                .map(|session| session.id.clone())
+                .unwrap_or_else(|| SessionKey("".into()));
+            let profile_id = self.active_session_profile_id();
+            return Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
+                session_id,
+                profile_id,
+            }));
+        }
+
+        // 其他 loop 命令（create/delete/pause/resume/fire-now）需要活跃 session。
         let session_id = self.active_autonomy_session_id()?;
         let profile_id = self.active_session_profile_id();
         match cmd {
             LoopCommand::List => {
-                if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
-                    return None;
-                }
-                self.state.status = t!("status.listing_loops").into_owned();
-                Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
-                    session_id,
-                    profile_id,
-                }))
+                unreachable!("LoopCommand::List handled above");
             }
             LoopCommand::Create { prompt, cadence } => {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_CREATE) {
@@ -34932,6 +34945,27 @@ now analyzing the bus module"
     fn loop_list_lists_loops() {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/loop list".into();
+        assert!(matches!(
+            store.compose_command(),
+            Some(AppUiCommand::ListLoops(_))
+        ));
+    }
+
+    #[test]
+    fn loop_list_works_without_active_session() {
+        // Bug: `/loop list` used to require an active session because it called
+        // `active_autonomy_session_id()?` before dispatching. When no session was
+        // open, the command silently failed and the user saw nothing.
+        //
+        // Fix: `/loop list` is a global query that works with or without an
+        // active session — it uses an empty session_id when none is open.
+        let mut store = protocol_store_with_autonomy();
+        // Clear the active session to simulate the no-session state
+        store.state.sessions.clear();
+        store.state.selected_session = 0; // Reset selection index
+        store.state.composer = "/loop list".into();
+        
+        // The command should still be sent (with an empty session_id)
         assert!(matches!(
             store.compose_command(),
             Some(AppUiCommand::ListLoops(_))
