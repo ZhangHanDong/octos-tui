@@ -2284,16 +2284,13 @@ impl Store {
         use crate::autonomy::{LoopCadence, LoopCommand};
 
         // `/loop list` 是全局查询，不需要绑定到当前 session。
-        // 如果没有活跃 session，使用空 session_id 表示查询所有 loop。
+        // 如果没有活跃 session，session_id 为 None，服务端会返回所有 loop。
         if matches!(cmd, LoopCommand::List) {
             if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
                 return None;
             }
             self.state.status = t!("status.listing_loops").into_owned();
-            let session_id = self
-                .active_session()
-                .map(|session| session.id.clone())
-                .unwrap_or_else(|| SessionKey("".into()));
+            let session_id = self.active_session().map(|session| session.id.clone());
             let profile_id = self.active_session_profile_id();
             return Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
                 session_id,
@@ -2306,7 +2303,8 @@ impl Store {
         let profile_id = self.active_session_profile_id();
         match cmd {
             LoopCommand::List => {
-                unreachable!("LoopCommand::List handled above");
+                // 已在上方处理，此处不会到达
+                None
             }
             LoopCommand::Create { prompt, cadence } => {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_CREATE) {
@@ -8027,7 +8025,7 @@ impl Store {
         }
         if capabilities.supports_method(crate::model::APPUI_METHOD_LOOP_LIST) {
             commands.push(AppUiCommand::ListLoops(crate::model::LoopListParams {
-                session_id: session_id.clone(),
+                session_id: Some(session_id.clone()),
                 profile_id,
             }));
         }
@@ -34958,18 +34956,28 @@ now analyzing the bus module"
         // open, the command silently failed and the user saw nothing.
         //
         // Fix: `/loop list` is a global query that works with or without an
-        // active session — it uses an empty session_id when none is open.
+        // active session — session_id is None when no session is open, which
+        // tells the server to return all loops (not filtered by session).
         let mut store = protocol_store_with_autonomy();
         // Clear the active session to simulate the no-session state
         store.state.sessions.clear();
         store.state.selected_session = 0; // Reset selection index
         store.state.composer = "/loop list".into();
         
-        // The command should still be sent (with an empty session_id)
+        // The command should still be sent (with session_id = None)
+        let command = store.compose_command();
         assert!(matches!(
-            store.compose_command(),
+            command,
             Some(AppUiCommand::ListLoops(_))
         ));
+        
+        // Verify the payload shape: session_id should be None (not empty string)
+        if let Some(AppUiCommand::ListLoops(params)) = command {
+            assert!(params.session_id.is_none(), 
+                "session_id should be None for global query, got {:?}", 
+                params.session_id);
+            // profile_id can be None or Some, but session_id must be None
+        }
     }
 
     #[test]

@@ -552,7 +552,8 @@ pub struct LoopCreateResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopListParams {
-    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
 }
