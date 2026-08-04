@@ -14473,7 +14473,6 @@ mod running_row_regression {
     }
 }
 
-<<<<<<< HEAD
 /// `flow_activity_items` filtered on `turn_id` only. A background session's
 /// `agent/updated` pushes a turn-less chip, so with no turn running in the
 /// focused session it rendered in that session's transcript — the
@@ -14564,7 +14563,5 @@ fn goal_objective_rows_never_split_a_grapheme() {
     assert!(
         chunks.iter().any(|c| c.contains("👩‍👩‍👧‍👦")),
         "the family emoji must stay within a single row, got: {chunks:?}"
-    );
-}
     );
 }
