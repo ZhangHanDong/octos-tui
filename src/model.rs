@@ -560,7 +560,12 @@ pub struct LoopListParams {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoopListResult {
-    pub session_id: SessionKey,
+    /// Echoed back from the request. A GLOBAL query sends no `session_id`, and
+    /// the server echoes that as `null` — a non-Option field here made the
+    /// whole response undecodable, so the list came back permanently empty
+    /// (spec task-loop-list-global-decode).
+    #[serde(default)]
+    pub session_id: Option<SessionKey>,
     #[serde(default)]
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
 }
