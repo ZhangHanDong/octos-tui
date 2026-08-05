@@ -10531,6 +10531,198 @@ mod tests {
         }
     }
 
+    /// Goal-echo regression, driven through the REAL path: submit + the
+    /// scrollback-sync + the inline live-tail render. A just-submitted prompt
+    /// must render EXACTLY ONCE across native scrollback and the live tail, for
+    /// every mid-turn disposition — staged (queued behind a busy goal), steered
+    /// (injected into the live turn), and the idle start. An earlier attempt
+    /// pinned on the flush-message COUNT, but `sync` advances that count to the
+    /// full committed length in the SAME frame, so the pin could never fire;
+    /// this drives the real path and shows the prompt is already rendered once,
+    /// which is what actually needs guarding.
+    #[test]
+    fn submitted_prompt_renders_exactly_once_through_real_path() {
+        use crate::store::Store;
+        let palette = Palette::for_theme(ThemeName::Slate);
+        const PROMPT: &str = "check the failing tests";
+
+        // Real event-loop tail: flush committed history to scrollback, then
+        // render the inline live tail with that frame's finalization.
+        fn render_counts(state: &AppState, palette: Palette) -> (usize, usize) {
+            let mut tracker = ScrollbackTracker::new();
+            let update = tracker.sync(state, palette, 100);
+            let scrollback = lines_text(&update.lines_to_insert);
+            let tail = viewport_rows_with_finalization(
+                state,
+                100,
+                40,
+                update.live_tail_finalization.as_ref(),
+            )
+            .join("\n");
+            (
+                scrollback.matches(PROMPT).count(),
+                tail.matches(PROMPT).count(),
+            )
+        }
+
+        fn running_goal_store() -> Store {
+            let turn = TurnId::new();
+            let mut store = Store {
+                state: AppState::new(
+                    vec![SessionView {
+                        id: SessionKey("local:test".into()),
+                        title: "t".into(),
+                        profile_id: Some("coding".into()),
+                        messages: vec![
+                            Message::user("run the goal"),
+                            Message::assistant("working"),
+                        ],
+                        tasks: vec![],
+                        live_reply: Some(crate::model::LiveReply {
+                            turn_id: turn,
+                            text: "still working".into(),
+                        }),
+                    }],
+                    0,
+                    "Working".into(),
+                    None,
+                    false,
+                ),
+            };
+            store.state.set_run_state_in_progress();
+            store
+        }
+
+        // Staged: a busy goal + no steer capability → the prompt queues.
+        let mut staged = running_goal_store();
+        staged.state.composer = PROMPT.into();
+        assert!(
+            staged.compose_command().is_none(),
+            "a mid-turn prompt with no steer support must stage"
+        );
+        let (s, t) = render_counts(&staged.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "staged mid-turn prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+
+        // Steered: a busy goal + turn/steer advertised → the prompt is injected.
+        let mut steered = running_goal_store();
+        steered.state.capabilities = Some(crate::menu::CapabilitySet::from_methods([
+            crate::model::APPUI_METHOD_TURN_STEER,
+        ]));
+        steered.state.composer = PROMPT.into();
+        assert!(
+            steered.compose_command().is_some(),
+            "a mid-turn prompt with steer support must emit a steer command"
+        );
+        let (s, t) = render_counts(&steered.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "steered mid-turn prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+
+        // Idle: no active turn → the prompt starts a fresh turn.
+        let mut idle = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: SessionKey("local:test".into()),
+                    title: "t".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::user("prior")],
+                    tasks: vec![],
+                    live_reply: None,
+                }],
+                0,
+                "ready".into(),
+                None,
+                false,
+            ),
+        };
+        idle.state.composer = PROMPT.into();
+        assert!(
+            idle.compose_command().is_some(),
+            "an idle prompt starts a turn"
+        );
+        let (s, t) = render_counts(&idle.state, palette);
+        assert_eq!(
+            s + t,
+            1,
+            "idle prompt renders exactly once (scrollback={s}, tail={t})"
+        );
+    }
+
+    /// Guards against the duplicate an over-eager staging echo would cause:
+    /// staging text IDENTICAL to the active turn's still-unreconciled optimistic
+    /// prompt must NOT delete that prompt's optimistic tracker
+    /// (`record_submitted_user_prompt`'s content-dedup would remove ALL matching
+    /// trackers), or the server's canonical `UserMessage` echo appends a SECOND
+    /// row instead of promoting the existing one.
+    #[test]
+    fn staging_identical_text_does_not_duplicate_the_active_prompt() {
+        use crate::store::Store;
+        let turn = TurnId::new();
+        let sess = SessionKey("local:test".into());
+        let mut store = Store {
+            state: AppState::new(
+                vec![SessionView {
+                    id: sess.clone(),
+                    title: "t".into(),
+                    profile_id: Some("coding".into()),
+                    messages: vec![Message::assistant("working")],
+                    tasks: vec![],
+                    live_reply: Some(crate::model::LiveReply {
+                        turn_id: turn.clone(),
+                        text: "still working".into(),
+                    }),
+                }],
+                0,
+                "Working".into(),
+                None,
+                false,
+            ),
+        };
+        store.state.set_run_state_in_progress();
+        // The ACTIVE turn's prompt is optimistically echoed, awaiting the
+        // server's canonical UserMessage.
+        store
+            .state
+            .record_submitted_user_prompt(sess.clone(), turn, "duplicate me".into());
+        assert_eq!(
+            store.state.optimistic_user_messages.len(),
+            1,
+            "precondition: the active prompt has one optimistic tracker"
+        );
+
+        // User stages IDENTICAL text mid-turn, via the real submit path.
+        store.state.composer = "duplicate me".into();
+        assert!(store.compose_command().is_none(), "identical text stages");
+        assert_eq!(
+            store.state.optimistic_user_messages.len(),
+            1,
+            "staging identical text must not delete the active prompt's optimistic tracker"
+        );
+
+        // The server's canonical echo for the ACTIVE prompt arrives.
+        store
+            .state
+            .apply_user_row_echo(&sess, "thread-1".into(), "duplicate me".into(), vec![]);
+        let user_rows = store
+            .state
+            .active_session()
+            .unwrap()
+            .messages
+            .iter()
+            .filter(|m| m.role.as_str() == "user" && m.content == "duplicate me")
+            .count();
+        assert_eq!(
+            user_rows, 1,
+            "the canonical echo must promote the existing row, not append a duplicate"
+        );
+    }
+
     #[test]
     fn glued_completed_segment_flushes_via_boundary_so_live_tail_holds_only_current_segment() {
         // Agentic narration segments are glued in live_reply (no blank line
