@@ -3543,7 +3543,13 @@ fn autonomy_loop_detail(app: &AppState, record: &octos_core::ui_protocol::UiLoop
 /// task-loop-list-transcript). Each row leads with the loop id — the four
 /// id-taking verbs (`pause` / `resume` / `delete` / `fire-now`) had no other
 /// source for it, which made them unusable from the UI.
-pub(crate) fn format_loop_list_block(loops: &[octos_core::ui_protocol::UiLoopRecord]) -> String {
+pub(crate) fn format_loop_list_block(
+    loops: &[octos_core::ui_protocol::UiLoopRecord],
+    // A GLOBAL list spans sessions, so each row names the session it belongs
+    // to. A SCOPED list shares one known session — repeating it every row is
+    // noise (spec task-loop-list-global-decode).
+    global: bool,
+) -> String {
     if loops.is_empty() {
         return t!("status.loop_list_empty_hint").into_owned();
     }
@@ -3562,12 +3568,29 @@ pub(crate) fn format_loop_list_block(loops: &[octos_core::ui_protocol::UiLoopRec
                     .into_owned(),
                 );
             }
+            // Drop the profile prefix: in a global list every row shares
+            // the queried profile, so repeating it adds width without info.
+            let session = if global {
+                let key = &record.session_id;
+                let shown = key
+                    .profile_id()
+                    .and_then(|profile| {
+                        key.0
+                            .strip_prefix(profile)
+                            .map(|r| r.trim_start_matches(':'))
+                    })
+                    .unwrap_or(key.0.as_str());
+                format!("  [{shown}]")
+            } else {
+                String::new()
+            };
             format!(
-                "{}  {}  {}  {}",
+                "{}  {}  {}  {}{}",
                 record.loop_id,
                 record.status,
                 segments.join(" · "),
-                autonomy_loop_label(record)
+                autonomy_loop_label(record),
+                session
             )
         })
         .collect::<Vec<_>>()

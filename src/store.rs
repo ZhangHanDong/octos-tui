@@ -7848,7 +7848,8 @@ impl Store {
                 // Spec task-loop-list-transcript: render the list INTO the
                 // transcript — a bare status-bar count left loop ids
                 // unobtainable, so every id-taking verb was unusable.
-                let block = crate::app::format_loop_list_block(&result.loops);
+                let block =
+                    crate::app::format_loop_list_block(&result.loops, result.session_id.is_none());
                 // Spec task-loop-list-global-decode: a SCOPED query is
                 // authoritative for its one session (replace wholesale); a
                 // GLOBAL query returns loops from many sessions, so each
@@ -34995,6 +34996,45 @@ now analyzing the bus module"
             store.compose_command(),
             Some(AppUiCommand::ListLoops(_))
         ));
+    }
+
+    #[test]
+    fn global_loop_list_block_labels_each_session() {
+        // Spec task-loop-list-global-decode: a global list spans sessions, so
+        // bare ids leave the reader unable to tell which session each loop
+        // belongs to.
+        let block = crate::app::format_loop_list_block(
+            &[
+                loop_for_session("loop_a", "kimi:local:tui#coding"),
+                loop_for_session("loop_b", "kimi:local:tui#notes"),
+            ],
+            true,
+        );
+
+        assert!(
+            block.contains("local:tui#coding"),
+            "first session shown: {block}"
+        );
+        assert!(
+            block.contains("local:tui#notes"),
+            "second session shown: {block}"
+        );
+    }
+
+    #[test]
+    fn scoped_loop_list_block_omits_session_column() {
+        // Every loop in a scoped list shares the one known session — repeating
+        // it on each row is noise.
+        let block = crate::app::format_loop_list_block(
+            &[loop_for_session("loop_a", "kimi:local:tui#coding")],
+            false,
+        );
+
+        assert!(
+            !block.contains("local:tui#coding"),
+            "scoped list omits the session column: {block}"
+        );
+        assert!(block.contains("loop_a"), "id still present: {block}");
     }
 
     #[test]

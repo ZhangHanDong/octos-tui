@@ -41,13 +41,17 @@ estimate: 0.25d
 - profile 回退:`active_session_profile_id()` 为 `None` 时改用启动 profile
   (`onboarding.launch_profile_id`),避免服务端兜底到 `main` 而查不到用户
   实际 profile 下的 loop。
-- 转录清单渲染与状态栏计数的既有行为不变;全局查询的计数为各组保留数之和。
+- 转录清单渲染:**全局查询**在每行追加该 loop 所属会话(取 `record.session_id`
+  的 base key,去掉 profile 前缀以免每行重复同一 profile);**限定查询**不加
+  该列(所有 loop 同属一个已知会话,重复显示是噪音)。状态栏计数行为不变;
+  全局查询的计数为各组保留数之和。
 
 ## 边界
 
 ### Allowed Changes
 - src/model.rs
 - src/store.rs
+- src/app.rs
 - tests/m15_autonomy_dispatch_contract.rs
 - locales/en.yml
 - locales/zh.yml
@@ -105,6 +109,19 @@ estimate: 0.25d
   当 应用 profile 为 kimi 的空全局回包
   那么 会话 A 的 loop 被清除
   并且 状态栏计数与镜像一致为零
+
+场景: 全局清单每行标注所属会话
+  测试: global_loop_list_block_labels_each_session
+  假设 全局查询回包含两条分属不同会话的 loop
+  当 渲染转录清单
+  那么 清单包含第一条 loop 所属会话的标识
+  并且 包含第二条 loop 所属会话的标识
+
+场景: 限定清单不重复会话标注
+  测试: scoped_loop_list_block_omits_session_column
+  假设 限定查询回包含一条 loop
+  当 渲染转录清单
+  那么 清单不包含会话标识列
 
 场景: 无会话时回退到启动 profile
   测试: loop_list_falls_back_to_launch_profile_without_session
