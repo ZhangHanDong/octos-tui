@@ -566,6 +566,11 @@ pub struct LoopListResult {
     /// (spec task-loop-list-global-decode).
     #[serde(default)]
     pub session_id: Option<SessionKey>,
+    /// The profile the server RESOLVED for this query. A global query is
+    /// authoritative exactly within this profile — it is what lets the client
+    /// clear stale mirrors without touching other profiles.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     #[serde(default)]
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
 }

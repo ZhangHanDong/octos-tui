@@ -30,10 +30,14 @@ estimate: 0.25d
 - 分发策略按查询种类区分:
   - **限定查询**(回包 `session_id` 为 `Some`):沿用既有语义,该会话的 loop
     集合被整体替换(服务端对该会话是权威的)。
-  - **全局查询**(回包 `session_id` 为 `None`):按**每条记录自身的
-    `record.session_id`** 分组,逐组替换。未在回包中出现的会话保持原镜像
-    不动 —— 全局查询受 profile 过滤,对其他 profile 的会话不具权威性,
-    清空它们会造成误删。
+  - **全局查询**(回包 `session_id` 为 `None`):以服务端回传的
+    `profile_id` 为权威边界 —— 先清空**该 profile 内所有会话**的镜像,
+    再按每条记录自身的 `record.session_id` 分组写入。其他 profile 的会话
+    不受影响。
+    (初版决策为"不清空未出现的会话",但实测导致矛盾态:服务端已删除全部
+    loop 时,状态栏显示 `0 loop(s)`、转录显示"没有循环",而指示行仍挂着
+    过期 loop。回包中的 `profile_id` 恰好给出了精确的权威范围,故改为
+    profile 内清空。)
 - profile 回退:`active_session_profile_id()` 为 `None` 时改用启动 profile
   (`onboarding.launch_profile_id`),避免服务端兜底到 `main` 而查不到用户
   实际 profile 下的 loop。
@@ -52,7 +56,7 @@ estimate: 0.25d
 ### Forbidden
 - 不改变限定查询(有活跃会话)的既有分发语义。
 - 不改变 `/loop list` 的请求侧契约(已正确)。
-- 不清空未出现在回包中的会话镜像。
+- 不清空回包 `profile_id` 之外的会话镜像。
 - 不新增 crate 依赖。
 
 ## 排除范围
@@ -82,11 +86,25 @@ estimate: 0.25d
   当 应用该结果
   那么 该会话镜像恰好持有这一条 loop
 
-场景: 全局查询不清空未出现的会话
-  测试: global_loop_list_leaves_unlisted_sessions_untouched
-  假设 会话 A 已有一条 loop,全局查询回包只含会话 B 的 loop
+场景: 全局查询清空同 profile 内已消失的 loop
+  测试: global_loop_list_clears_vanished_loops_in_scope
+  假设 会话 A 已有一条 loop,全局查询回包 profile 为同一 profile 且只含会话 B 的 loop
+  当 应用该结果
+  那么 会话 A 的 loop 被清除
+  并且 会话 B 持有回包中的 loop
+
+场景: 全局查询不触碰其他 profile 的会话
+  测试: global_loop_list_leaves_other_profiles_untouched
+  假设 会话 A 属于 other profile 且已有一条 loop,全局查询回包 profile 为 kimi
   当 应用该结果
   那么 会话 A 的 loop 仍然保留
+
+场景: 全局查询返回空时镜像与计数自洽
+  测试: empty_global_response_clears_scope_so_ui_agrees
+  假设 会话 A 在 kimi profile 下已有一条 loop
+  当 应用 profile 为 kimi 的空全局回包
+  那么 会话 A 的 loop 被清除
+  并且 状态栏计数与镜像一致为零
 
 场景: 无会话时回退到启动 profile
   测试: loop_list_falls_back_to_launch_profile_without_session

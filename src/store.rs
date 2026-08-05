@@ -7859,6 +7859,19 @@ impl Store {
                 let count = match result.session_id.as_ref() {
                     Some(session_id) => self.state.set_session_loops(session_id, result.loops),
                     None => {
+                        // A global response is authoritative for the profile
+                        // the server RESOLVED — and only that profile. Clear
+                        // those mirrors first so deletions/expiries actually
+                        // disappear; without this the indicator row kept
+                        // showing loops the server no longer reports, while
+                        // the status bar claimed "0 loop(s)".
+                        if let Some(scope) = result.profile_id.as_deref() {
+                            for entry in self.state.session_autonomy.iter_mut() {
+                                if entry.session_id.profile_id() == Some(scope) {
+                                    entry.loops.clear();
+                                }
+                            }
+                        }
                         let mut grouped: std::collections::HashMap<
                             SessionKey,
                             Vec<octos_core::ui_protocol::UiLoopRecord>,
@@ -25431,6 +25444,7 @@ now analyzing the bus module"
         store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
             result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
                 session_id: Some(SessionKey("local:test".into())),
+                profile_id: None,
                 loops,
             }),
         });
@@ -34988,7 +35002,7 @@ now analyzing the bus module"
         // Spec task-loop-list-global-decode: the server echoes the request's
         // session_id, so a global query comes back as `"session_id": null`.
         // A non-Option field made the whole response undecodable — the list
-        // was永远 empty (same class as the 2026-08-03 hydrate payload break).
+        // was permanently empty (same class as the 2026-08-03 hydrate break).
         let wire = serde_json::json!({
             "session_id": serde_json::Value::Null,
             "profile_id": "kimi",
@@ -35027,6 +35041,7 @@ now analyzing the bus module"
         store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
             result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
                 session_id: session_id.map(|id| SessionKey(id.into())),
+                profile_id: Some("kimi".into()),
                 loops,
             }),
         });
@@ -35076,11 +35091,19 @@ now analyzing the bus module"
         assert_eq!(mirror.loops.len(), 1, "scoped set is replaced wholesale");
     }
 
+    fn mirror_len(store: &Store, session: &str) -> usize {
+        store
+            .state
+            .session_autonomy_for(&SessionKey(session.into()))
+            .map(|entry| entry.loops.len())
+            .unwrap_or(0)
+    }
+
     #[test]
-    fn global_loop_list_leaves_unlisted_sessions_untouched() {
-        // A global query is profile-filtered, so it is NOT authoritative for
-        // sessions it does not mention — clearing them would delete loops the
-        // user still has.
+    fn global_loop_list_clears_vanished_loops_in_scope() {
+        // A global response IS authoritative for the profile the server
+        // resolved. Keeping unlisted sessions produced a contradictory UI:
+        // status bar "0 loop(s)" while the indicator row still showed one.
         let mut store = store_with_empty_session();
         store.state.upsert_session_loop(
             &SessionKey("kimi:local:tui#coding".into()),
@@ -35093,11 +35116,60 @@ now analyzing the bus module"
             vec![loop_for_session("loop_b", "kimi:local:tui#notes")],
         );
 
-        let coding = store
-            .state
-            .session_autonomy_for(&SessionKey("kimi:local:tui#coding".into()))
-            .expect("coding mirror survives");
-        assert_eq!(coding.loops.len(), 1, "unlisted session keeps its loops");
+        assert_eq!(
+            mirror_len(&store, "kimi:local:tui#coding"),
+            0,
+            "a loop the server no longer reports must disappear"
+        );
+        assert_eq!(mirror_len(&store, "kimi:local:tui#notes"), 1);
+    }
+
+    #[test]
+    fn global_loop_list_leaves_other_profiles_untouched() {
+        // The response's profile_id bounds its authority — another profile's
+        // sessions must survive untouched.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("other:local:tui#coding".into()),
+            loop_for_session("loop_x", "other:local:tui#coding"),
+        );
+
+        apply_list_result(
+            &mut store,
+            None,
+            vec![loop_for_session("loop_b", "kimi:local:tui#notes")],
+        );
+
+        assert_eq!(
+            mirror_len(&store, "other:local:tui#coding"),
+            1,
+            "out-of-scope profile keeps its loops"
+        );
+    }
+
+    #[test]
+    fn empty_global_response_clears_scope_so_ui_agrees() {
+        // The exact contradiction found while self-reviewing: an empty global
+        // response left the mirror populated, so the status bar said
+        // "0 loop(s)" while the autonomy row still showed a live loop.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("kimi:local:tui#coding".into()),
+            loop_for_session("loop_a", "kimi:local:tui#coding"),
+        );
+
+        apply_list_result(&mut store, None, vec![]);
+
+        assert_eq!(
+            mirror_len(&store, "kimi:local:tui#coding"),
+            0,
+            "mirror must agree with the reported count"
+        );
+        assert!(
+            store.state.status.contains('0'),
+            "status reports zero: {}",
+            store.state.status
+        );
     }
 
     #[test]
@@ -37024,6 +37096,7 @@ now analyzing the bus module"
         store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
             result: AutonomyResult::LoopList(crate::model::LoopListResult {
                 session_id: Some(session_id.clone()),
+                profile_id: None,
                 loops: vec![UiLoopRecord {
                     loop_id: "loop_a".into(),
                     session_id: session_id.clone(),
