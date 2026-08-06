@@ -1,4 +1,4 @@
-# octos-tui UI strings — 简体中文 (Simplified Chinese).
+# octoscode UI strings — 简体中文 (Simplified Chinese).
 # Mirror the key structure of en.yml. Native-speaker review welcome.
 composer:
   placeholder: "让 Octos 帮你改代码……"
@@ -866,9 +866,9 @@ menu:
     item:
       ready:
         label: "下一步：开始使用“%{profile}”的会话"
-        desc: "在此运行 `octos-tui`（此文件夹已为“%{profile}”激活），或在其他文件夹运行 `octos-tui --profile-id %{profile}`。"
+        desc: "在此运行 `octoscode`（此文件夹已为“%{profile}”激活），或在其他文件夹运行 `octoscode --profile-id %{profile}`。"
         label_generic: "下一步：开始一个会话"
-        desc_generic: "在此运行 `octos-tui` —— 此文件夹现已为你的大脑激活。"
+        desc_generic: "在此运行 `octoscode` —— 此文件夹现已为你的大脑激活。"
       open:
         label: "立即在此打开会话"
         desc: "立即在此文件夹使用“%{profile}”开始工作——无需重启。"
@@ -993,7 +993,7 @@ menu:
         label: 创建本地档案
       exit:
         desc: "不创建档案直接退出。提示：启动时加 --profile-id <id> 可跳过此界面。"
-        label: "退出 octos-tui"
+        label: "退出 octoscode"
       local_email:
         desc: 使用 /onboard email <地址>。邮箱仅为本地元数据。
       local_name:
@@ -1471,7 +1471,7 @@ status:
   doctor_caps_not_received_recovery: "请等待 `config/capabilities/list` 或重新连接传输。"
   doctor_appui_target: "Octos UI 目标：%{target}"
   doctor_no_transport: "未配置 Octos UI 传输"
-  doctor_no_transport_recovery: "请使用 octos-tui --stdio-command \"octos serve --stdio\" 或 octos-tui --endpoint ws://<host>:<port>/api/ui-protocol/ws 重新启动。"
+  doctor_no_transport_recovery: "请使用 octoscode --stdio-command \"octos serve --stdio\" 或 octoscode --endpoint ws://<host>:<port>/api/ui-protocol/ws 重新启动。"
   onboarding_doctor_summary: "引导诊断 — %{summary}"
   ps_active_turn: "活动回合 %{id}"
   ps_idle: "空闲"
