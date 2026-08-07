@@ -159,9 +159,12 @@ fn pager_scroll_keeps_composer_pinned_at_bottom() {
     );
 
     // ...while the composer stays pinned at the bottom of the screen.
+    // Margin allows for the word-wrapped status bar (2026-08-02): at 60 cols
+    // the status line takes up to 3 rows, lifting the composer accordingly —
+    // it still sits directly above the status region.
     let composer_row = row_index_containing(&rows, "Composer");
     assert!(
-        composer_row >= rows.len() - 6,
+        composer_row >= rows.len() - 8,
         "composer must sit in the bottom rows, found at row {composer_row}"
     );
     let deepest_transcript_row = rows

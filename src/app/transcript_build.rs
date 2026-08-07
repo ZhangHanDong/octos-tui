@@ -47,7 +47,7 @@ pub fn live_ui_height_with_finalization(
         + agent_strip_height
         + peer_strip_height
         + composer_height
-        + 1; // +1 status
+        + super::render::status_bar_height(app, width);
 
     let tail_height = live_tail_height_with_finalization(app, width, height, live_finalization);
     // The live-tail pane is laid out with `Constraint::Min(1)`, so it always
@@ -537,6 +537,11 @@ pub fn finalized_live_turn_lines_between(
     wrap_width: usize,
     previous: &LiveTurnFinalization,
     next: &LiveTurnFinalization,
+    // True when the scrollback tail is already THIS turn's flushed activity
+    // group (tracked by the caller across flushes): a new activity batch then
+    // appends child rows under the existing header instead of opening another
+    // full "Agent task completed" block per settle batch (the k3 header-spam).
+    append_to_flushed_group: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let Some((session_id, turn_id)) = app.active_turn() else {
@@ -576,6 +581,14 @@ pub fn finalized_live_turn_lines_between(
         .map(|(_, item)| item)
         .collect::<Vec<_>>();
     if !new_activity.is_empty() {
+        // Continuation batch: the scrollback tail is this turn's group (caller
+        // tracked it) AND this delta carries no reply lines of its own (the
+        // buffer is still empty), so the children may attach directly under
+        // the already-flushed header — no separator, no repeated header.
+        let continuation = append_to_flushed_group
+            && previous.matches_turn(session_id, turn_id)
+            && previous.activity_flushed_items > 0
+            && lines.is_empty();
         // Each scrollback delta flush builds a fresh buffer, so a pure-activity
         // delta (a sub-agent completing with no reply text ahead of it) reaches
         // the finalized section with an EMPTY buffer — which defeats that
@@ -585,7 +598,7 @@ pub fn finalized_live_turn_lines_between(
         // previous scrollback block. (A reply-delta-then-activity flush leaves
         // `lines` non-empty, so the section's guard handles that case and this
         // never double-blanks.)
-        if lines.is_empty() {
+        if lines.is_empty() && !continuation {
             lines.push(Line::from(""));
         }
         push_finalized_activity_items_section(
@@ -594,6 +607,7 @@ pub fn finalized_live_turn_lines_between(
             app,
             Some(turn_id),
             &new_activity,
+            continuation,
             wrap_width,
         );
     }
@@ -2237,33 +2251,54 @@ pub(super) fn push_inline_approval_card(
     palette: Palette,
     approval: &ApprovalModalState,
 ) {
+    // Spec task-approval-ux-salience: a decision card must READ as a card —
+    // danger-tinted top/bottom caps + a left rail — instead of loose muted
+    // text that blends into the transcript stream. A full right border is
+    // deliberately not drawn: the body wraps at arbitrary widths and a ragged
+    // right rail is worse than none (same compromise as the table borders).
+    let danger = Style::default()
+        .fg(palette.danger)
+        .add_modifier(Modifier::BOLD);
     lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("  ", palette.muted()),
+    let mut header = vec![
+        Span::styled("  ┌─ ", danger),
+        Span::styled("⚠ ", danger),
         Span::styled(
             t!("app.approval.title").to_string(),
             palette.title().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!("  {}", t!("app.approval.inline")), palette.muted()),
-    ]));
+        Span::styled(format!(" ── {}", approval.tool_name), palette.muted()),
+    ];
+    if let Some(risk) = approval.risk.as_deref() {
+        header.push(Span::styled(
+            format!(" · {}", t!("app.approval.risk_chip", risk = risk)),
+            danger,
+        ));
+    }
+    header.push(Span::styled(
+        format!("  {}", t!("app.approval.inline")),
+        palette.muted(),
+    ));
+    lines.push(Line::from(header));
     for line in approval_modal_lines(approval, palette) {
-        push_prefixed_line(lines, "    ", palette.muted(), line);
+        push_prefixed_line(lines, "  │ ", palette.muted(), line);
     }
     for action in approval_action_labels(approval) {
         lines.push(Line::from(vec![
-            Span::styled("    ", palette.muted()),
+            Span::styled("  │ ", danger),
             Span::styled(action, palette.selected()),
         ]));
     }
     if approval.diff_preview_id().is_some() {
         lines.push(Line::from(vec![
-            Span::styled("    ", palette.muted()),
+            Span::styled("  │ ", danger),
             Span::styled(
                 t!("app.approval.action_diff").to_string(),
                 palette.selected(),
             ),
         ]));
     }
+    lines.push(Line::from(Span::styled("  └──", danger)));
 }
 
 /// UPCR-2026-023: render the pending AskUserQuestion picker inline, mirroring
@@ -2621,13 +2656,26 @@ pub(super) fn push_activity_section_with_finalization(
         lines.push(Line::from(""));
     }
     let shown_limit = if app.expanded_tool_outputs { 12 } else { 3 };
-    let recent = flow_activity
-        .iter()
-        .rev()
-        .take(shown_limit)
-        .rev()
-        .copied()
-        .collect::<Vec<_>>();
+    // Cap by RENDERED rows, not raw items: a run of identical bare tool rows
+    // merges to one `⏺ Bash ×N` line (spec task-activity-compact-fold), so
+    // the whole run costs one row of the budget.
+    let recent = {
+        let mut taken = 0usize;
+        let mut rows = 0usize;
+        while taken < flow_activity.len() && rows < shown_limit {
+            let idx = flow_activity.len() - 1 - taken;
+            let item = flow_activity[idx];
+            let mut run = 1;
+            if activity_row_is_bare(item) {
+                while run <= idx && same_activity_run(item, flow_activity[idx - run]) {
+                    run += 1;
+                }
+            }
+            taken += run;
+            rows += 1;
+        }
+        flow_activity[flow_activity.len() - taken..].to_vec()
+    };
     let pending_continuations = active_session_pending_continuations(app);
     // The header counts tally the FULL per-turn set (from `flow_activity`), not
     // the display-capped `group` — so a chip header agrees with the sibling
@@ -2656,6 +2704,8 @@ pub(super) fn push_activity_section_with_finalization(
                     is_active_group(app, last_turn),
                     app.expanded_tool_outputs,
                     true,
+                    false,
+                    last_turn.is_some_and(|turn| loop_attributed_turn_in_any_session(app, turn)),
                     wrap_width,
                 );
                 group.clear();
@@ -2676,10 +2726,14 @@ pub(super) fn push_activity_section_with_finalization(
             is_active_group(app, last_turn),
             app.expanded_tool_outputs,
             true,
+            false,
+            last_turn.is_some_and(|turn| loop_attributed_turn_in_any_session(app, turn)),
             wrap_width,
         );
     }
     if flow_activity.len() > recent.len() {
+        // Prominent fold affordance (spec task-activity-compact-fold): the
+        // hidden tail must read as expandable, not as a dim afterthought.
         lines.push(Line::from(vec![
             Span::styled("     ", palette.muted()),
             Span::styled(
@@ -2688,7 +2742,7 @@ pub(super) fn push_activity_section_with_finalization(
                     count = flow_activity.len() - recent.len()
                 )
                 .to_string(),
-                palette.muted(),
+                palette.selected(),
             ),
         ]));
     }
@@ -2772,6 +2826,8 @@ pub(super) fn push_turn_activity_log_section(
             is_active,
             app.expanded_tool_outputs,
             collapse_settled,
+            false,
+            loop_attributed_turn_in_any_session(app, &log.turn_id),
             wrap_width,
         );
         if full.len() > shown.len() {
@@ -2829,6 +2885,9 @@ pub(super) fn push_turn_activity_log_section_unflushed(
         app,
         Some(&log.turn_id),
         &items,
+        // Late-activity flush: always a fresh block (its position in
+        // scrollback is not adjacent to the live group header).
+        false,
         wrap_width,
     );
     // The settling flush routes a still-covered log through this path, so emit
@@ -2865,6 +2924,10 @@ pub(super) fn push_finalized_activity_items_section(
     app: &AppState,
     turn_id: Option<&octos_core::ui_protocol::TurnId>,
     items: &[&ActivityItem],
+    // Append child rows under an already-flushed group header for the same
+    // turn instead of opening a fresh block (see the capsule continuation in
+    // `finalized_live_turn_lines_between`).
+    continuation: bool,
     wrap_width: usize,
 ) {
     // This section targets IMMUTABLE scrollback, which can never be reclaimed
@@ -2889,7 +2952,7 @@ pub(super) fn push_finalized_activity_items_section(
     if terminal_items.is_empty() {
         return;
     }
-    if !lines.is_empty() && !line_is_blank(lines.last()) {
+    if !continuation && !lines.is_empty() && !line_is_blank(lines.last()) {
         lines.push(Line::from(""));
     }
     push_agent_task_group(
@@ -2904,6 +2967,8 @@ pub(super) fn push_finalized_activity_items_section(
         app.expanded_tool_outputs,
         // Scrollback flush path: the archive never collapses.
         false,
+        continuation,
+        turn_id.is_some_and(|turn| loop_attributed_turn_in_any_session(app, turn)),
         wrap_width,
     );
 }
@@ -2929,10 +2994,30 @@ pub(super) fn push_agent_task_group(
     is_active_group: bool,
     expanded: bool,
     collapse_settled: bool,
+    // Scrollback capsule continuation: the group header for this turn is
+    // already in scrollback (immutable), so emit ONLY the child rows — no
+    // second header. `first`-child connectors are suppressed too: the `⎿`
+    // elbow belongs to the header line these rows attach under.
+    append_children_only: bool,
+    // This turn was started by a loop firing (spec
+    // task-loop-liveness-indicator) — render the `↻` attribution prefix.
+    loop_attributed: bool,
     wrap_width: usize,
 ) {
     let active_subagents = subagent_titles.len();
     if items.is_empty() && subagent_titles.is_empty() {
+        return;
+    }
+    if append_children_only {
+        push_agent_task_children(
+            lines,
+            palette,
+            items,
+            true,
+            expanded,
+            wrap_width,
+            !collapse_settled,
+        );
         return;
     }
     // Header counts tally the FULL turn set, not the display-capped `items`.
@@ -2971,12 +3056,19 @@ pub(super) fn push_agent_task_group(
     // a settled chip keeps the static bullet. Both are 1 col wide so the title
     // stays aligned whether running or done.
     let icon = if in_progress { spinner_frame() } else { "•" };
+    // Loop attribution (spec task-loop-liveness-indicator): a turn started by
+    // a loop firing is marked so unattended runs are distinguishable from the
+    // operator's own prompts.
+    let loop_prefix = if loop_attributed { "↻ " } else { "" };
     // Role-contrast: runtime/tool activity is the LOW tier of the transcript's
     // visual hierarchy — muted header (bold kept for grouping), status icons
     // keep their state colors (spinner/✓/✗ carry information).
     let spans = vec![
         Span::styled(format!("{icon} "), palette.selected()),
-        Span::styled(title, palette.muted().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("{loop_prefix}{title}"),
+            palette.muted().add_modifier(Modifier::BOLD),
+        ),
         Span::styled(format!(" ({})", metadata.join(" · ")), palette.muted()),
     ];
     lines.push(Line::from(spans));
@@ -2990,17 +3082,15 @@ pub(super) fn push_agent_task_group(
         return;
     }
 
-    for (idx, item) in items.iter().enumerate() {
-        push_agent_task_child(
-            lines,
-            palette,
-            item,
-            idx == 0,
-            expanded,
-            wrap_width,
-            !collapse_settled,
-        );
-    }
+    push_agent_task_children(
+        lines,
+        palette,
+        items,
+        false,
+        expanded,
+        wrap_width,
+        !collapse_settled,
+    );
 
     // List this turn's running sub-agents (from session.tasks, attributed by
     // turn) as children, so their live progress shows under THIS chip instead
@@ -3021,6 +3111,94 @@ pub(super) fn push_agent_task_group(
             wrap_width,
         );
         lines.push(Line::from(spans));
+    }
+}
+
+/// Whether ANY session attributes this turn to a loop fire. The group
+/// renderer has no session id in scope; turn ids are unique, so matching on
+/// the turn alone is exact (spec task-loop-liveness-indicator).
+fn loop_attributed_turn_in_any_session(
+    app: &AppState,
+    turn_id: &octos_core::ui_protocol::TurnId,
+) -> bool {
+    app.loop_attributed_turns
+        .iter()
+        .any(|(_, attributed)| attributed == turn_id)
+}
+
+/// A tool row with no invocation text — the only kind that may run-length
+/// merge (spec task-activity-compact-fold): a bare `⏺ Bash` line carries no
+/// information beyond its name and status.
+fn activity_row_is_bare(item: &ActivityItem) -> bool {
+    item.kind == ActivityKind::Tool
+        && tool_invocation_text(item)
+            .map(|text| text.trim().is_empty())
+            .unwrap_or(true)
+}
+
+/// Whether `next` continues `item`'s mergeable run: both bare, same display
+/// name, same failed/running status, same originating turn.
+fn same_activity_run(item: &ActivityItem, next: &ActivityItem) -> bool {
+    activity_row_is_bare(next)
+        && tool_display_name(&next.title) == tool_display_name(&item.title)
+        && activity_is_failed(next) == activity_is_failed(item)
+        && is_running_activity(next) == is_running_activity(item)
+        && next.turn_id == item.turn_id
+}
+
+/// Emit a group's child rows with run-length merging (spec
+/// task-activity-compact-fold): consecutive items that share a display name,
+/// carry NO invocation text, and have the same failed/running status collapse
+/// to one `⏺ Bash ×N` row. Rows with a real invocation always render
+/// individually — the command IS the information.
+fn push_agent_task_children(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    items: &[&ActivityItem],
+    suppress_first_connector: bool,
+    expanded: bool,
+    wrap_width: usize,
+    show_output: bool,
+) {
+    let mut idx = 0;
+    let mut emitted = 0usize;
+    while idx < items.len() {
+        let item = items[idx];
+        let mut run = 1;
+        if activity_row_is_bare(item) {
+            while idx + run < items.len() && same_activity_run(item, items[idx + run]) {
+                run += 1;
+            }
+        }
+        if run > 1 {
+            let (bullet, bullet_style) = tool_card_bullet(item, palette);
+            let spans = clip_line_spans(
+                vec![
+                    Span::styled(TOOL_CARD_CHILD_INDENT, palette.border()),
+                    Span::styled(format!("{bullet} "), bullet_style),
+                    Span::styled(tool_display_name(&item.title), palette.text()),
+                    Span::styled(
+                        t!("app.activity.repeat_suffix", count = run).into_owned(),
+                        palette.muted(),
+                    ),
+                ],
+                wrap_width,
+            );
+            lines.push(Line::from(spans));
+        } else {
+            let first = emitted == 0 && !suppress_first_connector;
+            push_agent_task_child(
+                lines,
+                palette,
+                item,
+                first,
+                expanded,
+                wrap_width,
+                show_output,
+            );
+        }
+        emitted += 1;
+        idx += run;
     }
 }
 
