@@ -117,7 +117,6 @@ app:
     retrying_attempt_max: "retrying (attempt %{attempt}/%{max})"
     retrying_attempt: "retrying (attempt %{attempt})"
     retrying: "retrying"
-    msgs_tasks: "%{msgs} msgs/%{tasks} tasks"
     loops_active_countdown: "↻ %{count} loop · next %{remaining}"
     loops_active: "⟳ %{count} active loop(s) — /loop pause to stop"
     loops_paused: "%{count} paused loop(s) — /loop resume to re-arm"

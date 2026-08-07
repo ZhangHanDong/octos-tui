@@ -8906,8 +8906,13 @@ mod tests {
     /// compresses a fixed row (clipped composer / scrollback ghosts).
     #[test]
     fn live_ui_height_reserves_peer_strip_rows() {
+        // Width 120, not 80: opening a peer also lengthens the STATUS line,
+        // which at 80 cols crosses the wrap threshold (1 -> 2 rows, measured
+        // by `status_bar_height` on both sides of reserve==render). This test
+        // pins the PEER DOCK term, so use a width where the status height is
+        // identical in both states and the delta isolates the dock.
         let mut app = autonomy_app_state();
-        let without = live_ui_height(&app, 80, 40);
+        let without = live_ui_height(&app, 120, 40);
         app.peer_session_meta.insert(
             SessionKey("local:tui#peer-ci-red".into()),
             crate::model::PeerMeta {
@@ -8921,7 +8926,7 @@ mod tests {
         let expected = peer_strip_height(&app, 40);
         assert!(expected > 0, "an open peer occupies dock rows");
         assert_eq!(
-            live_ui_height(&app, 80, 40),
+            live_ui_height(&app, 120, 40),
             without + expected,
             "the reservation basis must grow by exactly the dock's rendered rows"
         );
