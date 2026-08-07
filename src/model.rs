@@ -5110,6 +5110,9 @@ impl From<SessionStatusReadResult> for SessionRuntimeStatus {
 pub enum ActivityKind {
     Tool,
     Progress,
+    /// A client-local, fully rendered transcript report. Unlike runtime
+    /// activity, reports never enter the agent-task grouping/collapse path.
+    Report,
     Approval,
     Warning,
     Error,
@@ -5120,6 +5123,7 @@ impl ActivityKind {
         match self {
             Self::Tool => "tool",
             Self::Progress => "progress",
+            Self::Report => "report",
             Self::Approval => "approval",
             Self::Warning => "warning",
             Self::Error => "error",
@@ -10246,6 +10250,13 @@ fn estimated_activity_rows(item: &ActivityItem) -> usize {
             } else {
                 2
             }
+        }
+        ActivityKind::Report => {
+            1 + item
+                .detail
+                .as_deref()
+                .map(|body| body.lines().count().max(1))
+                .unwrap_or(0)
         }
         ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => 2,
     }

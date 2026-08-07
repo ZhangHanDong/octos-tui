@@ -7850,6 +7850,7 @@ impl Store {
                 // unobtainable, so every id-taking verb was unusable.
                 let block =
                     crate::app::format_loop_list_block(&result.loops, result.session_id.is_none());
+                let report_session_id = result.session_id.clone();
                 // Spec task-loop-list-global-decode: a SCOPED query is
                 // authoritative for its one session (replace wholesale); a
                 // GLOBAL query returns loops from many sessions, so each
@@ -7904,12 +7905,27 @@ impl Store {
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
                 }
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
-                self.push_local_activity(
-                    ActivityKind::Progress,
-                    t!("status.loop_list_title").into_owned(),
+                // A loop list is a local transcript REPORT, not runtime/tool
+                // activity. Report rendering bypasses agent-task grouping,
+                // settled collapse, and Tool preview limits so every id remains
+                // visible in the default UI.
+                let title = t!("status.loop_list_title").into_owned();
+                // A list is a snapshot of CURRENT state, not a log: drop any
+                // earlier loop-list report (scoped or global) so exactly one —
+                // the latest — remains pinned in the transcript.
+                self.state
+                    .activity
+                    .retain(|item| !(item.kind == ActivityKind::Report && item.title == title));
+                let mut report = ActivityItem::new(
+                    ActivityKind::Report,
+                    title,
                     t!("status.loop_list_refreshed", count = count).into_owned(),
-                    Some(block),
-                );
+                )
+                .with_detail(block);
+                if let Some(session_id) = report_session_id {
+                    report = report.with_session(session_id);
+                }
+                self.state.push_activity(report);
             }
             AutonomyResult::LoopMutation { method, result } => {
                 let loop_id = result.loop_id.clone();
@@ -13478,7 +13494,10 @@ impl Store {
                         );
                     }
                 }
-                ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => {}
+                ActivityKind::Report
+                | ActivityKind::Approval
+                | ActivityKind::Warning
+                | ActivityKind::Error => {}
             }
         }
         summary
@@ -13498,7 +13517,10 @@ impl Store {
                                 .as_deref()
                                 .is_some_and(|detail| detail.contains("diff preview ready"))
                     }
-                    ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => false,
+                    ActivityKind::Report
+                    | ActivityKind::Approval
+                    | ActivityKind::Warning
+                    | ActivityKind::Error => false,
                 }
         })
     }
@@ -25442,10 +25464,18 @@ now analyzing the bus module"
     }
 
     fn apply_loop_list(store: &mut Store, loops: Vec<octos_core::ui_protocol::UiLoopRecord>) {
+        apply_loop_list_for_scope(store, Some(SessionKey("local:test".into())), loops);
+    }
+
+    fn apply_loop_list_for_scope(
+        store: &mut Store,
+        session_id: Option<SessionKey>,
+        loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    ) {
         store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
             result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
-                session_id: Some(SessionKey("local:test".into())),
-                profile_id: None,
+                session_id,
+                profile_id: Some("kimi".into()),
                 loops,
             }),
         });
@@ -25465,19 +25495,29 @@ now analyzing the bus module"
             ],
         );
 
-        let item = store.state.activity.last().expect("transcript entry");
-        let text = format!(
-            "{} {} {}",
-            item.title,
-            item.status,
-            item.detail.clone().unwrap_or_default()
-        );
+        // Assert the RENDERED transcript, not a data field: an earlier version
+        // stored the list in `detail`, which renders nothing at all.
+        let text = crate::app::debug_render_text(&store.state);
         assert!(text.contains("loop-aaa"), "first id listed: {text}");
         assert!(text.contains("loop-bbb"), "second id listed: {text}");
         assert!(
             text.contains("active") && text.contains("paused"),
             "statuses listed: {text}"
         );
+        let first_row = text
+            .lines()
+            .position(|row| row.contains("loop-aaa"))
+            .expect("first loop has a rendered row");
+        let second_row = text
+            .lines()
+            .position(|row| row.contains("loop-bbb"))
+            .expect("second loop has a rendered row");
+        assert_ne!(first_row, second_row, "each loop gets its own row: {text}");
+        assert!(
+            !text.contains("Agent task completed"),
+            "a local report must not masquerade as an agent task: {text}"
+        );
+        assert_eq!(store.state.status, "Loop list refreshed: 2 loop(s)");
     }
 
     #[test]
@@ -25488,12 +25528,36 @@ now analyzing the bus module"
             vec![list_loop_record("loop-aaa", "请你完成这本书", "active")],
         );
 
-        let item = store.state.activity.last().expect("transcript entry");
-        let text = item.detail.clone().unwrap_or_default();
+        let text = crate::app::debug_render_text(&store.state);
         assert!(text.contains("self-paced"), "cadence shown: {text}");
+        // Ratatui's TestBackend stores an empty/space continuation cell after
+        // each double-width CJK glyph. Remove those buffer-only placeholders
+        // before comparing the logical prompt text.
+        let logical_text = text.replace(' ', "");
         assert!(
-            text.contains("请你完成这本书"),
+            logical_text.contains("请你完成这本书"),
             "prompt summary shown: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_list_report_wraps_without_hiding_ids() {
+        let mut store = store_with_empty_session();
+        assert!(!store.state.expanded_tool_outputs, "default collapse state");
+        apply_loop_list(
+            &mut store,
+            vec![
+                list_loop_record("loop-narrow-a", "整理所有发布说明", "active"),
+                list_loop_record("loop-narrow-b", "检查所有持续集成任务", "paused"),
+            ],
+        );
+
+        let text = crate::app::debug_render_text_with_size(&store.state, 52, 42);
+        assert!(text.contains("loop-narrow-a"), "first id survives: {text}");
+        assert!(text.contains("loop-narrow-b"), "second id survives: {text}");
+        assert!(
+            !text.contains("more line(s) hidden") && !text.contains("行已隐藏"),
+            "reports never use the collapsed Tool preview: {text}"
         );
     }
 
@@ -25502,15 +25566,81 @@ now analyzing the bus module"
         let mut store = store_with_empty_session();
         apply_loop_list(&mut store, vec![]);
 
-        let item = store.state.activity.last().expect("transcript entry");
-        let text = format!(
-            "{} {}",
-            item.status,
-            item.detail.clone().unwrap_or_default()
-        );
+        let text = crate::app::debug_render_text(&store.state);
         assert!(
             text.contains("/loop"),
             "empty list explains creation: {text}"
+        );
+    }
+
+    #[test]
+    fn repeated_loop_list_keeps_only_latest_report() {
+        // The list is a snapshot of CURRENT state, not a log — stacking stale
+        // snapshots below the fresh one misleads (spec: only the latest
+        // report survives, including across scoped/global queries).
+        let mut store = store_with_empty_session();
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        // Post-rebase merge behavior: a SCOPED list also opens the loops menu
+        // (upstream #508-era main) — the menu lists the same id, so close it
+        // as a user would before the next query renders the transcript.
+        assert!(
+            store.state.active_menu.is_some(),
+            "a scoped /loop list opens the loops menu"
+        );
+        store.close_menu();
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record("loop-aaa", "写书", "paused")],
+        );
+        assert!(
+            store.state.active_menu.is_none(),
+            "a global /loop list must NOT pop an (unavailable) menu"
+        );
+
+        let reports = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.kind == ActivityKind::Report)
+            .count();
+        assert_eq!(reports, 1, "exactly one loop-list report survives");
+
+        let text = crate::app::debug_render_text(&store.state);
+        let rows = text.lines().filter(|row| row.contains("loop-aaa")).count();
+        assert_eq!(rows, 1, "the id renders on exactly one row: {text}");
+        assert!(
+            text.contains("paused"),
+            "the surviving report reflects the LATEST result: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_list_report_renders_without_active_session() {
+        let mut store = Store {
+            state: AppState::new(vec![], 0, "ready".into(), None, false),
+        };
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record(
+                "loop-global-only",
+                "跨会话清理缓存",
+                "active",
+            )],
+        );
+
+        let text = crate::app::debug_render_text(&store.state);
+        assert!(
+            text.contains("loop-global-only"),
+            "global report visible without a session: {text}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "global report is not an agent task: {text}"
         );
     }
 
