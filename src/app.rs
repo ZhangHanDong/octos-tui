@@ -2504,7 +2504,7 @@ fn spinner_frame() -> &'static str {
     use std::time::Instant;
     static START: OnceLock<Instant> = OnceLock::new();
     let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
-    SPINNER_FRAMES[(elapsed / 160) as usize % SPINNER_FRAMES.len()]
+    SPINNER_FRAMES[(elapsed / turn_spinner_period_ms()) as usize % SPINNER_FRAMES.len()]
 }
 
 /// Frame period of the turn spinner, in milliseconds. Exposed so the loop
@@ -3585,17 +3585,6 @@ pub(crate) fn active_loop_countdown(app: &AppState) -> Option<String> {
         .filter_map(loop_next_run_secs)
         .min()
         .map(format_loop_duration)
-}
-
-/// Whether this turn was started by a loop firing, so its activity group can
-/// carry the `↻` attribution prefix (spec task-loop-liveness-indicator).
-pub(crate) fn turn_is_loop_attributed(
-    app: &AppState,
-    session_id: &SessionKey,
-    turn_id: &octos_core::ui_protocol::TurnId,
-) -> bool {
-    app.loop_attributed_turns
-        .contains(&(session_id.clone(), turn_id.clone()))
 }
 
 /// True when a loop is in the runnable `"active"` state. Paused / deleted
