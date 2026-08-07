@@ -1224,11 +1224,30 @@ fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     }
 
     if ctx.app.loops.is_empty() {
-        return MenuBuildResult::Unavailable(MenuStatusSpec {
+        // A real (empty) menu, not an Unavailable card: the user asked for
+        // the list, so give them the surface they expect with a creation
+        // hint as a read-only row (user feedback 2026-08-08).
+        return MenuBuildResult::Ready(MenuSpec {
             id: MenuId::from(crate::menu::registry::MENU_LOOPS),
-            title: t!("menu.loops.unavailable_title").into_owned(),
-            message: t!("menu.loops.unavailable_empty").into_owned(),
+            title: t!("menu.loops.title").into_owned(),
+            subtitle: None,
+            items: vec![
+                MenuItem::new(
+                    "loops.empty.hint",
+                    t!("menu.loops.unavailable_empty"),
+                    MenuAction::Noop,
+                )
+                .with_state(MenuItemState {
+                    non_selectable: true,
+                    ..MenuItemState::default()
+                }),
+            ],
+            tabs: Vec::new(),
+            searchable: false,
+            search_placeholder: None,
             footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+            preview: None,
+            mode: MenuMode::SingleSelect,
         });
     }
 
@@ -9349,7 +9368,10 @@ mod tests {
     }
 
     #[test]
-    fn loops_menu_unavailable_when_empty() {
+    fn loops_menu_empty_is_still_usable() {
+        // Revised 2026-08-08 (user request): an empty list answers with a
+        // REAL menu carrying a read-only creation hint, not an Unavailable
+        // card — the user asked for the loops surface, so it should open.
         let loops: Vec<octos_core::ui_protocol::UiLoopRecord> = vec![];
         let ctx = MenuContext {
             availability: AvailabilityContext::local(),
@@ -9361,7 +9383,18 @@ mod tests {
             theme_name: None,
             selected_path: &[],
         };
-        assert!(matches!(loops_menu(&ctx), MenuBuildResult::Unavailable(_)));
+        match loops_menu(&ctx) {
+            MenuBuildResult::Ready(spec) => {
+                assert_eq!(spec.items.len(), 1);
+                assert!(
+                    spec.items[0].label.contains("/loop"),
+                    "hint row explains creation: {}",
+                    spec.items[0].label
+                );
+                assert!(spec.items[0].state.non_selectable, "hint row is read-only");
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     fn dock_agent(id: &str, status: &str) -> octos_core::ui_protocol::UiAgentRecord {

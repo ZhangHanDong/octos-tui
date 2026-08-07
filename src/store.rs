@@ -2290,6 +2290,9 @@ impl Store {
                 return None;
             }
             self.state.status = t!("status.listing_loops").into_owned();
+            // Only a USER-dispatched list may pop the loops menu when its
+            // result lands — hydration fires the same RPC silently.
+            self.state.pending_loop_list_menu = true;
             let session_id = self.active_session().map(|session| session.id.clone());
             // Without a session there is no session profile to read, and the
             // server would fall back to the `main` profile — filtering out
@@ -7901,7 +7904,19 @@ impl Store {
                 // and stomp the status; the transcript block below is the
                 // global surface. Status is set AFTER opening: `open_menu`
                 // overwrites `state.status` with the menu label.
-                if scoped {
+                // Consume the flag unconditionally: a global result must not
+                // leave it armed for a later hydration result to trip over.
+                let user_requested = std::mem::take(&mut self.state.pending_loop_list_menu);
+                // Menu-first (user feedback 2026-08-08): the menu is LIVE
+                // (rebuilt from the mirror on every refresh) while a transcript
+                // report is a frozen snapshot — showing both lets them drift
+                // apart after any mutation. A scoped user query gets ONLY the
+                // menu (its Unavailable card covers the empty case); the
+                // transcript report below is reserved for GLOBAL (no-session)
+                // queries, which the menu cannot serve — it reads the active
+                // session's mirror. Hydration (user_requested=false) stays
+                // silent either way.
+                if scoped && user_requested {
                     self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
                 }
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
@@ -7909,6 +7924,9 @@ impl Store {
                 // activity. Report rendering bypasses agent-task grouping,
                 // settled collapse, and Tool preview limits so every id remains
                 // visible in the default UI.
+                if scoped {
+                    return None;
+                }
                 let title = t!("status.loop_list_title").into_owned();
                 // A list is a snapshot of CURRENT state, not a log: drop any
                 // earlier loop-list report (scoped or global) so exactly one —
@@ -25487,8 +25505,9 @@ now analyzing the bus module"
         // result and print a bare count, so loop ids were unobtainable and
         // /loop pause|resume|delete|fire-now were unusable.
         let mut store = store_with_empty_session();
-        apply_loop_list(
+        apply_loop_list_for_scope(
             &mut store,
+            None,
             vec![
                 list_loop_record("loop-aaa", "写书", "active"),
                 list_loop_record("loop-bbb", "查 CI", "paused"),
@@ -25523,8 +25542,9 @@ now analyzing the bus module"
     #[test]
     fn loop_list_entry_shows_cadence_and_prompt() {
         let mut store = store_with_empty_session();
-        apply_loop_list(
+        apply_loop_list_for_scope(
             &mut store,
+            None,
             vec![list_loop_record("loop-aaa", "请你完成这本书", "active")],
         );
 
@@ -25544,8 +25564,9 @@ now analyzing the bus module"
     fn loop_list_report_wraps_without_hiding_ids() {
         let mut store = store_with_empty_session();
         assert!(!store.state.expanded_tool_outputs, "default collapse state");
-        apply_loop_list(
+        apply_loop_list_for_scope(
             &mut store,
+            None,
             vec![
                 list_loop_record("loop-narrow-a", "整理所有发布说明", "active"),
                 list_loop_record("loop-narrow-b", "检查所有持续集成任务", "paused"),
@@ -25564,7 +25585,7 @@ now analyzing the bus module"
     #[test]
     fn empty_loop_list_still_explains_how_to_create() {
         let mut store = store_with_empty_session();
-        apply_loop_list(&mut store, vec![]);
+        apply_loop_list_for_scope(&mut store, None, vec![]);
 
         let text = crate::app::debug_render_text(&store.state);
         assert!(
@@ -25579,18 +25600,11 @@ now analyzing the bus module"
         // snapshots below the fresh one misleads (spec: only the latest
         // report survives, including across scoped/global queries).
         let mut store = store_with_empty_session();
-        apply_loop_list(
+        apply_loop_list_for_scope(
             &mut store,
+            None,
             vec![list_loop_record("loop-aaa", "写书", "active")],
         );
-        // Post-rebase merge behavior: a SCOPED list also opens the loops menu
-        // (upstream #508-era main) — the menu lists the same id, so close it
-        // as a user would before the next query renders the transcript.
-        assert!(
-            store.state.active_menu.is_some(),
-            "a scoped /loop list opens the loops menu"
-        );
-        store.close_menu();
         apply_loop_list_for_scope(
             &mut store,
             None,
@@ -25598,7 +25612,7 @@ now analyzing the bus module"
         );
         assert!(
             store.state.active_menu.is_none(),
-            "a global /loop list must NOT pop an (unavailable) menu"
+            "a global /loop list must NOT pop a menu"
         );
 
         let reports = store
@@ -25615,6 +25629,79 @@ now analyzing the bus module"
         assert!(
             text.contains("paused"),
             "the surviving report reflects the LATEST result: {text}"
+        );
+    }
+
+    #[test]
+    fn scoped_user_loop_list_opens_menu_without_report() {
+        // Menu-first: the menu is live, a report is a frozen snapshot —
+        // showing both drifts apart after any mutation (user report
+        // 2026-08-08: menu said paused while the report still said active).
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(store.state.active_menu.is_some(), "menu opens");
+        let reports = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.kind == ActivityKind::Report)
+            .count();
+        assert_eq!(reports, 0, "a scoped query pushes NO transcript report");
+    }
+
+    #[test]
+    fn empty_scoped_loop_list_opens_usable_menu() {
+        // An empty list still answers with a REAL menu (creation hint as a
+        // read-only row), not an Unavailable card (user request 2026-08-08).
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(&mut store, vec![]);
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                assert!(
+                    spec.items.iter().any(|item| item.label.contains("/loop")),
+                    "the empty menu carries the creation hint"
+                );
+            }
+            other => panic!("expected a Ready menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_loop_list_opens_menu_but_hydration_does_not() {
+        // Session-open hydration fires loop/list silently; found live
+        // 2026-08-08: the unconditional open popped the menu on session open,
+        // swallowed subsequent typing into its search box, and a stray Enter
+        // pause-toggled a loop the user never selected.
+        let mut store = store_with_empty_session();
+
+        // Hydration result: flag unset — no menu.
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(
+            store.state.active_menu.is_none(),
+            "hydration must never pop the loops menu"
+        );
+
+        // User-dispatched: flag armed — menu opens.
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(
+            store.state.active_menu.is_some(),
+            "an explicit /loop list opens the menu"
+        );
+        assert!(
+            !store.state.pending_loop_list_menu,
+            "the flag is consumed by the result"
         );
     }
 
