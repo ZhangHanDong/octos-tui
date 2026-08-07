@@ -996,6 +996,7 @@ fn is_running_activity(item: &ActivityItem) -> bool {
 /// banner at the top of the transcript area (it scrolls away on the first turn).
 fn launch_banner_active(app: &AppState) -> bool {
     app.pending_messages.is_empty()
+        && flow_report_items(app).is_empty()
         && app
             .active_session()
             .is_some_and(|session| session.messages.is_empty() && session.live_reply.is_none())
@@ -2419,6 +2420,34 @@ fn is_active_group(app: &AppState, group_turn: Option<&octos_core::ui_protocol::
     }
 }
 
+/// Test-only: render `app` to a row-aware buffer string. Keeping row separators
+/// lets store-level tests prove that a multi-line report really occupies
+/// distinct terminal rows instead of merely finding its data in the model.
+#[cfg(test)]
+pub(crate) fn debug_render_text(app: &AppState) -> String {
+    debug_render_text_with_size(app, 120, 42)
+}
+
+#[cfg(test)]
+pub(crate) fn debug_render_text_with_size(app: &AppState, width: u16, height: u16) -> String {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| render(frame, app, Palette::for_theme(crate::cli::ThemeName::Slate)))
+        .expect("render succeeds");
+    let buffer = terminal.backend().buffer();
+    (0..buffer.area.height)
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
     let active_turn_id = app.active_turn().map(|(_, turn_id)| turn_id);
     let active_session_id = app.active_session().map(|session| &session.id);
@@ -2435,12 +2464,32 @@ fn flow_activity_items(app: &AppState) -> Vec<&ActivityItem> {
             (Some(_), None) => false,
             (None, _) => true,
         })
+        // Reports have their own full-fidelity transcript block. Feeding one
+        // into this collection would count it as an agent action and subject it
+        // to settled-group collapse before the report renderer can see it.
+        .filter(|item| item.kind != ActivityKind::Report)
         .filter(|item| match active_turn_id {
             Some(turn_id) => item.turn_id.as_ref() == Some(turn_id),
             // When no turn is active, turn-less running sub-agent progress is
             // folded into the orchestrating turn's chip (as children) — don't
             // also render it here as a separate turn-less "Orchestrating" chip.
             None => item.turn_id.is_none() && !is_subagent_progress(app, item),
+        })
+        .collect()
+}
+
+/// Client-local transcript reports visible in the current chat context.
+/// Unscoped reports (such as global `/loop list`) remain visible without a
+/// session; scoped reports follow their owning session and never bleed into a
+/// different session after the operator switches focus.
+fn flow_report_items(app: &AppState) -> Vec<&ActivityItem> {
+    let active_session_id = app.active_session().map(|session| &session.id);
+    app.activity
+        .iter()
+        .filter(|item| item.kind == ActivityKind::Report)
+        .filter(|item| match item.session_id.as_ref() {
+            Some(owner) => active_session_id == Some(owner),
+            None => true,
         })
         .collect()
 }
@@ -3543,7 +3592,13 @@ fn autonomy_loop_detail(app: &AppState, record: &octos_core::ui_protocol::UiLoop
 /// task-loop-list-transcript). Each row leads with the loop id — the four
 /// id-taking verbs (`pause` / `resume` / `delete` / `fire-now`) had no other
 /// source for it, which made them unusable from the UI.
-pub(crate) fn format_loop_list_block(loops: &[octos_core::ui_protocol::UiLoopRecord]) -> String {
+pub(crate) fn format_loop_list_block(
+    loops: &[octos_core::ui_protocol::UiLoopRecord],
+    // A GLOBAL list spans sessions, so each row names the session it belongs
+    // to. A SCOPED list shares one known session — repeating it every row is
+    // noise (spec task-loop-list-global-decode).
+    global: bool,
+) -> String {
     if loops.is_empty() {
         return t!("status.loop_list_empty_hint").into_owned();
     }
@@ -3562,12 +3617,29 @@ pub(crate) fn format_loop_list_block(loops: &[octos_core::ui_protocol::UiLoopRec
                     .into_owned(),
                 );
             }
+            // Drop the profile prefix: in a global list every row shares
+            // the queried profile, so repeating it adds width without info.
+            let session = if global {
+                let key = &record.session_id;
+                let shown = key
+                    .profile_id()
+                    .and_then(|profile| {
+                        key.0
+                            .strip_prefix(profile)
+                            .map(|r| r.trim_start_matches(':'))
+                    })
+                    .unwrap_or(key.0.as_str());
+                format!("  [{shown}]")
+            } else {
+                String::new()
+            };
             format!(
-                "{}  {}  {}  {}",
+                "{}  {}  {}  {}{}",
                 record.loop_id,
                 record.status,
                 segments.join(" · "),
-                autonomy_loop_label(record)
+                autonomy_loop_label(record),
+                session
             )
         })
         .collect::<Vec<_>>()

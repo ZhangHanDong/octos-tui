@@ -2282,18 +2282,38 @@ impl Store {
 
     fn dispatch_loop_command(&mut self, cmd: crate::autonomy::LoopCommand) -> Option<AppUiCommand> {
         use crate::autonomy::{LoopCadence, LoopCommand};
+
+        // `/loop list` 是全局查询，不需要绑定到当前 session。
+        // 如果没有活跃 session，session_id 为 None，服务端会返回所有 loop。
+        if matches!(cmd, LoopCommand::List) {
+            if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
+                return None;
+            }
+            self.state.status = t!("status.listing_loops").into_owned();
+            // Only a USER-dispatched list may pop the loops menu when its
+            // result lands — hydration fires the same RPC silently.
+            self.state.pending_loop_list_menu = true;
+            let session_id = self.active_session().map(|session| session.id.clone());
+            // Without a session there is no session profile to read, and the
+            // server would fall back to the `main` profile — filtering out
+            // every loop under the user's actual profile. Fall back to the
+            // launch profile instead (spec task-loop-list-global-decode).
+            let profile_id = self
+                .active_session_profile_id()
+                .or_else(|| self.state.onboarding.launch_profile_id.clone());
+            return Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
+                session_id,
+                profile_id,
+            }));
+        }
+
+        // 其他 loop 命令（create/delete/pause/resume/fire-now）需要活跃 session。
         let session_id = self.active_autonomy_session_id()?;
         let profile_id = self.active_session_profile_id();
         match cmd {
             LoopCommand::List => {
-                if !self.require_appui_method(crate::model::APPUI_METHOD_LOOP_LIST) {
-                    return None;
-                }
-                self.state.status = t!("status.listing_loops").into_owned();
-                Some(AppUiCommand::ListLoops(crate::model::LoopListParams {
-                    session_id,
-                    profile_id,
-                }))
+                // 已在上方处理，此处不会到达
+                None
             }
             LoopCommand::Create { prompt, cadence } => {
                 if !self.require_mutating_appui_method(crate::model::APPUI_METHOD_LOOP_CREATE) {
@@ -7831,26 +7851,99 @@ impl Store {
                 // Spec task-loop-list-transcript: render the list INTO the
                 // transcript — a bare status-bar count left loop ids
                 // unobtainable, so every id-taking verb was unusable.
-                let block = crate::app::format_loop_list_block(&result.loops);
-                let count = self
-                    .state
-                    .set_session_loops(&result.session_id, result.loops);
-                // Surface the list the user asked for: previously `/loop list`
-                // only refreshed the mirror + a status-bar count chip, never
-                // rendered the loops. Open the loops menu so each loop's
-                // status/id/cadence/prompt (and its pause/resume/delete/fire
-                // actions) is actually visible. Set the status AFTER opening:
-                // `open_menu` overwrites `state.status` with the menu label,
-                // so the refresh acknowledgment must come last to stay visible
-                // (and to keep the `status contains "N loop"` contract).
-                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
+                let block =
+                    crate::app::format_loop_list_block(&result.loops, result.session_id.is_none());
+                let report_session_id = result.session_id.clone();
+                // Spec task-loop-list-global-decode: a SCOPED query is
+                // authoritative for its one session (replace wholesale); a
+                // GLOBAL query returns loops from many sessions, so each
+                // record lands in ITS OWN session's mirror. Sessions absent
+                // from a global response keep their loops — the response is
+                // profile-filtered and therefore not authoritative for them.
+                let scoped = result.session_id.is_some();
+                let count = match result.session_id.as_ref() {
+                    Some(session_id) => self.state.set_session_loops(session_id, result.loops),
+                    None => {
+                        // A global response is authoritative for the profile
+                        // the server RESOLVED — and only that profile. Clear
+                        // those mirrors first so deletions/expiries actually
+                        // disappear; without this the indicator row kept
+                        // showing loops the server no longer reports, while
+                        // the status bar claimed "0 loop(s)".
+                        if let Some(scope) = result.profile_id.as_deref() {
+                            for entry in self.state.session_autonomy.iter_mut() {
+                                if entry.session_id.profile_id() == Some(scope) {
+                                    entry.loops.clear();
+                                }
+                            }
+                        }
+                        let mut grouped: std::collections::HashMap<
+                            SessionKey,
+                            Vec<octos_core::ui_protocol::UiLoopRecord>,
+                        > = std::collections::HashMap::new();
+                        for record in result.loops {
+                            grouped
+                                .entry(record.session_id.clone())
+                                .or_default()
+                                .push(record);
+                        }
+                        grouped
+                            .into_iter()
+                            .map(|(session_id, loops)| {
+                                self.state.set_session_loops(&session_id, loops)
+                            })
+                            .sum()
+                    }
+                };
+                // Upstream main opens the loops menu here so each loop's
+                // actions (pause/resume/delete/fire) are directly reachable.
+                // Keep that for SCOPED queries — the menu reads the ACTIVE
+                // session's mirror, which is exactly what a scoped query
+                // refreshed. A GLOBAL (no-session) query has no active
+                // session to read, so the menu would come up unavailable
+                // and stomp the status; the transcript block below is the
+                // global surface. Status is set AFTER opening: `open_menu`
+                // overwrites `state.status` with the menu label.
+                // Consume the flag unconditionally: a global result must not
+                // leave it armed for a later hydration result to trip over.
+                let user_requested = std::mem::take(&mut self.state.pending_loop_list_menu);
+                // Menu-first (user feedback 2026-08-08): the menu is LIVE
+                // (rebuilt from the mirror on every refresh) while a transcript
+                // report is a frozen snapshot — showing both lets them drift
+                // apart after any mutation. A scoped user query gets ONLY the
+                // menu (its Unavailable card covers the empty case); the
+                // transcript report below is reserved for GLOBAL (no-session)
+                // queries, which the menu cannot serve — it reads the active
+                // session's mirror. Hydration (user_requested=false) stays
+                // silent either way.
+                if scoped && user_requested {
+                    self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOPS));
+                }
                 self.state.status = t!("status.loop_list_refreshed", count = count).into_owned();
-                self.push_local_activity(
-                    ActivityKind::Progress,
-                    t!("status.loop_list_title").into_owned(),
+                // A loop list is a local transcript REPORT, not runtime/tool
+                // activity. Report rendering bypasses agent-task grouping,
+                // settled collapse, and Tool preview limits so every id remains
+                // visible in the default UI.
+                if scoped {
+                    return None;
+                }
+                let title = t!("status.loop_list_title").into_owned();
+                // A list is a snapshot of CURRENT state, not a log: drop any
+                // earlier loop-list report (scoped or global) so exactly one —
+                // the latest — remains pinned in the transcript.
+                self.state
+                    .activity
+                    .retain(|item| !(item.kind == ActivityKind::Report && item.title == title));
+                let mut report = ActivityItem::new(
+                    ActivityKind::Report,
+                    title,
                     t!("status.loop_list_refreshed", count = count).into_owned(),
-                    Some(block),
-                );
+                )
+                .with_detail(block);
+                if let Some(session_id) = report_session_id {
+                    report = report.with_session(session_id);
+                }
+                self.state.push_activity(report);
             }
             AutonomyResult::LoopMutation { method, result } => {
                 let loop_id = result.loop_id.clone();
@@ -8014,7 +8107,7 @@ impl Store {
         }
         if capabilities.supports_method(crate::model::APPUI_METHOD_LOOP_LIST) {
             commands.push(AppUiCommand::ListLoops(crate::model::LoopListParams {
-                session_id: session_id.clone(),
+                session_id: Some(session_id.clone()),
                 profile_id,
             }));
         }
@@ -13419,7 +13512,10 @@ impl Store {
                         );
                     }
                 }
-                ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => {}
+                ActivityKind::Report
+                | ActivityKind::Approval
+                | ActivityKind::Warning
+                | ActivityKind::Error => {}
             }
         }
         summary
@@ -13439,7 +13535,10 @@ impl Store {
                                 .as_deref()
                                 .is_some_and(|detail| detail.contains("diff preview ready"))
                     }
-                    ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => false,
+                    ActivityKind::Report
+                    | ActivityKind::Approval
+                    | ActivityKind::Warning
+                    | ActivityKind::Error => false,
                 }
         })
     }
@@ -25383,9 +25482,18 @@ now analyzing the bus module"
     }
 
     fn apply_loop_list(store: &mut Store, loops: Vec<octos_core::ui_protocol::UiLoopRecord>) {
+        apply_loop_list_for_scope(store, Some(SessionKey("local:test".into())), loops);
+    }
+
+    fn apply_loop_list_for_scope(
+        store: &mut Store,
+        session_id: Option<SessionKey>,
+        loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    ) {
         store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
             result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
-                session_id: SessionKey("local:test".into()),
+                session_id,
+                profile_id: Some("kimi".into()),
                 loops,
             }),
         });
@@ -25397,60 +25505,229 @@ now analyzing the bus module"
         // result and print a bare count, so loop ids were unobtainable and
         // /loop pause|resume|delete|fire-now were unusable.
         let mut store = store_with_empty_session();
-        apply_loop_list(
+        apply_loop_list_for_scope(
             &mut store,
+            None,
             vec![
                 list_loop_record("loop-aaa", "写书", "active"),
                 list_loop_record("loop-bbb", "查 CI", "paused"),
             ],
         );
 
-        let item = store.state.activity.last().expect("transcript entry");
-        let text = format!(
-            "{} {} {}",
-            item.title,
-            item.status,
-            item.detail.clone().unwrap_or_default()
-        );
+        // Assert the RENDERED transcript, not a data field: an earlier version
+        // stored the list in `detail`, which renders nothing at all.
+        let text = crate::app::debug_render_text(&store.state);
         assert!(text.contains("loop-aaa"), "first id listed: {text}");
         assert!(text.contains("loop-bbb"), "second id listed: {text}");
         assert!(
             text.contains("active") && text.contains("paused"),
             "statuses listed: {text}"
         );
+        let first_row = text
+            .lines()
+            .position(|row| row.contains("loop-aaa"))
+            .expect("first loop has a rendered row");
+        let second_row = text
+            .lines()
+            .position(|row| row.contains("loop-bbb"))
+            .expect("second loop has a rendered row");
+        assert_ne!(first_row, second_row, "each loop gets its own row: {text}");
+        assert!(
+            !text.contains("Agent task completed"),
+            "a local report must not masquerade as an agent task: {text}"
+        );
+        assert_eq!(store.state.status, "Loop list refreshed: 2 loop(s)");
     }
 
     #[test]
     fn loop_list_entry_shows_cadence_and_prompt() {
         let mut store = store_with_empty_session();
-        apply_loop_list(
+        apply_loop_list_for_scope(
             &mut store,
+            None,
             vec![list_loop_record("loop-aaa", "请你完成这本书", "active")],
         );
 
-        let item = store.state.activity.last().expect("transcript entry");
-        let text = item.detail.clone().unwrap_or_default();
+        let text = crate::app::debug_render_text(&store.state);
         assert!(text.contains("self-paced"), "cadence shown: {text}");
+        // Ratatui's TestBackend stores an empty/space continuation cell after
+        // each double-width CJK glyph. Remove those buffer-only placeholders
+        // before comparing the logical prompt text.
+        let logical_text = text.replace(' ', "");
         assert!(
-            text.contains("请你完成这本书"),
+            logical_text.contains("请你完成这本书"),
             "prompt summary shown: {text}"
+        );
+    }
+
+    #[test]
+    fn loop_list_report_wraps_without_hiding_ids() {
+        let mut store = store_with_empty_session();
+        assert!(!store.state.expanded_tool_outputs, "default collapse state");
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![
+                list_loop_record("loop-narrow-a", "整理所有发布说明", "active"),
+                list_loop_record("loop-narrow-b", "检查所有持续集成任务", "paused"),
+            ],
+        );
+
+        let text = crate::app::debug_render_text_with_size(&store.state, 52, 42);
+        assert!(text.contains("loop-narrow-a"), "first id survives: {text}");
+        assert!(text.contains("loop-narrow-b"), "second id survives: {text}");
+        assert!(
+            !text.contains("more line(s) hidden") && !text.contains("行已隐藏"),
+            "reports never use the collapsed Tool preview: {text}"
         );
     }
 
     #[test]
     fn empty_loop_list_still_explains_how_to_create() {
         let mut store = store_with_empty_session();
-        apply_loop_list(&mut store, vec![]);
+        apply_loop_list_for_scope(&mut store, None, vec![]);
 
-        let item = store.state.activity.last().expect("transcript entry");
-        let text = format!(
-            "{} {}",
-            item.status,
-            item.detail.clone().unwrap_or_default()
-        );
+        let text = crate::app::debug_render_text(&store.state);
         assert!(
             text.contains("/loop"),
             "empty list explains creation: {text}"
+        );
+    }
+
+    #[test]
+    fn repeated_loop_list_keeps_only_latest_report() {
+        // The list is a snapshot of CURRENT state, not a log — stacking stale
+        // snapshots below the fresh one misleads (spec: only the latest
+        // report survives, including across scoped/global queries).
+        let mut store = store_with_empty_session();
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record("loop-aaa", "写书", "paused")],
+        );
+        assert!(
+            store.state.active_menu.is_none(),
+            "a global /loop list must NOT pop a menu"
+        );
+
+        let reports = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.kind == ActivityKind::Report)
+            .count();
+        assert_eq!(reports, 1, "exactly one loop-list report survives");
+
+        let text = crate::app::debug_render_text(&store.state);
+        let rows = text.lines().filter(|row| row.contains("loop-aaa")).count();
+        assert_eq!(rows, 1, "the id renders on exactly one row: {text}");
+        assert!(
+            text.contains("paused"),
+            "the surviving report reflects the LATEST result: {text}"
+        );
+    }
+
+    #[test]
+    fn scoped_user_loop_list_opens_menu_without_report() {
+        // Menu-first: the menu is live, a report is a frozen snapshot —
+        // showing both drifts apart after any mutation (user report
+        // 2026-08-08: menu said paused while the report still said active).
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(store.state.active_menu.is_some(), "menu opens");
+        let reports = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| item.kind == ActivityKind::Report)
+            .count();
+        assert_eq!(reports, 0, "a scoped query pushes NO transcript report");
+    }
+
+    #[test]
+    fn empty_scoped_loop_list_opens_usable_menu() {
+        // An empty list still answers with a REAL menu (creation hint as a
+        // read-only row), not an Unavailable card (user request 2026-08-08).
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(&mut store, vec![]);
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                assert!(
+                    spec.items.iter().any(|item| item.label.contains("/loop")),
+                    "the empty menu carries the creation hint"
+                );
+            }
+            other => panic!("expected a Ready menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_loop_list_opens_menu_but_hydration_does_not() {
+        // Session-open hydration fires loop/list silently; found live
+        // 2026-08-08: the unconditional open popped the menu on session open,
+        // swallowed subsequent typing into its search box, and a stray Enter
+        // pause-toggled a loop the user never selected.
+        let mut store = store_with_empty_session();
+
+        // Hydration result: flag unset — no menu.
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(
+            store.state.active_menu.is_none(),
+            "hydration must never pop the loops menu"
+        );
+
+        // User-dispatched: flag armed — menu opens.
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(
+            store.state.active_menu.is_some(),
+            "an explicit /loop list opens the menu"
+        );
+        assert!(
+            !store.state.pending_loop_list_menu,
+            "the flag is consumed by the result"
+        );
+    }
+
+    #[test]
+    fn loop_list_report_renders_without_active_session() {
+        let mut store = Store {
+            state: AppState::new(vec![], 0, "ready".into(), None, false),
+        };
+        apply_loop_list_for_scope(
+            &mut store,
+            None,
+            vec![list_loop_record(
+                "loop-global-only",
+                "跨会话清理缓存",
+                "active",
+            )],
+        );
+
+        let text = crate::app::debug_render_text(&store.state);
+        assert!(
+            text.contains("loop-global-only"),
+            "global report visible without a session: {text}"
+        );
+        assert!(
+            !text.contains("Agent task completed"),
+            "global report is not an agent task: {text}"
         );
     }
 
@@ -34939,6 +35216,274 @@ now analyzing the bus module"
     }
 
     #[test]
+    fn global_loop_list_block_labels_each_session() {
+        // Spec task-loop-list-global-decode: a global list spans sessions, so
+        // bare ids leave the reader unable to tell which session each loop
+        // belongs to.
+        let block = crate::app::format_loop_list_block(
+            &[
+                loop_for_session("loop_a", "kimi:local:tui#coding"),
+                loop_for_session("loop_b", "kimi:local:tui#notes"),
+            ],
+            true,
+        );
+
+        assert!(
+            block.contains("local:tui#coding"),
+            "first session shown: {block}"
+        );
+        assert!(
+            block.contains("local:tui#notes"),
+            "second session shown: {block}"
+        );
+    }
+
+    #[test]
+    fn scoped_loop_list_block_omits_session_column() {
+        // Every loop in a scoped list shares the one known session — repeating
+        // it on each row is noise.
+        let block = crate::app::format_loop_list_block(
+            &[loop_for_session("loop_a", "kimi:local:tui#coding")],
+            false,
+        );
+
+        assert!(
+            !block.contains("local:tui#coding"),
+            "scoped list omits the session column: {block}"
+        );
+        assert!(block.contains("loop_a"), "id still present: {block}");
+    }
+
+    #[test]
+    fn loop_list_result_decodes_null_session_id() {
+        // Spec task-loop-list-global-decode: the server echoes the request's
+        // session_id, so a global query comes back as `"session_id": null`.
+        // A non-Option field made the whole response undecodable — the list
+        // was permanently empty (same class as the 2026-08-03 hydrate break).
+        let wire = serde_json::json!({
+            "session_id": serde_json::Value::Null,
+            "profile_id": "kimi",
+            "loops": []
+        });
+
+        let decoded: crate::model::LoopListResult =
+            serde_json::from_value(wire).expect("global-query response must decode");
+
+        assert!(decoded.session_id.is_none(), "null decodes to None");
+    }
+
+    fn loop_for_session(loop_id: &str, session: &str) -> octos_core::ui_protocol::UiLoopRecord {
+        let now = chrono::Utc::now().timestamp_millis();
+        octos_core::ui_protocol::UiLoopRecord {
+            loop_id: loop_id.into(),
+            session_id: SessionKey(session.into()),
+            profile_id: Some("kimi".into()),
+            prompt: "写书".into(),
+            mode: "self_paced".into(),
+            interval_seconds: None,
+            status: "active".into(),
+            next_run_at_ms: Some(now + 60_000),
+            last_run_at_ms: None,
+            expires_at_ms: now + 3_600_000,
+            created_at_ms: now,
+            updated_at_ms: now,
+        }
+    }
+
+    fn apply_list_result(
+        store: &mut Store,
+        session_id: Option<&str>,
+        loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
+    ) {
+        store.apply_autonomy_result(crate::client_event::AutonomyClientEvent {
+            result: crate::client_event::AutonomyResult::LoopList(crate::model::LoopListResult {
+                session_id: session_id.map(|id| SessionKey(id.into())),
+                profile_id: Some("kimi".into()),
+                loops,
+            }),
+        });
+    }
+
+    #[test]
+    fn global_loop_list_distributes_by_record_session() {
+        // A global query returns loops from MANY sessions; writing them all
+        // into one mirror would misattribute them.
+        let mut store = store_with_empty_session();
+        apply_list_result(
+            &mut store,
+            None,
+            vec![
+                loop_for_session("loop_a", "kimi:local:tui#coding"),
+                loop_for_session("loop_b", "kimi:local:tui#notes"),
+            ],
+        );
+
+        let coding = store
+            .state
+            .session_autonomy_for(&SessionKey("kimi:local:tui#coding".into()))
+            .expect("coding mirror");
+        let notes = store
+            .state
+            .session_autonomy_for(&SessionKey("kimi:local:tui#notes".into()))
+            .expect("notes mirror");
+        assert_eq!(coding.loops.len(), 1, "each loop lands in its own session");
+        assert_eq!(notes.loops.len(), 1);
+        assert_eq!(coding.loops[0].loop_id, "loop_a");
+        assert_eq!(notes.loops[0].loop_id, "loop_b");
+    }
+
+    #[test]
+    fn scoped_loop_list_replaces_that_session_set() {
+        let mut store = store_with_empty_session();
+        apply_list_result(
+            &mut store,
+            Some("kimi:local:tui#coding"),
+            vec![loop_for_session("loop_a", "kimi:local:tui#coding")],
+        );
+
+        let mirror = store
+            .state
+            .session_autonomy_for(&SessionKey("kimi:local:tui#coding".into()))
+            .expect("mirror");
+        assert_eq!(mirror.loops.len(), 1, "scoped set is replaced wholesale");
+    }
+
+    fn mirror_len(store: &Store, session: &str) -> usize {
+        store
+            .state
+            .session_autonomy_for(&SessionKey(session.into()))
+            .map(|entry| entry.loops.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn global_loop_list_clears_vanished_loops_in_scope() {
+        // A global response IS authoritative for the profile the server
+        // resolved. Keeping unlisted sessions produced a contradictory UI:
+        // status bar "0 loop(s)" while the indicator row still showed one.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("kimi:local:tui#coding".into()),
+            loop_for_session("loop_a", "kimi:local:tui#coding"),
+        );
+
+        apply_list_result(
+            &mut store,
+            None,
+            vec![loop_for_session("loop_b", "kimi:local:tui#notes")],
+        );
+
+        assert_eq!(
+            mirror_len(&store, "kimi:local:tui#coding"),
+            0,
+            "a loop the server no longer reports must disappear"
+        );
+        assert_eq!(mirror_len(&store, "kimi:local:tui#notes"), 1);
+    }
+
+    #[test]
+    fn global_loop_list_leaves_other_profiles_untouched() {
+        // The response's profile_id bounds its authority — another profile's
+        // sessions must survive untouched.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("other:local:tui#coding".into()),
+            loop_for_session("loop_x", "other:local:tui#coding"),
+        );
+
+        apply_list_result(
+            &mut store,
+            None,
+            vec![loop_for_session("loop_b", "kimi:local:tui#notes")],
+        );
+
+        assert_eq!(
+            mirror_len(&store, "other:local:tui#coding"),
+            1,
+            "out-of-scope profile keeps its loops"
+        );
+    }
+
+    #[test]
+    fn empty_global_response_clears_scope_so_ui_agrees() {
+        // The exact contradiction found while self-reviewing: an empty global
+        // response left the mirror populated, so the status bar said
+        // "0 loop(s)" while the autonomy row still showed a live loop.
+        let mut store = store_with_empty_session();
+        store.state.upsert_session_loop(
+            &SessionKey("kimi:local:tui#coding".into()),
+            loop_for_session("loop_a", "kimi:local:tui#coding"),
+        );
+
+        apply_list_result(&mut store, None, vec![]);
+
+        assert_eq!(
+            mirror_len(&store, "kimi:local:tui#coding"),
+            0,
+            "mirror must agree with the reported count"
+        );
+        assert!(
+            store.state.status.contains('0'),
+            "status reports zero: {}",
+            store.state.status
+        );
+    }
+
+    #[test]
+    fn loop_list_falls_back_to_launch_profile_without_session() {
+        // Without a session `active_session_profile_id()` is None, so the
+        // server would resolve the profile to `main` and filter out every
+        // loop that lives under the user's real profile.
+        let mut store = protocol_store_with_autonomy();
+        store.state.sessions.clear();
+        store.state.selected_session = 0;
+        store.state.onboarding.launch_profile_id = Some("kimi".into());
+        store.state.composer = "/loop list".into();
+
+        let command = store.compose_command();
+
+        let Some(AppUiCommand::ListLoops(params)) = command else {
+            panic!("expected ListLoops");
+        };
+        assert!(params.session_id.is_none(), "global query omits session_id");
+        assert_eq!(
+            params.profile_id.as_deref(),
+            Some("kimi"),
+            "falls back to the launch profile instead of letting the server pick main"
+        );
+    }
+
+    #[test]
+    fn loop_list_works_without_active_session() {
+        // Bug: `/loop list` used to require an active session because it called
+        // `active_autonomy_session_id()?` before dispatching. When no session was
+        // open, the command silently failed and the user saw nothing.
+        //
+        // Fix: `/loop list` is a global query that works with or without an
+        // active session — session_id is None when no session is open, which
+        // tells the server to return all loops (not filtered by session).
+        let mut store = protocol_store_with_autonomy();
+        // Clear the active session to simulate the no-session state
+        store.state.sessions.clear();
+        store.state.selected_session = 0; // Reset selection index
+        store.state.composer = "/loop list".into();
+
+        // The command should still be sent (with session_id = None)
+        let command = store.compose_command();
+        assert!(matches!(command, Some(AppUiCommand::ListLoops(_))));
+
+        // Verify the payload shape: session_id should be None (not empty string)
+        if let Some(AppUiCommand::ListLoops(params)) = command {
+            assert!(
+                params.session_id.is_none(),
+                "session_id should be None for global query, got {:?}",
+                params.session_id
+            );
+            // profile_id can be None or Some, but session_id must be None
+        }
+    }
+
+    #[test]
     fn loop_with_self_paced_prompt_dispatches_create_self_paced() {
         let mut store = protocol_store_with_autonomy();
         store.state.composer = "/loop check the deploy".into();
@@ -36807,7 +37352,8 @@ now analyzing the bus module"
         let session_id = SessionKey("local:test".into());
         store.apply_client_event(ClientEvent::Autonomy(AutonomyClientEvent {
             result: AutonomyResult::LoopList(crate::model::LoopListResult {
-                session_id: session_id.clone(),
+                session_id: Some(session_id.clone()),
+                profile_id: None,
                 loops: vec![UiLoopRecord {
                     loop_id: "loop_a".into(),
                     session_id: session_id.clone(),

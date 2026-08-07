@@ -1070,6 +1070,7 @@ pub fn core_command_specs() -> Vec<CommandSpec> {
             description: "command.loop.desc",
             category: CommandCategory::Runtime,
             availability: CommandAvailability::app_ui_read(&[])
+                .with_session(SessionRequirement::Any)
                 .with_required_methods_any(APPUI_LOOP_MENU_METHODS_ANY)
                 .with_required_features(AUTONOMY_FEATURES),
             inline_args: InlineArgMode::Optional,

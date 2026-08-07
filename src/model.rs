@@ -552,14 +552,25 @@ pub struct LoopCreateResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopListParams {
-    pub session_id: SessionKey,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionKey>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoopListResult {
-    pub session_id: SessionKey,
+    /// Echoed back from the request. A GLOBAL query sends no `session_id`, and
+    /// the server echoes that as `null` — a non-Option field here made the
+    /// whole response undecodable, so the list came back permanently empty
+    /// (spec task-loop-list-global-decode).
+    #[serde(default)]
+    pub session_id: Option<SessionKey>,
+    /// The profile the server RESOLVED for this query. A global query is
+    /// authoritative exactly within this profile — it is what lets the client
+    /// clear stale mirrors without touching other profiles.
+    #[serde(default)]
+    pub profile_id: Option<String>,
     #[serde(default)]
     pub loops: Vec<octos_core::ui_protocol::UiLoopRecord>,
 }
@@ -4497,6 +4508,10 @@ pub struct AppState {
     /// Session whose NEXT turn should be attributed to a loop: set when
     /// `loop/fired` arrives, consumed when that session's next turn starts.
     pub pending_loop_attribution: std::collections::HashSet<SessionKey>,
+    /// True while a USER-dispatched `/loop list` awaits its result. The
+    /// session-open hydration fires the same RPC silently; only an explicit
+    /// user query may pop the loops menu when the result lands.
+    pub pending_loop_list_menu: bool,
     /// Path of the `--config` file this session launched from, retained so
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
@@ -5099,6 +5114,9 @@ impl From<SessionStatusReadResult> for SessionRuntimeStatus {
 pub enum ActivityKind {
     Tool,
     Progress,
+    /// A client-local, fully rendered transcript report. Unlike runtime
+    /// activity, reports never enter the agent-task grouping/collapse path.
+    Report,
     Approval,
     Warning,
     Error,
@@ -5109,6 +5127,7 @@ impl ActivityKind {
         match self {
             Self::Tool => "tool",
             Self::Progress => "progress",
+            Self::Report => "report",
             Self::Approval => "approval",
             Self::Warning => "warning",
             Self::Error => "error",
@@ -6585,6 +6604,7 @@ impl AppState {
             loop_fire_counts: std::collections::HashMap::new(),
             loop_attributed_turns: std::collections::HashSet::new(),
             pending_loop_attribution: std::collections::HashSet::new(),
+            pending_loop_list_menu: false,
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,
@@ -10235,6 +10255,13 @@ fn estimated_activity_rows(item: &ActivityItem) -> usize {
             } else {
                 2
             }
+        }
+        ActivityKind::Report => {
+            1 + item
+                .detail
+                .as_deref()
+                .map(|body| body.lines().count().max(1))
+                .unwrap_or(0)
         }
         ActivityKind::Approval | ActivityKind::Warning | ActivityKind::Error => 2,
     }

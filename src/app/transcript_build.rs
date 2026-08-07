@@ -123,6 +123,7 @@ pub(super) fn live_tail_has_activity_section(
     app: &AppState,
     live_finalization: Option<&LiveTurnFinalization>,
 ) -> bool {
+    let has_reports = !flow_report_items(app).is_empty();
     let mut flow_activity = flow_activity_items(app);
     if let Some(finalization) = active_live_finalization(app, live_finalization) {
         flow_activity = flow_activity
@@ -136,7 +137,7 @@ pub(super) fn live_tail_has_activity_section(
             .map(|(_, item)| item)
             .collect();
     }
-    !flow_activity.is_empty()
+    has_reports || !flow_activity.is_empty()
 }
 
 pub(super) fn live_tail_lines_with_finalization(
@@ -146,46 +147,49 @@ pub(super) fn live_tail_lines_with_finalization(
     live_finalization: Option<&LiveTurnFinalization>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let Some(session) = app.active_session() else {
-        return lines;
-    };
     let active_finalization = active_live_finalization(app, live_finalization);
 
-    // `should_show_turn_flow` already covers the visible-approval and
-    // visible-question cases (it ORs them in), so a single branch suffices.
-    if should_show_turn_flow(app, session) {
-        let interactive_context_visible = app
-            .approval
-            .as_ref()
-            .is_some_and(|approval| approval.visible)
-            || app
-                .user_question
+    if let Some(session) = app.active_session() {
+        // `should_show_turn_flow` already covers the visible-approval and
+        // visible-question cases (it ORs them in), so a single branch suffices.
+        if should_show_turn_flow(app, session) {
+            let interactive_context_visible = app
+                .approval
                 .as_ref()
-                .is_some_and(|picker| picker.visible);
-        // The recent-user-context pin is only needed while an interactive overlay
-        // (approval / question) is visible — there it shows which prompt you're
-        // acting on. Otherwise the committed prompt is already in native scrollback
-        // just above the live tail, so pinning it again duplicates it (bug 2A: most
-        // visibly for a mid-turn-submitted prompt whose turn hasn't replied yet —
-        // the pin and the scrollback copy both sit on screen). The old
-        // `!has_flushed_content` clause showed the pin for every just-started turn,
-        // which is exactly the redundant case.
-        let show_recent_context = interactive_context_visible;
-        if show_recent_context
-            && let Some(prompt) = latest_user_message(session)
-                .filter(|prompt| !pending_messages_contains(&app.pending_messages, prompt))
-        {
-            push_recent_user_context(&mut lines, palette, prompt, wrap_width);
+                .is_some_and(|approval| approval.visible)
+                || app
+                    .user_question
+                    .as_ref()
+                    .is_some_and(|picker| picker.visible);
+            // The recent-user-context pin is only needed while an interactive overlay
+            // (approval / question) is visible — there it shows which prompt you're
+            // acting on. Otherwise the committed prompt is already in native scrollback
+            // just above the live tail, so pinning it again duplicates it (bug 2A: most
+            // visibly for a mid-turn-submitted prompt whose turn hasn't replied yet —
+            // the pin and the scrollback copy both sit on screen). The old
+            // `!has_flushed_content` clause showed the pin for every just-started turn,
+            // which is exactly the redundant case.
+            let show_recent_context = interactive_context_visible;
+            if show_recent_context
+                && let Some(prompt) = latest_user_message(session)
+                    .filter(|prompt| !pending_messages_contains(&app.pending_messages, prompt))
+            {
+                push_recent_user_context(&mut lines, palette, prompt, wrap_width);
+            }
+            push_turn_flow(
+                &mut lines,
+                palette,
+                app,
+                session,
+                wrap_width,
+                active_finalization,
+            );
         }
-        push_turn_flow(
-            &mut lines,
-            palette,
-            app,
-            session,
-            wrap_width,
-            active_finalization,
-        );
     }
+
+    // Reports are turn-independent local transcript output, so they remain
+    // visible while idle and even when no session exists.
+    push_report_section(&mut lines, palette, app, wrap_width);
 
     if !app.pending_messages.is_empty() {
         push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
@@ -940,11 +944,14 @@ pub(super) fn transcript_render_model(
         if !app.pending_messages.is_empty() {
             push_pending_messages_block(&mut lines, palette, &app.pending_messages, wrap_width);
         }
-    } else {
+        push_report_section(&mut lines, palette, app, wrap_width);
+    } else if flow_report_items(app).is_empty() {
         lines.push(Line::from(Span::styled(
             t!("app.empty.no_session").to_string(),
             palette.muted(),
         )));
+    } else {
+        push_report_section(&mut lines, palette, app, wrap_width);
     }
 
     collapse_blank_runs(&mut lines);
@@ -2625,6 +2632,53 @@ pub(super) fn push_wrapped_card_text(
                 Span::styled(continuation_prefix.clone(), Style::default()),
                 Span::styled(row, style),
             ]));
+        }
+    }
+}
+
+/// Render client-local reports as full-fidelity transcript blocks. This path
+/// is deliberately separate from `push_agent_task_group`: reports are neither
+/// agent actions nor Tool previews, so they never collapse, count as actions,
+/// or inherit the one-line preview limit. Each source line is wrapped without
+/// truncation and keeps a hanging indent on narrow terminals.
+pub(super) fn push_report_section(
+    lines: &mut Vec<Line<'static>>,
+    palette: Palette,
+    app: &AppState,
+    wrap_width: usize,
+) {
+    for report in flow_report_items(app) {
+        if !lines.is_empty() && !line_is_blank(lines.last()) {
+            lines.push(Line::from(""));
+        }
+
+        let mut header = vec![
+            Span::styled("• ", palette.selected()),
+            Span::styled(
+                report.title.clone(),
+                palette.muted().add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if !report.status.trim().is_empty() {
+            header.push(Span::styled(
+                format!("  {}", report.status),
+                palette.muted(),
+            ));
+        }
+        lines.push(Line::from(header));
+
+        if let Some(body) = report.detail.as_deref() {
+            let body_budget = wrap_width.saturating_sub(2).max(1);
+            for source_line in body.split('\n') {
+                push_wrapped_card_text(
+                    lines,
+                    vec![Span::styled("  ", palette.border())],
+                    "  ".to_string(),
+                    source_line,
+                    palette.text(),
+                    body_budget,
+                );
+            }
         }
     }
 }

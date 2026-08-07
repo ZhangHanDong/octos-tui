@@ -101,7 +101,13 @@ fn loop_list_slash_dispatches_loop_list_when_advertised() {
     let command = store.compose_command().expect("dispatched");
     match command {
         AppUiCommand::ListLoops(LoopListParams { session_id, .. }) => {
-            assert_eq!(session_id, SessionKey("coding:local:tui#coding".into()));
+            // `session_id` is optional now: a SCOPED query still carries the
+            // active session, while a global query omits it entirely so the
+            // server returns every loop (spec task-loop-list-global-decode).
+            assert_eq!(
+                session_id,
+                Some(SessionKey("coding:local:tui#coding".into()))
+            );
         }
         other => panic!("expected ListLoops, got {other:?}"),
     }
