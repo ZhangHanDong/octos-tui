@@ -380,7 +380,6 @@ fn classify_quota_failure(code: &str, message: &str) -> Option<QuotaFailure> {
     })
 }
 
-
 fn should_record_in_history(prompt: &str) -> bool {
     if prompt.is_empty() || prompt.starts_with('!') {
         return false;
@@ -10697,9 +10696,10 @@ impl Store {
             // but v2-only servers never emit it and the TUI intentionally does
             // not render it.
             UiNotification::Envelope(_) => None,
-            // Added by octos-core v2.0.3-rc.1. Neither has a client
-            // surface yet; drop them rather than guess at a rendering.
-            UiNotification::SkillActionJobUpdated(_) | UiNotification::PeerClosed(_) => None,
+            // Added by octos-core v2.0.3-rc.1; no client surface yet, so
+            // drop it rather than guess at a rendering. (PeerClosed, added in
+            // the same core rev, IS handled above by the peer console.)
+            UiNotification::SkillActionJobUpdated(_) => None,
             UiNotification::EnvelopeV2(event) => self.apply_envelope_v2(event),
             UiNotification::SessionEventBridged(event) => self.apply_session_event_bridged(event),
             UiNotification::RouterStatus(event) => {

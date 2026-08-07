@@ -100,8 +100,14 @@ fn closed_fence_flushes_as_complete_block() {
     );
 
     let previous_empty = octoscode::app::LiveTurnFinalization::default();
-    let lines =
-        finalized_live_turn_lines_between(&store.state, palette(), 80, &previous_empty, &next, false);
+    let lines = finalized_live_turn_lines_between(
+        &store.state,
+        palette(),
+        80,
+        &previous_empty,
+        &next,
+        false,
+    );
     let rendered = lines_text(&lines);
     let opens = rendered.iter().filter(|l| l.contains("┌─")).count();
     let closes = rendered.iter().filter(|l| l.contains("└─")).count();
