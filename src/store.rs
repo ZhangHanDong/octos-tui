@@ -6172,6 +6172,13 @@ impl Store {
             agents: self.state.active_session_agents(),
             loops: self.state.active_session_loops(),
             loop_actions_target: self.state.loop_actions_target.as_deref(),
+            now_ms: i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default(),
+            )
+            .ok(),
             unseen_agent_ids: self.state.active_session_unseen_agents(),
             chat_view_agent_id: match &self.state.chat_view {
                 crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),

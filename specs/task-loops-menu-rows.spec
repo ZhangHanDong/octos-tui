@@ -28,6 +28,12 @@ estimate: 0.25d
   "已不存在" 说明而非报错动词;`loop_actions_target` 不主动清理——它仅在
   `MENU_LOOP_ACTIONS` 在栈上时被读取,下次打开前必被覆写。
 - 空清单行为不变(仍为可用菜单 + 创建提示行,见 task-loop-list-transcript)。
+- (2026-08-09 补齐已批准图示)时钟经 `MenuAppSnapshot.now_ms` 显式注入
+  (store 在快照构建时取当前时间;测试传固定值,构建保持确定性)。清单行对
+  active 且有 `next_run_at_ms` 的 loop 追加 `· next <时长>`;子菜单详情行
+  追加 `· next <时长>` 与 `· <时长> left`(取 `expires_at_ms`)。`now_ms`
+  缺失或时刻已过期时**省略该段,不虚构**。菜单不逐帧重绘,倒计时按事件
+  刷新粒度更新即可——秒级精度由常驻的自主指示行负责。
 
 ## 边界
 
@@ -48,7 +54,6 @@ estimate: 0.25d
 
 ## 排除范围
 
-- 清单行内显示下次触发倒计时(菜单构建无时钟上下文,自主指示行已提供)。
 - 跨会话全局菜单(菜单数据源仍为活跃会话镜像)。
 
 ## 完成条件
@@ -81,6 +86,25 @@ estimate: 0.25d
   假设 目标 id 不在当前 loop 镜像中
   当 构建动作子菜单
   那么 返回不可用说明而非动词行
+
+场景: 清单行显示下次触发倒计时
+  测试: loops_menu_row_shows_next_run_countdown
+  假设 一个 active loop 的 next_run_at_ms 晚于注入的 now_ms 十四分钟
+  当 构建 loops 菜单
+  那么 该行包含 next 与 14m 字样
+
+场景: 时钟缺失时不虚构倒计时
+  测试: loops_menu_row_omits_next_without_clock
+  假设 快照未注入 now_ms
+  当 构建 loops 菜单
+  那么 行内不含 next 字样
+
+场景: 子菜单详情行包含剩余寿命
+  测试: loop_actions_detail_shows_next_and_expiry
+  假设 目标 loop 有 next_run_at_ms 与 expires_at_ms 且晚于 now_ms
+  当 构建动作子菜单
+  那么 详情行包含 next 字样
+  并且 包含 left 字样
 
 场景: 激活清单行打开子菜单并记录目标
   测试: activating_loop_row_opens_action_submenu

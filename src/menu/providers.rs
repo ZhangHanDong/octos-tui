@@ -1278,10 +1278,15 @@ fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         // ONE row per loop (2026-08-09, user feedback: the old
         // row-per-verb layout repeated the id three times and read as
         // duplicate loops). Enter opens the per-loop action submenu.
+        let next = (record.status == "active")
+            .then(|| loop_countdown(ctx.app.now_ms, record.next_run_at_ms))
+            .flatten()
+            .map(|d| format!(" · next {d}"))
+            .unwrap_or_default();
         items.push(
             MenuItem::new(
                 format!("loops.select.{}", record.loop_id),
-                format!("{base_label}  {prompt_summary}"),
+                format!("{base_label}{next}  {prompt_summary}"),
                 MenuAction::Local(LocalAction::OpenLoopActions(record.loop_id.clone())),
             )
             .with_description(t!("menu.loops.row_hint").into_owned()),
@@ -1327,6 +1332,15 @@ fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
 /// slash command through the existing capability-gated loop command path;
 /// `RunSlashCommand` closes the stack first, so the mutation lands on a
 /// clean composer.
+/// `Some("14m 55s")` when `at_ms` is a real future moment relative to the
+/// injected clock; `None` (omit, never fabricate) otherwise.
+fn loop_countdown(now_ms: Option<i64>, at_ms: Option<i64>) -> Option<String> {
+    let now = now_ms?;
+    let at = at_ms?;
+    let secs = u64::try_from((at - now) / 1000).ok().filter(|s| *s > 0)?;
+    Some(crate::app::format_loop_duration(secs))
+}
+
 fn loop_actions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
     let unavailable = |message: String| {
         MenuBuildResult::Unavailable(MenuStatusSpec {
@@ -1365,7 +1379,16 @@ fn loop_actions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         // Read-only detail header rows — the cursor skips them.
         MenuItem::new(
             "loop_actions.detail",
-            format!("{} · {}", record.status, cadence),
+            {
+                let mut detail = format!("{} · {}", record.status, cadence);
+                if let Some(next) = loop_countdown(ctx.app.now_ms, record.next_run_at_ms) {
+                    detail.push_str(&format!(" · next {next}"));
+                }
+                if let Some(left) = loop_countdown(ctx.app.now_ms, Some(record.expires_at_ms)) {
+                    detail.push_str(&format!(" · {left} left"));
+                }
+                detail
+            },
             MenuAction::Noop,
         )
         .with_state(MenuItemState {
@@ -9503,6 +9526,89 @@ mod tests {
                 .iter()
                 .any(|item| item.id == "loop_actions.pause"),
             "a paused loop offers resume, not pause"
+        );
+    }
+
+    #[test]
+    fn loops_menu_row_shows_next_run_countdown() {
+        // Spec task-loops-menu-rows: the approved design carries the next-run
+        // countdown on the list row. The clock is INJECTED (now_ms) so menu
+        // builds stay deterministic.
+        let mut record = loop_record("build-check", "active");
+        record.next_run_at_ms = Some(1_000_000 + 14 * 60 * 1_000 + 55_000);
+        let loops = vec![record];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                now_ms: Some(1_000_000),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loops_menu(&ctx));
+        let row = &spec.items[0];
+        assert!(
+            row.label.contains("next") && row.label.contains("14m"),
+            "row carries the countdown: {}",
+            row.label
+        );
+    }
+
+    #[test]
+    fn loops_menu_row_omits_next_without_clock() {
+        // No injected clock -> no fabricated countdown.
+        let mut record = loop_record("build-check", "active");
+        record.next_run_at_ms = Some(2_000_000);
+        let loops = vec![record];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loops_menu(&ctx));
+        assert!(
+            !spec.items[0].label.contains("next"),
+            "no clock, no countdown: {}",
+            spec.items[0].label
+        );
+    }
+
+    #[test]
+    fn loop_actions_detail_shows_next_and_expiry() {
+        let mut record = loop_record("build-check", "active");
+        record.next_run_at_ms = Some(1_000_000 + 14 * 60 * 1_000);
+        record.expires_at_ms = 1_000_000 + 6 * 86_400_000 + 23 * 3_600_000;
+        let loops = vec![record];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                loop_actions_target: Some("build-check"),
+                now_ms: Some(1_000_000),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loop_actions_menu(&ctx));
+        let detail = spec
+            .items
+            .iter()
+            .find(|item| item.id == "loop_actions.detail")
+            .expect("detail row");
+        assert!(
+            detail.label.contains("next") && detail.label.contains("left"),
+            "detail carries countdown and lifetime: {}",
+            detail.label
         );
     }
 

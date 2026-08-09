@@ -765,6 +765,11 @@ pub struct MenuAppSnapshot<'a> {
     /// The loop the per-loop action submenu is currently targeting (set by
     /// `LocalAction::OpenLoopActions`, cleared when the submenu closes).
     pub loop_actions_target: Option<&'a str>,
+    /// Wall-clock "now" in epoch ms, injected at snapshot build so menu
+    /// builders can render countdowns while staying DETERMINISTIC under test
+    /// (fixed value) — builders must omit time-relative segments when absent,
+    /// never fabricate them.
+    pub now_ms: Option<i64>,
     /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
     pub unseen_agent_ids: &'a [String],
     /// The agent currently shown in the main pane, when peeking one —
