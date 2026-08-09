@@ -2645,6 +2645,11 @@ impl Store {
                     t!("status.inserted_at_cursor", text = text.trim_end()).into_owned();
                 None
             }
+            LocalAction::OpenLoopActions(loop_id) => {
+                self.state.loop_actions_target = Some(loop_id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOP_ACTIONS));
+                None
+            }
             LocalAction::RunSlashCommand(draft) => {
                 // Codex Enter semantics: run the highlighted command NOW.
                 // Close the popup first so a command that opens its own menu
@@ -6166,6 +6171,7 @@ impl Store {
                 .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
             agents: self.state.active_session_agents(),
             loops: self.state.active_session_loops(),
+            loop_actions_target: self.state.loop_actions_target.as_deref(),
             unseen_agent_ids: self.state.active_session_unseen_agents(),
             chat_view_agent_id: match &self.state.chat_view {
                 crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),
@@ -25775,6 +25781,41 @@ now analyzing the bus module"
                 );
             }
             other => panic!("expected a Ready menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activating_loop_row_opens_action_submenu() {
+        // Spec task-loops-menu-rows: a loops-list row activation records the
+        // target and pushes the per-loop action submenu onto the stack.
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(store.state.active_menu.is_some(), "loops menu open");
+
+        store.dispatch_menu_action(crate::menu::MenuAction::Local(
+            crate::menu::LocalAction::OpenLoopActions("loop-aaa".into()),
+        ));
+
+        assert_eq!(store.state.loop_actions_target.as_deref(), Some("loop-aaa"));
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                assert_eq!(
+                    spec.id.as_str(),
+                    crate::menu::registry::MENU_LOOP_ACTIONS,
+                    "action submenu is on top"
+                );
+                assert!(
+                    spec.items
+                        .iter()
+                        .any(|item| item.id == "loop_actions.pause"),
+                    "verbs are offered"
+                );
+            }
+            other => panic!("expected Ready action submenu, got {other:?}"),
         }
     }
 

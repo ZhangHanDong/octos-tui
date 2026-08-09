@@ -309,6 +309,10 @@ pub enum LocalAction {
     /// and requiring a second Enter. The string is the full slash draft to
     /// run (e.g. "/theme").
     RunSlashCommand(String),
+    /// Open the per-loop action submenu for `loop_id` (the loops list's row
+    /// action): records the target so `loop_actions_menu` knows which loop's
+    /// verbs to offer, then pushes `MENU_LOOP_ACTIONS` onto the stack.
+    OpenLoopActions(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,
@@ -758,6 +762,9 @@ pub struct MenuAppSnapshot<'a> {
     /// Active-session loop roster for the `/loop` list menu, mirrored from
     /// `AppState`'s per-session autonomy loops.
     pub loops: &'a [octos_core::ui_protocol::UiLoopRecord],
+    /// The loop the per-loop action submenu is currently targeting (set by
+    /// `LocalAction::OpenLoopActions`, cleared when the submenu closes).
+    pub loop_actions_target: Option<&'a str>,
     /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
     pub unseen_agent_ids: &'a [String],
     /// The agent currently shown in the main pane, when peeking one —

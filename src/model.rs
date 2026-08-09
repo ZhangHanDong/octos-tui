@@ -4512,6 +4512,9 @@ pub struct AppState {
     /// session-open hydration fires the same RPC silently; only an explicit
     /// user query may pop the loops menu when the result lands.
     pub pending_loop_list_menu: bool,
+    /// Loop id the `MENU_LOOP_ACTIONS` submenu is acting on (set when a
+    /// loops-list row is activated).
+    pub loop_actions_target: Option<String>,
     /// Path of the `--config` file this session launched from, retained so
     /// `/saveconfig` can persist runtime UI settings back. `None` when launched
     /// without `--config` (saving then falls back to the default path).
@@ -6605,6 +6608,7 @@ impl AppState {
             loop_attributed_turns: std::collections::HashSet::new(),
             pending_loop_attribution: std::collections::HashSet::new(),
             pending_loop_list_menu: false,
+            loop_actions_target: None,
             config_path: None,
             activity_navigator: ActivityNavigatorState::default(),
             focus: FocusPane::Composer,
