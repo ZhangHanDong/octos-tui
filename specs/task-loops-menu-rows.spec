@@ -28,6 +28,11 @@ estimate: 0.25d
   "已不存在" 说明而非报错动词;`loop_actions_target` 不主动清理——它仅在
   `MENU_LOOP_ACTIONS` 在栈上时被读取,下次打开前必被覆写。
 - 空清单行为不变(仍为可用菜单 + 创建提示行,见 task-loop-list-transcript)。
+- (2026-08-09 用户追加)清单行支持**→ 快速切换**:`MenuItem.right_action`
+  为通用二级动作槽,loops 行填 `QuickLoopToggle(loop_id)`——active → 派发
+  pause,paused → 派发 resume,其他状态无操作;**菜单保持打开**,变更结果
+  经镜像刷新回填行内。无 `right_action` 的行/菜单按下 → 仍为空操作,
+  不影响其他菜单。高频操作(暂停/恢复)一键完成;子菜单只承担低频动作。
 - (2026-08-09 补齐已批准图示)时钟经 `MenuAppSnapshot.now_ms` 显式注入
   (store 在快照构建时取当前时间;测试传固定值,构建保持确定性)。清单行对
   active 且有 `next_run_at_ms` 的 loop 追加 `· next <时长>`;子菜单详情行
@@ -43,6 +48,7 @@ estimate: 0.25d
 - src/menu/registry.rs
 - src/model.rs
 - src/store.rs
+- src/event_loop.rs
 - locales/en.yml
 - locales/zh.yml
 - specs/**
@@ -105,6 +111,26 @@ estimate: 0.25d
   当 构建动作子菜单
   那么 详情行包含 next 字样
   并且 包含 left 字样
+
+场景: 右方向键快速切换 active loop 为暂停
+  测试: right_arrow_on_active_loop_dispatches_pause
+  假设 loops 菜单打开且选中一个 active loop 行
+  当 按下右方向键
+  那么 派发针对该 loop 的 pause 命令
+  并且 菜单保持打开
+
+场景: 右方向键快速恢复 paused loop
+  测试: right_arrow_on_paused_loop_dispatches_resume
+  假设 loops 菜单打开且选中一个 paused loop 行
+  当 按下右方向键
+  那么 派发针对该 loop 的 resume 命令
+
+场景: 无二级动作的行按右键无操作
+  测试: right_arrow_without_right_action_is_noop
+  假设 菜单选中行未声明 right_action
+  当 按下右方向键
+  那么 不派发任何命令
+  并且 菜单保持打开
 
 场景: 激活清单行打开子菜单并记录目标
   测试: activating_loop_row_opens_action_submenu

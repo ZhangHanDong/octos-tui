@@ -539,7 +539,7 @@ menu:
       pause: "⏸ pause — 暂停调度,直到恢复"
       resume: "▶ resume — 恢复调度"
   loops:
-    row_hint: 回车查看操作
+    row_hint: "回车查看操作 · → 暂停/恢复"
     subtitle: "%{count} 个循环 · %{active} 活跃 · %{paused} 暂停"
     title: 循环
     unavailable_empty: 本会话还没有循环——用 /loop <提示词> 创建,或 /loop <提示词> every <间隔>。

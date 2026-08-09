@@ -1289,7 +1289,10 @@ fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
                 format!("{base_label}{next}  {prompt_summary}"),
                 MenuAction::Local(LocalAction::OpenLoopActions(record.loop_id.clone())),
             )
-            .with_description(t!("menu.loops.row_hint").into_owned()),
+            .with_description(t!("menu.loops.row_hint").into_owned())
+            .with_right_action(MenuAction::Local(LocalAction::QuickLoopToggle(
+                record.loop_id.clone(),
+            ))),
         );
     }
 

@@ -1132,7 +1132,7 @@ menu:
       pause: "⏸ pause — stop scheduling until resumed"
       resume: "▶ resume — re-arm the schedule"
   loops:
-    row_hint: Enter for actions
+    row_hint: "Enter actions · → pause/resume"
     subtitle: "%{count} loops · %{active} active · %{paused} paused"
     title: Loops
     unavailable_empty: No loops in this session yet — create one with /loop <prompt> or /loop <prompt> every <interval>.

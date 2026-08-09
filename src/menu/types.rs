@@ -313,6 +313,11 @@ pub enum LocalAction {
     /// action): records the target so `loop_actions_menu` knows which loop's
     /// verbs to offer, then pushes `MENU_LOOP_ACTIONS` onto the stack.
     OpenLoopActions(String),
+    /// Quick pause⇄resume for `loop_id` (the loops list's RIGHT-arrow
+    /// action): active dispatches pause, paused dispatches resume, anything
+    /// else is a no-op. The menu stays open; the row updates when the
+    /// mutation result refreshes the mirror.
+    QuickLoopToggle(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,
@@ -474,6 +479,10 @@ pub struct MenuItem {
     pub state: MenuItemState,
     pub disabled_reason: Option<String>,
     pub action: MenuAction,
+    /// Optional secondary action fired by the RIGHT arrow while the row is
+    /// selected — a quick verb that keeps the menu OPEN (unlike Enter's
+    /// primary action). Rows without one leave Right a no-op.
+    pub right_action: Option<MenuAction>,
 }
 
 impl MenuItem {
@@ -486,6 +495,7 @@ impl MenuItem {
             state: MenuItemState::default(),
             disabled_reason: None,
             action,
+            right_action: None,
         }
     }
 
@@ -518,6 +528,10 @@ impl MenuItem {
 
     pub fn is_enabled(&self) -> bool {
         self.disabled_reason.is_none()
+    }
+    pub fn with_right_action(mut self, action: MenuAction) -> Self {
+        self.right_action = Some(action);
+        self
     }
 }
 
