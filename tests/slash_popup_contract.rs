@@ -10,15 +10,15 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use octos_core::ui_protocol::UiProtocolCapabilities;
 use octos_core::{Message, SessionKey};
-use octos_tui::client_event::{CapabilitiesClientEvent, ClientEvent};
-use octos_tui::event_loop::handle_terminal_event;
-use octos_tui::menu::MenuBuildResult;
-use octos_tui::model::SessionView;
-use octos_tui::model::{
+use octoscode::client_event::{CapabilitiesClientEvent, ClientEvent};
+use octoscode::event_loop::handle_terminal_event;
+use octoscode::menu::MenuBuildResult;
+use octoscode::model::SessionView;
+use octoscode::model::{
     APPUI_METHOD_MODEL_LIST, APPUI_METHOD_PROFILE_LLM_CATALOG, APPUI_METHOD_PROFILE_LOCAL_CREATE,
     AppState, ConfigCapabilitiesListResult,
 };
-use octos_tui::store::Store;
+use octoscode::store::Store;
 
 #[test]
 fn typing_slash_scrollmode_filters_help_popup() {
@@ -78,7 +78,7 @@ fn typing_slash_scrollmode_filters_help_popup() {
 }
 
 #[test]
-fn typing_slash_onboard_filters_help_popup() {
+fn typing_a_slash_prefix_filters_the_help_popup() {
     // Session open (normal chat), capabilities advertised.
     let mut store = Store {
         state: AppState::new(
@@ -110,7 +110,7 @@ fn typing_slash_onboard_filters_help_popup() {
         message: "caps".into(),
     }));
 
-    for ch in "/onbo".chars() {
+    for ch in "/hel".chars() {
         handle_terminal_event(
             &mut store,
             Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
@@ -129,8 +129,21 @@ fn typing_slash_onboard_filters_help_popup() {
     eprintln!("COMPOSER: {:?}", store.state.composer);
     eprintln!("ITEMS: {ids:#?}");
     assert!(
-        spec.items.iter().any(|i| i.label.contains("onboard")),
-        "onboard should appear in the filtered popup"
+        spec.items.iter().any(|i| i.label.contains("help")),
+        "a visible command matching the typed prefix must appear in the popup"
+    );
+    // The probe used to be `/onbo`, but onboarding is now deliberately HIDDEN
+    // from the `/` menu while staying dispatchable by name (see
+    // `store::tests::onboard_is_hidden_from_menu_but_still_dispatchable`), so
+    // that prefix filters to an EMPTY popup and this contract tested nothing.
+    // Pin the hiding here too, so re-listing it is a deliberate change.
+    assert!(
+        !spec.items.iter().any(|i| i.label.contains("onboard")),
+        "onboarding is hidden from the `/` menu; items: {:?}",
+        spec.items
+            .iter()
+            .map(|i| i.label.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -138,7 +151,7 @@ struct BufferFrame {
     area: ratatui::layout::Rect,
     buffer: ratatui::buffer::Buffer,
 }
-impl octos_tui::tui_terminal::FrameLike for BufferFrame {
+impl octoscode::tui_terminal::FrameLike for BufferFrame {
     fn area(&self) -> ratatui::layout::Rect {
         self.area
     }
@@ -186,7 +199,7 @@ fn slash_popup_renders_in_short_viewport() {
         },
         message: "caps".into(),
     }));
-    for ch in "/onbo".chars() {
+    for ch in "/hel".chars() {
         handle_terminal_event(
             &mut store,
             Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
@@ -194,24 +207,24 @@ fn slash_popup_renders_in_short_viewport() {
     }
 
     // The inline viewport sizes itself; render at the computed height.
-    let height = octos_tui::app::live_ui_height(&store.state, 100, 40);
+    let height = octoscode::app::live_ui_height(&store.state, 100, 40);
     eprintln!("VIEWPORT HEIGHT: {height}");
     let area = ratatui::layout::Rect::new(0, 0, 100, height);
     let mut frame = BufferFrame {
         area,
         buffer: ratatui::buffer::Buffer::empty(area),
     };
-    octos_tui::app::render_viewport(
+    octoscode::app::render_viewport(
         &mut frame,
         &store.state,
-        octos_tui::theme::Palette::for_theme(octos_tui::cli::ThemeName::default()),
+        octoscode::theme::Palette::for_theme(octoscode::cli::ThemeName::default()),
     );
     let rows: Vec<String> = (0..height)
         .map(|y| (0..100).map(|x| frame.buffer[(x, y)].symbol()).collect())
         .collect();
     eprintln!("ROWS: {rows:#?}");
     assert!(
-        rows.iter().any(|r| r.contains("/onboard")),
+        rows.iter().any(|r| r.contains("/help")),
         "the popup must be visible in the inline viewport"
     );
 }

@@ -4,7 +4,7 @@ use crate::menu::availability::{AvailabilityContext, CommandAvailability};
 use crate::model::{
     AppUiCommand, OnboardingAction, OnboardingWizardState, ProfileLlmCatalogResult,
     ProfileLlmListResult, ProfileSkillsListResult, ProfileSkillsRegistrySearchResult,
-    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus,
+    SessionMcpCatalog, SessionModelCatalog, SessionRuntimeStatus, SubProvidersListResult,
 };
 use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -137,6 +137,7 @@ impl CommandSpec {
                 | "scrollmode"
                 | "saveconfig"
                 | "vimmode"
+                | "steer"
                 | "statusline"
                 | "title"
                 | "keymap"
@@ -298,12 +299,25 @@ pub enum LocalAction {
     SaveKeymap,
     RefreshMenu(MenuId),
     EditComposer(String),
+    /// Insert `text` into the composer AT THE CURSOR (unlike `EditComposer`,
+    /// which replaces the whole draft). The `@` file picker's row action
+    /// (#363): the picked relative path lands where the user typed `@`.
+    InsertComposerText(String),
     /// Codex Enter semantics for the slash popup: dispatch the highlighted
     /// command IMMEDIATELY (one Enter goes straight to the command's
     /// page/menu/action) instead of completing its name into the composer
     /// and requiring a second Enter. The string is the full slash draft to
     /// run (e.g. "/theme").
     RunSlashCommand(String),
+    /// Open the per-loop action submenu for `loop_id` (the loops list's row
+    /// action): records the target so `loop_actions_menu` knows which loop's
+    /// verbs to offer, then pushes `MENU_LOOP_ACTIONS` onto the stack.
+    OpenLoopActions(String),
+    /// Quick pause⇄resume for `loop_id` (the loops list's RIGHT-arrow
+    /// action): active dispatches pause, paused dispatches resume, anything
+    /// else is a no-op. The menu stays open; the row updates when the
+    /// mutation result refreshes the mirror.
+    QuickLoopToggle(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,
@@ -336,6 +350,7 @@ pub enum LocalAction {
     /// `/scrollmode <native|pinned>` sets). Only flips the runtime
     /// `AppState.pinned_scroll`; the launch config stays the default source.
     SetScrollMode,
+    SetSteerMidTurn,
     /// Copy the last assistant reply for the active session to the system
     /// clipboard (`/copy`). The store stages the text on
     /// `AppState::pending_clipboard`; the event loop emits the OSC 52 escape
@@ -394,6 +409,22 @@ pub enum LocalAction {
     /// (`/model` → "Remove a model…" picker row). The confirmed Yes row sends
     /// `profile/llm/delete`.
     RequestRemoveModel(Box<crate::model::ModelRemovalRequest>),
+    /// Stage a research provider lane for removal and open its Yes/No confirm
+    /// (`/research` menu → lane row). The captured `profile_id` + `key` are
+    /// carried to the confirm's Yes row, which sends
+    /// `profile/sub_providers/remove` — so a profile switch between select and
+    /// confirm cannot retarget the delete.
+    RequestRemoveResearchLane(Box<crate::model::ResearchLaneRemoval>),
+    /// Save the wizard's staged provider as the research lane with this key
+    /// (`MENU_RESEARCH_LANE_KEY` row: "cheap"/"strong"). Fires the
+    /// `profile/sub_providers/upsert` dispatch — the staged selection cannot
+    /// change while the picker is open (menus block composer + wizard edits),
+    /// so building the params at fire time reads exactly what the row showed.
+    SaveResearchLaneAs(String),
+    /// Stage a workspace-snapshot restore and open its Yes/No confirm
+    /// (`/undo` picker row, #1768). The captured session + snapshot id are
+    /// carried to the confirm's Yes row (`snapshot/restore`).
+    RequestRestoreSnapshot(Box<crate::model::SnapshotRestoreRequest>),
     Custom(&'static str),
 }
 
@@ -448,6 +479,10 @@ pub struct MenuItem {
     pub state: MenuItemState,
     pub disabled_reason: Option<String>,
     pub action: MenuAction,
+    /// Optional secondary action fired by the RIGHT arrow while the row is
+    /// selected — a quick verb that keeps the menu OPEN (unlike Enter's
+    /// primary action). Rows without one leave Right a no-op.
+    pub right_action: Option<MenuAction>,
 }
 
 impl MenuItem {
@@ -460,6 +495,7 @@ impl MenuItem {
             state: MenuItemState::default(),
             disabled_reason: None,
             action,
+            right_action: None,
         }
     }
 
@@ -492,6 +528,10 @@ impl MenuItem {
 
     pub fn is_enabled(&self) -> bool {
         self.disabled_reason.is_none()
+    }
+    pub fn with_right_action(mut self, action: MenuAction) -> Self {
+        self.right_action = Some(action);
+        self
     }
 }
 
@@ -690,6 +730,9 @@ pub struct MenuAppSnapshot<'a> {
     pub model_catalog: Option<&'a SessionModelCatalog>,
     pub profile_llm_catalog: Option<&'a ProfileLlmCatalogResult>,
     pub profile_llm_state: Option<&'a ProfileLlmListResult>,
+    pub sub_providers_state: Option<&'a SubProvidersListResult>,
+    /// #1768: last snapshot list for the /undo picker.
+    pub snapshots_state: Option<&'a crate::model::SnapshotListResult>,
     pub profile_skills: Option<&'a ProfileSkillsListResult>,
     pub profile_skill_registry: Option<&'a ProfileSkillsRegistrySearchResult>,
     pub mcp_catalog: Option<&'a SessionMcpCatalog>,
@@ -709,6 +752,8 @@ pub struct MenuAppSnapshot<'a> {
     /// render one row per session. Empty until the first fetch lands (the menu
     /// renders `Loading` in that window).
     pub resume_sessions: &'a [crate::model::ResumeSessionRow],
+    /// #324: open-session chips for the Ctrl+S/Alt+S switcher popup.
+    pub session_chips: Vec<crate::model::SessionChipView>,
     /// Whether a `session/list` result has landed, mirrored from
     /// `AppState::resume_list_loaded`. Lets `resume_menu` tell a genuinely
     /// in-flight fetch (render `Loading`) apart from a completed fetch that
@@ -728,6 +773,17 @@ pub struct MenuAppSnapshot<'a> {
     /// Active-session sub-agent roster for the `/agents` picker (#323),
     /// mirrored from `AppState::active_session_agents`.
     pub agents: &'a [octos_core::ui_protocol::UiAgentRecord],
+    /// Active-session loop roster for the `/loop` list menu, mirrored from
+    /// `AppState`'s per-session autonomy loops.
+    pub loops: &'a [octos_core::ui_protocol::UiLoopRecord],
+    /// The loop the per-loop action submenu is currently targeting (set by
+    /// `LocalAction::OpenLoopActions`, cleared when the submenu closes).
+    pub loop_actions_target: Option<&'a str>,
+    /// Wall-clock "now" in epoch ms, injected at snapshot build so menu
+    /// builders can render countdowns while staying DETERMINISTIC under test
+    /// (fixed value) — builders must omit time-relative segments when absent,
+    /// never fabricate them.
+    pub now_ms: Option<i64>,
     /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
     pub unseen_agent_ids: &'a [String],
     /// The agent currently shown in the main pane, when peeking one —
@@ -736,6 +792,10 @@ pub struct MenuAppSnapshot<'a> {
     /// Whether the Agent Dock is collapsed to its summary pill, so the
     /// picker's toggle row can label itself expand vs collapse.
     pub agent_dock_collapsed: bool,
+    /// Workspace file list scanned when the `@` composer file picker was
+    /// opened, mirrored from `AppState::file_picker` so `file_picker_menu`
+    /// can render one row per file. `None` when the picker is not open.
+    pub file_picker: Option<&'a crate::file_picker::FilePickerState>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
