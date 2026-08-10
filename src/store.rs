@@ -11938,12 +11938,43 @@ impl Store {
         }
     }
 
+    /// Rejoin an envelope's split session key.
+    ///
+    /// Envelopes carry `session_id` stripped to its base plus a separate
+    /// `topic`; the TUI keys sessions by the full `base#topic`. Recompose only
+    /// when it resolves to a session that actually exists, so a server that
+    /// sends the full key already (or a genuinely topic-less session) keeps
+    /// routing exactly as before rather than being sent to a fabricated key.
+    fn envelope_session_key(&self, session_id: SessionKey, topic: Option<&str>) -> SessionKey {
+        let Some(topic) = topic.map(str::trim).filter(|topic| !topic.is_empty()) else {
+            return session_id;
+        };
+        if session_id.topic().is_some() {
+            return session_id;
+        }
+        let composed = SessionKey(format!("{}#{topic}", session_id.0));
+        if self.find_session(&composed).is_some() {
+            composed
+        } else {
+            session_id
+        }
+    }
+
     fn apply_envelope_v2(&mut self, event: EnvelopeV2Notification) -> Option<AppUiCommand> {
         let EnvelopeV2Notification {
             session_id,
             topic,
             envelope,
         } = event;
+        // The envelope lane delivers the session key SPLIT — `session_id` holds
+        // the base key and the topic rides in `topic` — while the TUI keys its
+        // sessions by the full `base#topic`. Routing on the bare key finds no
+        // session, so every delta AND the terminal were discarded: nothing
+        // rendered, the spinner never cleared, and the answer showed up only
+        // once a restart re-hydrated the session. Recompose once here, so all
+        // the arms below (including `commit_live_reply`, which routes purely on
+        // `session_id`) address the session the user is actually looking at.
+        let session_id = self.envelope_session_key(session_id, topic.as_deref());
         let thread_id = envelope.thread_id;
         let cursor = envelope.cursor;
         let wire_turn_id = envelope.turn_id;

@@ -7155,6 +7155,97 @@ mod tests {
         );
     }
 
+    /// Envelopes arrive with the session key SPLIT: `session_id` carries the
+    /// base key and the topic rides alongside in `topic` (verified against a
+    /// live server — opening `alan:local:tui#coding` yields
+    /// `session_id='alan:local:tui' topic='coding'`). The TUI keys its sessions
+    /// by the FULL key, so routing deltas on the bare `session_id` finds no
+    /// session and discards the whole turn: nothing renders, the spinner never
+    /// clears, and the answer only appears once a restart re-hydrates.
+    #[test]
+    fn envelope_with_split_session_topic_routes_to_the_full_key_session() {
+        const THREAD: &str = "aaae41c6-9491-4913-8167-4de07c2a57b1";
+        let full_key = "alan:local:tui#coding";
+        let base_key = "alan:local:tui";
+        let topic = "coding";
+
+        let mut store = crate::store::Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![AppUiSession {
+                id: SessionKey(full_key.into()),
+                title: "coding".into(),
+                profile_id: Some("alan".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "ready".into(),
+            target: None,
+            readonly: false,
+        });
+        store.state.composer = "hello".into();
+        store.compose_command().expect("submit starts a turn");
+
+        let mut pending = HashMap::new();
+        let frames = [
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": base_key, "topic": topic, "thread_id": THREAD,
+                "seq": 1, "turn_id": THREAD,
+                "payload": {"type":"assistant_delta","data":{
+                    "text":"Hello! ",
+                    "assistant_segment_id": "aaae41c6:assistant:1"}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": base_key, "topic": topic, "thread_id": THREAD,
+                "seq": 2, "turn_id": THREAD,
+                "payload": {"type":"assistant_persisted","data":{
+                    "text":"Hello! How can I help you today?",
+                    "assistant_segment_id": "aaae41c6:assistant:1",
+                    "meta": {"message_id":"m1","persisted_at":"2026-08-10T07:51:34.194329Z"}}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": base_key, "topic": topic, "thread_id": THREAD,
+                "seq": 3, "turn_id": THREAD,
+                "payload": {"type":"turn_terminal","data":{
+                    "outcome":"completed",
+                    "token_usage":{"input_tokens":87,"output_tokens":43}}}}}),
+        ];
+
+        for frame in frames {
+            let event = rpc_text_to_app_event_with_pending(&frame.to_string(), &mut pending)
+                .expect("frame decodes")
+                .expect("client event");
+            let ClientEvent::App(app_event) = event else {
+                panic!("expected an app event for {frame}");
+            };
+            store.apply_event(*app_event);
+        }
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id.0 == full_key)
+            .expect("the topic-keyed session still exists");
+        let transcript = session
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("How can I help you today?"),
+            "answer never reached the topic-keyed session: {transcript:?}"
+        );
+        assert!(
+            session.live_reply.is_none(),
+            "terminal never settled the topic-keyed session's turn"
+        );
+        assert_ne!(
+            store.state.run_state,
+            crate::model::SessionRunState::InProgress,
+            "run state stuck InProgress: the spinner never clears"
+        );
+    }
+
     #[test]
     fn profile_skill_results_decode_to_client_events() {
         let mut pending = HashMap::new();
