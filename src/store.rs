@@ -3,15 +3,15 @@ use std::collections::BTreeSet;
 use octos_core::app_ui::{AppUiEvent, AppUiSnapshot};
 use octos_core::ui_protocol::{
     ApprovalAutoResolvedEvent, ApprovalCancelledEvent, ApprovalDecidedEvent, ApprovalId,
-    ApprovalRespondParams, DiffPreviewGetParams, EnvelopeToolEndStatus, EnvelopeV2,
-    EnvelopeV2Notification, HydratedMessage, InputItem, MessageDeltaEvent, PayloadV2,
-    ReplayLossyEvent, SessionHydrateParams, SessionHydrateResult, SessionListParams,
-    SessionListResult, SessionOpenParams, SessionRollbackParams, SessionRollbackResult,
-    TaskArtifactReadParams, TaskOutputDeltaEvent, TaskOutputReadParams, TaskRuntimeState,
-    TaskUpdatedEvent, ThreadGraphGetParams, TurnCompletedEvent, TurnErrorEvent, TurnId,
-    TurnInterruptParams, TurnLifecycleState, TurnStartParams, TurnStateGetParams,
-    TurnTerminalOutcome, UiContextState, UiNotification, UiProgressEvent,
-    UserQuestionRequestedEvent,
+    ApprovalRespondParams, AttachmentOwnerV2, DiffPreviewGetParams, Envelope, EnvelopeNotification,
+    EnvelopeToolEndStatus, EnvelopeV2, EnvelopeV2Notification, HydratedMessage, InputItem,
+    MessageDeltaEvent, Payload, PayloadV2, ReplayLossyEvent, SessionHydrateParams,
+    SessionHydrateResult, SessionListParams, SessionListResult, SessionOpenParams,
+    SessionRollbackParams, SessionRollbackResult, TaskArtifactReadParams, TaskOutputDeltaEvent,
+    TaskOutputReadParams, TaskRuntimeState, TaskUpdatedEvent, ThreadGraphGetParams,
+    TurnCompletedEvent, TurnErrorEvent, TurnId, TurnInterruptParams, TurnLifecycleState,
+    TurnStartParams, TurnStateGetParams, TurnTerminalOutcome, UiContextState, UiNotification,
+    UiProgressEvent, UserQuestionRequestedEvent,
 };
 use octos_core::{Message, MessageRole, SessionKey, TaskId, ThreadId};
 use serde_json::Value;
@@ -11041,10 +11041,13 @@ impl Store {
             UiNotification::ReplayLossy(event) => self.apply_replay_lossy(event),
             UiNotification::TurnSpawnComplete(event) => self.apply_turn_spawn_complete(event),
             UiNotification::FileAttached(event) => self.apply_file_attached(event),
-            // octos-core retains the v1 enum variant for wire compatibility,
-            // but v2-only servers never emit it and the TUI intentionally does
-            // not render it.
-            UiNotification::Envelope(_) => None,
+            // A v1 server projects the SAME turn content as v2 — reply deltas
+            // and the turn terminal included — so discarding this arm silently
+            // stranded a whole turn: nothing rendered, the spinner never
+            // cleared, and the answer only appeared once a restart re-hydrated
+            // the session from the server. Lift it into the v2 shape and run
+            // the one handler instead of maintaining a second projection.
+            UiNotification::Envelope(event) => self.apply_envelope_v2(envelope_v1_as_v2(event)),
             // Added by octos-core v2.0.3-rc.1; no client surface yet, so
             // drop it rather than guess at a rendering. (PeerClosed, added in
             // the same core rev, IS handled above by the peer console.)
@@ -14494,6 +14497,116 @@ fn hydrated_row_to_message(row: HydratedMessage) -> Message {
         client_message_id: row.client_message_id,
         thread_id: row.thread_id,
         timestamp: row.persisted_at,
+    }
+}
+
+/// Lift a v1 projection envelope into the v2 shape so both wire versions run
+/// through [`Store::apply_envelope_v2`].
+///
+/// The payloads are the same union; v1 only lacks the two things v2 added:
+///
+/// * **No `turn_id`.** The thread IS the turn on the v1 wire (a thread is never
+///   reused — a new turn must use a new `thread_id`), and a live v2 server
+///   projects `turn_id == thread_id` anyway, so the thread id is the faithful
+///   substitute rather than a placeholder.
+/// * **No `assistant_segment_id`.** v1 predates multi-segment assistant
+///   iterations, so every fragment in a thread belongs to one segment; deltas
+///   and the persisted message must agree on the id or the persisted text
+///   opens a second bubble instead of finalizing the streamed one.
+///
+/// `turn_completed` becomes the canonical `TurnTerminal`. v1 has no failure
+/// terminal — an errored turn ends via `turn/failed`, not an envelope — so
+/// `Completed` is the only outcome this can carry.
+fn envelope_v1_as_v2(event: EnvelopeNotification) -> EnvelopeV2Notification {
+    let EnvelopeNotification {
+        session_id,
+        topic,
+        envelope,
+    } = event;
+    let Envelope {
+        thread_id,
+        seq,
+        client_message_id,
+        payload,
+    } = envelope;
+    let segment_id = format!("{thread_id}:assistant:1");
+
+    let payload_v2 = match payload {
+        Payload::UserMessage { text, files } => PayloadV2::UserMessage { text, files },
+        Payload::AssistantDelta { text } => PayloadV2::AssistantDelta {
+            text,
+            assistant_segment_id: segment_id,
+        },
+        Payload::ReasoningDelta { text } => PayloadV2::ReasoningDelta { text },
+        Payload::AssistantPersisted { text, meta } => PayloadV2::AssistantPersisted {
+            text,
+            assistant_segment_id: segment_id,
+            meta,
+        },
+        Payload::ToolStart {
+            tool_call_id,
+            name,
+            arguments_preview,
+        } => PayloadV2::ToolStart {
+            tool_call_id,
+            name,
+            arguments_preview,
+        },
+        Payload::ToolProgress {
+            tool_call_id,
+            message,
+        } => PayloadV2::ToolProgress {
+            tool_call_id,
+            message,
+        },
+        Payload::ToolEnd {
+            tool_call_id,
+            status,
+            error,
+            reason,
+            output_preview,
+            duration_ms,
+        } => PayloadV2::ToolEnd {
+            tool_call_id,
+            status,
+            error,
+            reason,
+            output_preview,
+            duration_ms,
+        },
+        Payload::FileAttached {
+            path,
+            mime,
+            size_bytes,
+        } => PayloadV2::FileAttached {
+            path,
+            mime,
+            size_bytes,
+            // v1 carries no owner; anchor to the thread's sole assistant
+            // segment so the file lands on the bubble it was streamed beside.
+            attachment_owner: AttachmentOwnerV2 {
+                assistant_segment_id: Some(segment_id),
+                tool_call_id: None,
+            },
+        },
+        Payload::TurnCompleted { token_usage } => PayloadV2::TurnTerminal {
+            outcome: TurnTerminalOutcome::Completed,
+            error: None,
+            token_usage: Some(token_usage),
+        },
+    };
+
+    EnvelopeV2Notification {
+        session_id,
+        topic,
+        envelope: EnvelopeV2 {
+            thread_id: thread_id.clone(),
+            seq,
+            cursor: None,
+            turn_id: thread_id,
+            client_message_id,
+            payload: payload_v2,
+        },
     }
 }
 
