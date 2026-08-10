@@ -2098,6 +2098,14 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         KeyCode::Up | KeyCode::Char('k') => {
             store.select_prev_menu_item();
         }
+        // RIGHT fires the selected row's quick secondary action (e.g. the
+        // loops list's pause⇄resume toggle) and keeps the menu open. Rows
+        // without a `right_action` leave the key a no-op, as before.
+        KeyCode::Right => {
+            if let Some(command) = store.trigger_menu_right_action() {
+                return KeyAction::send(command);
+            }
+        }
         _ => {}
     }
 

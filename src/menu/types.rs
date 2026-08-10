@@ -309,6 +309,15 @@ pub enum LocalAction {
     /// and requiring a second Enter. The string is the full slash draft to
     /// run (e.g. "/theme").
     RunSlashCommand(String),
+    /// Open the per-loop action submenu for `loop_id` (the loops list's row
+    /// action): records the target so `loop_actions_menu` knows which loop's
+    /// verbs to offer, then pushes `MENU_LOOP_ACTIONS` onto the stack.
+    OpenLoopActions(String),
+    /// Quick pause⇄resume for `loop_id` (the loops list's RIGHT-arrow
+    /// action): active dispatches pause, paused dispatches resume, anything
+    /// else is a no-op. The menu stays open; the row updates when the
+    /// mutation result refreshes the mirror.
+    QuickLoopToggle(String),
     Onboarding(OnboardingAction),
     Skills,
     McpConfig,
@@ -470,6 +479,10 @@ pub struct MenuItem {
     pub state: MenuItemState,
     pub disabled_reason: Option<String>,
     pub action: MenuAction,
+    /// Optional secondary action fired by the RIGHT arrow while the row is
+    /// selected — a quick verb that keeps the menu OPEN (unlike Enter's
+    /// primary action). Rows without one leave Right a no-op.
+    pub right_action: Option<MenuAction>,
 }
 
 impl MenuItem {
@@ -482,6 +495,7 @@ impl MenuItem {
             state: MenuItemState::default(),
             disabled_reason: None,
             action,
+            right_action: None,
         }
     }
 
@@ -514,6 +528,10 @@ impl MenuItem {
 
     pub fn is_enabled(&self) -> bool {
         self.disabled_reason.is_none()
+    }
+    pub fn with_right_action(mut self, action: MenuAction) -> Self {
+        self.right_action = Some(action);
+        self
     }
 }
 
@@ -758,6 +776,14 @@ pub struct MenuAppSnapshot<'a> {
     /// Active-session loop roster for the `/loop` list menu, mirrored from
     /// `AppState`'s per-session autonomy loops.
     pub loops: &'a [octos_core::ui_protocol::UiLoopRecord],
+    /// The loop the per-loop action submenu is currently targeting (set by
+    /// `LocalAction::OpenLoopActions`, cleared when the submenu closes).
+    pub loop_actions_target: Option<&'a str>,
+    /// Wall-clock "now" in epoch ms, injected at snapshot build so menu
+    /// builders can render countdowns while staying DETERMINISTIC under test
+    /// (fixed value) — builders must omit time-relative segments when absent,
+    /// never fabricate them.
+    pub now_ms: Option<i64>,
     /// Agent ids with unread terminal outcomes (Agent Dock badges, #323).
     pub unseen_agent_ids: &'a [String],
     /// The agent currently shown in the main pane, when peeking one —

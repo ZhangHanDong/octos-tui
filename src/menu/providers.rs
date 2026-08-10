@@ -81,6 +81,7 @@ pub fn core_menu_registry() -> MenuRegistry {
         Provider::Resume,
         Provider::Agents,
         Provider::Loops,
+        Provider::LoopActions,
         Provider::Rewind,
         Provider::Model,
         Provider::ModelConfig,
@@ -133,6 +134,7 @@ enum Provider {
     Resume,
     Agents,
     Loops,
+    LoopActions,
     Rewind,
     Model,
     ModelConfig,
@@ -180,6 +182,7 @@ impl MenuProvider for Provider {
             Self::Resume => MENU_RESUME,
             Self::Agents => crate::menu::registry::MENU_AGENTS,
             Self::Loops => crate::menu::registry::MENU_LOOPS,
+            Self::LoopActions => crate::menu::registry::MENU_LOOP_ACTIONS,
             Self::Rewind => MENU_REWIND,
             Self::Model => MENU_MODEL,
             Self::ModelConfig => MENU_MODEL_CONFIG,
@@ -227,6 +230,7 @@ impl MenuProvider for Provider {
             Self::Resume => resume_menu(ctx),
             Self::Agents => agents_menu(ctx),
             Self::Loops => loops_menu(ctx),
+            Self::LoopActions => loop_actions_menu(ctx),
             Self::Rewind => rewind_menu(ctx),
             Self::Model => model_menu(ctx),
             Self::ModelConfig => model_config_menu(ctx),
@@ -1271,27 +1275,25 @@ fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
             cadence
         );
 
-        // One action row per applicable verb, dispatched as the matching slash
-        // command so it flows through the existing capability-gated loop
-        // command path.
-        let verbs: &[&str] = match record.status.as_str() {
-            "active" => &["pause", "fire-now", "delete"],
-            "paused" => &["resume", "delete"],
-            _ => &["delete"],
-        };
-        for verb in verbs {
-            items.push(
-                MenuItem::new(
-                    format!("loops.{verb}.{}", record.loop_id),
-                    format!("{base_label}  ·  {verb}"),
-                    MenuAction::Local(LocalAction::RunSlashCommand(format!(
-                        "/loop {verb} {}",
-                        record.loop_id
-                    ))),
-                )
-                .with_description(prompt_summary.clone()),
-            );
-        }
+        // ONE row per loop (2026-08-09, user feedback: the old
+        // row-per-verb layout repeated the id three times and read as
+        // duplicate loops). Enter opens the per-loop action submenu.
+        let next = (record.status == "active")
+            .then(|| loop_countdown(ctx.app.now_ms, record.next_run_at_ms))
+            .flatten()
+            .map(|d| format!(" · next {d}"))
+            .unwrap_or_default();
+        items.push(
+            MenuItem::new(
+                format!("loops.select.{}", record.loop_id),
+                format!("{base_label}{next}  {prompt_summary}"),
+                MenuAction::Local(LocalAction::OpenLoopActions(record.loop_id.clone())),
+            )
+            .with_description(t!("menu.loops.row_hint").into_owned())
+            .with_right_action(MenuAction::Local(LocalAction::QuickLoopToggle(
+                record.loop_id.clone(),
+            ))),
+        );
     }
 
     let active = ctx
@@ -1323,6 +1325,111 @@ fn loops_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
         searchable: false,
         search_placeholder: None,
         footer_hint: Some(t!("menu.footer.esc_close").into_owned()),
+        preview: None,
+        mode: MenuMode::SingleSelect,
+    })
+}
+
+/// Per-loop action submenu: a read-only detail header (full status +
+/// prompt), then one row per applicable verb. Verbs dispatch the matching
+/// slash command through the existing capability-gated loop command path;
+/// `RunSlashCommand` closes the stack first, so the mutation lands on a
+/// clean composer.
+/// `Some("14m 55s")` when `at_ms` is a real future moment relative to the
+/// injected clock; `None` (omit, never fabricate) otherwise.
+fn loop_countdown(now_ms: Option<i64>, at_ms: Option<i64>) -> Option<String> {
+    let now = now_ms?;
+    let at = at_ms?;
+    let secs = u64::try_from((at - now) / 1000).ok().filter(|s| *s > 0)?;
+    Some(crate::app::format_loop_duration(secs))
+}
+
+fn loop_actions_menu(ctx: &MenuContext<'_>) -> MenuBuildResult {
+    let unavailable = |message: String| {
+        MenuBuildResult::Unavailable(MenuStatusSpec {
+            id: MenuId::from(crate::menu::registry::MENU_LOOP_ACTIONS),
+            title: t!("menu.loop_actions.title").into_owned(),
+            message,
+            footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
+        })
+    };
+    let Some(target) = ctx.app.loop_actions_target else {
+        return unavailable(t!("menu.loop_actions.no_target").into_owned());
+    };
+    let Some(record) = ctx.app.loops.iter().find(|l| l.loop_id == target) else {
+        // The loop vanished under us (deleted elsewhere / expired between
+        // refreshes) — say so instead of offering verbs that would fail.
+        return unavailable(t!("menu.loop_actions.gone", id = target).into_owned());
+    };
+
+    let cadence = match record.interval_seconds {
+        Some(secs) if secs >= 3600 => format!("every {}h", secs / 3600),
+        Some(secs) if secs >= 60 => format!("every {}m", secs / 60),
+        Some(secs) => format!("every {}s", secs),
+        None => record.mode.clone(),
+    };
+    let prompt_summary = record
+        .prompt
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(72)
+        .collect::<String>();
+
+    let mut items = vec![
+        // Read-only detail header rows — the cursor skips them.
+        MenuItem::new(
+            "loop_actions.detail",
+            {
+                let mut detail = format!("{} · {}", record.status, cadence);
+                if let Some(next) = loop_countdown(ctx.app.now_ms, record.next_run_at_ms) {
+                    detail.push_str(&format!(" · next {next}"));
+                }
+                if let Some(left) = loop_countdown(ctx.app.now_ms, Some(record.expires_at_ms)) {
+                    detail.push_str(&format!(" · {left} left"));
+                }
+                detail
+            },
+            MenuAction::Noop,
+        )
+        .with_state(MenuItemState {
+            non_selectable: true,
+            ..MenuItemState::default()
+        }),
+        MenuItem::new("loop_actions.prompt", prompt_summary, MenuAction::Noop).with_state(
+            MenuItemState {
+                non_selectable: true,
+                ..MenuItemState::default()
+            },
+        ),
+    ];
+    let verbs: &[&str] = match record.status.as_str() {
+        "active" => &["pause", "fire-now", "delete"],
+        "paused" => &["resume", "fire-now", "delete"],
+        _ => &["delete"],
+    };
+    for verb in verbs {
+        items.push(MenuItem::new(
+            format!("loop_actions.{verb}"),
+            t!(format!("menu.loop_actions.verb.{verb}")).into_owned(),
+            MenuAction::Local(LocalAction::RunSlashCommand(format!(
+                "/loop {verb} {}",
+                record.loop_id
+            ))),
+        ));
+    }
+
+    MenuBuildResult::Ready(MenuSpec {
+        id: MenuId::from(crate::menu::registry::MENU_LOOP_ACTIONS),
+        title: t!("menu.loop_actions.title_for", id = record.loop_id.clone()).into_owned(),
+        subtitle: None,
+        items,
+        tabs: Vec::new(),
+        searchable: false,
+        search_placeholder: None,
+        footer_hint: Some(t!("menu.footer.esc_back").into_owned()),
         preview: None,
         mode: MenuMode::SingleSelect,
     })
@@ -9313,7 +9420,10 @@ mod tests {
     /// dispatched as the matching `/loop <verb> <id>` slash command; Unavailable
     /// when the session has no loops.
     #[test]
-    fn loops_menu_lists_loops_with_actions() {
+    fn loops_menu_one_row_per_loop_opens_action_submenu() {
+        // Revised 2026-08-09 (user feedback): the old row-per-verb layout
+        // repeated each loop id three times and read as duplicate loops.
+        // Now: ONE row per loop; Enter opens the per-loop action submenu.
         let loops = vec![
             loop_record("build-check", "active"),
             loop_record("nightly", "paused"),
@@ -9330,40 +9440,198 @@ mod tests {
         };
         let spec = ready_spec(loops_menu(&ctx));
 
-        // Active loop gets pause/fire-now/delete rows; paused gets resume/delete.
+        let loop_rows: Vec<_> = spec
+            .items
+            .iter()
+            .filter(|item| item.id.starts_with("loops.select."))
+            .collect();
+        assert_eq!(loop_rows.len(), 2, "exactly one row per loop");
         assert!(
-            spec.items
-                .iter()
-                .any(|item| item.id == "loops.pause.build-check")
+            matches!(
+                &loop_rows[0].action,
+                MenuAction::Local(LocalAction::OpenLoopActions(id)) if id == "build-check"
+            ),
+            "the row opens the action submenu for its loop"
         );
         assert!(
-            spec.items
-                .iter()
-                .any(|item| item.id == "loops.fire-now.build-check")
+            loop_rows[0].label.contains("build-check") && loop_rows[0].label.contains("active"),
+            "the row carries id and status: {}",
+            loop_rows[0].label
         );
-        assert!(
-            spec.items
-                .iter()
-                .any(|item| item.id == "loops.resume.nightly")
-        );
+    }
+
+    #[test]
+    fn loop_actions_menu_offers_verbs_for_the_target() {
+        let loops = vec![
+            loop_record("build-check", "active"),
+            loop_record("nightly", "paused"),
+        ];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                loop_actions_target: Some("build-check"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loop_actions_menu(&ctx));
+
+        assert!(spec.title.contains("build-check"), "title names the loop");
         let pause_row = spec
             .items
             .iter()
-            .find(|item| item.id == "loops.pause.build-check")
-            .expect("pause row");
+            .find(|item| item.id == "loop_actions.pause")
+            .expect("active loop offers pause");
         assert!(
             matches!(
                 &pause_row.action,
                 MenuAction::Local(LocalAction::RunSlashCommand(cmd)) if cmd == "/loop pause build-check"
             ),
-            "row dispatches the pause slash command"
+            "verb dispatches the slash command for the TARGET loop"
+        );
+        assert!(
+            spec.items
+                .iter()
+                .filter(|item| item.state.non_selectable)
+                .count()
+                >= 2,
+            "detail header rows are read-only"
+        );
+    }
+
+    #[test]
+    fn loop_actions_menu_for_paused_loop_offers_resume() {
+        let loops = vec![loop_record("nightly", "paused")];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                loop_actions_target: Some("nightly"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loop_actions_menu(&ctx));
+        assert!(
+            spec.items
+                .iter()
+                .any(|item| item.id == "loop_actions.resume"),
+            "paused loop offers resume"
         );
         assert!(
             !spec
                 .items
                 .iter()
-                .any(|item| item.id == "loops.pause.nightly"),
+                .any(|item| item.id == "loop_actions.pause"),
             "a paused loop offers resume, not pause"
+        );
+    }
+
+    #[test]
+    fn loops_menu_row_shows_next_run_countdown() {
+        // Spec task-loops-menu-rows: the approved design carries the next-run
+        // countdown on the list row. The clock is INJECTED (now_ms) so menu
+        // builds stay deterministic.
+        let mut record = loop_record("build-check", "active");
+        record.next_run_at_ms = Some(1_000_000 + 14 * 60 * 1_000 + 55_000);
+        let loops = vec![record];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                now_ms: Some(1_000_000),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loops_menu(&ctx));
+        let row = &spec.items[0];
+        assert!(
+            row.label.contains("next") && row.label.contains("14m"),
+            "row carries the countdown: {}",
+            row.label
+        );
+    }
+
+    #[test]
+    fn loops_menu_row_omits_next_without_clock() {
+        // No injected clock -> no fabricated countdown.
+        let mut record = loop_record("build-check", "active");
+        record.next_run_at_ms = Some(2_000_000);
+        let loops = vec![record];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loops_menu(&ctx));
+        assert!(
+            !spec.items[0].label.contains("next"),
+            "no clock, no countdown: {}",
+            spec.items[0].label
+        );
+    }
+
+    #[test]
+    fn loop_actions_detail_shows_next_and_expiry() {
+        let mut record = loop_record("build-check", "active");
+        record.next_run_at_ms = Some(1_000_000 + 14 * 60 * 1_000);
+        record.expires_at_ms = 1_000_000 + 6 * 86_400_000 + 23 * 3_600_000;
+        let loops = vec![record];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                loop_actions_target: Some("build-check"),
+                now_ms: Some(1_000_000),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        let spec = ready_spec(loop_actions_menu(&ctx));
+        let detail = spec
+            .items
+            .iter()
+            .find(|item| item.id == "loop_actions.detail")
+            .expect("detail row");
+        assert!(
+            detail.label.contains("next") && detail.label.contains("left"),
+            "detail carries countdown and lifetime: {}",
+            detail.label
+        );
+    }
+
+    #[test]
+    fn loop_actions_menu_says_gone_when_target_vanished() {
+        let loops = vec![loop_record("survivor", "active")];
+        let ctx = MenuContext {
+            availability: AvailabilityContext::local(),
+            app: MenuAppSnapshot {
+                loops: &loops,
+                loop_actions_target: Some("deleted-elsewhere"),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+        assert!(
+            matches!(loop_actions_menu(&ctx), MenuBuildResult::Unavailable(_)),
+            "a vanished target explains itself instead of offering dead verbs"
         );
     }
 

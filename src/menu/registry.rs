@@ -75,6 +75,9 @@ pub const MENU_AGENTS: &str = "agents";
 /// `/loop` list menu — one row per loop in the active session (status, id,
 /// cadence, prompt) with pause/resume/delete/fire-now actions.
 pub const MENU_LOOPS: &str = "loops";
+/// Per-loop action submenu: one verb row (pause/resume/fire-now/delete) for
+/// the loop selected in `MENU_LOOPS`.
+pub const MENU_LOOP_ACTIONS: &str = "loop-actions";
 /// `/rewind` turn picker menu.
 pub const MENU_REWIND: &str = "rewind";
 pub const MENU_STATUS: &str = "status";

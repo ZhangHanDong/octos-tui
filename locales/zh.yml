@@ -528,6 +528,22 @@ lang:
   unknown: 未知语言 '%{value}'。可选：en、zh。
   usage: 当前语言：%{current}。用法：/lang <en|zh>。
 menu:
+  loop_actions:
+    gone: "循环 %{id} 已不存在——被删除或已过期。"
+    no_target: 未选中任何循环。
+    title: 循环操作
+    title_for: "循环 %{id}"
+    verb:
+      delete: "✕ delete — 删除该循环(不可恢复)"
+      fire-now: "⚡ fire-now — 立即触发一轮"
+      pause: "⏸ pause — 暂停调度,直到恢复"
+      resume: "▶ resume — 恢复调度"
+  loops:
+    row_hint: "回车查看操作 · → 暂停/恢复"
+    subtitle: "%{count} 个循环 · %{active} 活跃 · %{paused} 暂停"
+    title: 循环
+    unavailable_empty: 本会话还没有循环——用 /loop <提示词> 创建,或 /loop <提示词> every <间隔>。
+    unavailable_title: 循环
   file_picker:
     title: "插入文件路径"
     search: "输入以筛选工作区文件"

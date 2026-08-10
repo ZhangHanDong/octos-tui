@@ -2645,6 +2645,32 @@ impl Store {
                     t!("status.inserted_at_cursor", text = text.trim_end()).into_owned();
                 None
             }
+            LocalAction::OpenLoopActions(loop_id) => {
+                self.state.loop_actions_target = Some(loop_id);
+                self.open_menu(MenuId::from(crate::menu::registry::MENU_LOOP_ACTIONS));
+                None
+            }
+            LocalAction::QuickLoopToggle(loop_id) => {
+                // Status is read at KEYPRESS time from the mirror: active
+                // pauses, paused resumes, anything else no-ops. The menu is
+                // deliberately left open — the mutation result refreshes the
+                // mirror and the row flips in place.
+                let status = self
+                    .state
+                    .active_session_loops()
+                    .iter()
+                    .find(|record| record.loop_id == loop_id)
+                    .map(|record| record.status.clone());
+                match status.as_deref() {
+                    Some("active") => {
+                        self.dispatch_loop_command(crate::autonomy::LoopCommand::Pause(loop_id))
+                    }
+                    Some("paused") => {
+                        self.dispatch_loop_command(crate::autonomy::LoopCommand::Resume(loop_id))
+                    }
+                    _ => None,
+                }
+            }
             LocalAction::RunSlashCommand(draft) => {
                 // Codex Enter semantics: run the highlighted command NOW.
                 // Close the popup first so a command that opens its own menu
@@ -5855,6 +5881,22 @@ impl Store {
             || self.select_active_menu_item_by_id("provider.current")
     }
 
+    /// RIGHT-arrow secondary action: dispatch the selected row's
+    /// `right_action` if it declares one. Unlike Enter's accept path this
+    /// never closes the menu — quick verbs act in place.
+    pub fn trigger_menu_right_action(&mut self) -> Option<AppUiCommand> {
+        let action = match self.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => self
+                .state
+                .menu_stack
+                .active()
+                .and_then(|frame| spec.items.get(frame.selected_index))
+                .and_then(|item| item.right_action.clone()),
+            _ => None,
+        }?;
+        self.dispatch_menu_action(action)
+    }
+
     pub fn accept_active_menu_item(&mut self) -> Option<AppUiCommand> {
         let selected_index = self
             .state
@@ -6166,6 +6208,14 @@ impl Store {
                 .and_then(|session| crate::app::context_window_usage(&self.state, &session.id)),
             agents: self.state.active_session_agents(),
             loops: self.state.active_session_loops(),
+            loop_actions_target: self.state.loop_actions_target.as_deref(),
+            now_ms: i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or_default(),
+            )
+            .ok(),
             unseen_agent_ids: self.state.active_session_unseen_agents(),
             chat_view_agent_id: match &self.state.chat_view {
                 crate::model::ChatViewTarget::Agent(id) => Some(id.as_str()),
@@ -25889,6 +25939,106 @@ now analyzing the bus module"
                 );
             }
             other => panic!("expected a Ready menu, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_arrow_on_active_loop_dispatches_pause() {
+        // Spec task-loops-menu-rows: Right on a loop row quick-toggles
+        // WITHOUT closing the menu.
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_LOOP_PAUSE,
+                crate::model::APPUI_METHOD_LOOP_RESUME,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+
+        let command = store.trigger_menu_right_action();
+
+        match command {
+            Some(AppUiCommand::PauseLoop(params)) => {
+                assert_eq!(params.loop_id, "loop-aaa");
+            }
+            other => panic!("expected PauseLoop, got {other:?}"),
+        }
+        assert!(store.state.active_menu.is_some(), "menu stays open");
+    }
+
+    #[test]
+    fn right_arrow_on_paused_loop_dispatches_resume() {
+        let mut store = store_with_empty_session();
+        store.state.capabilities = Some(crate::menu::CapabilitySet::from_methods_and_features(
+            [
+                crate::model::APPUI_METHOD_LOOP_PAUSE,
+                crate::model::APPUI_METHOD_LOOP_RESUME,
+            ],
+            [crate::model::APPUI_FEATURE_CODING_AUTONOMY_V1],
+        ));
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "paused")],
+        );
+
+        match store.trigger_menu_right_action() {
+            Some(AppUiCommand::ResumeLoop(params)) => {
+                assert_eq!(params.loop_id, "loop-aaa");
+            }
+            other => panic!("expected ResumeLoop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn right_arrow_without_right_action_is_noop() {
+        // The empty loops menu's hint row declares no right_action — Right
+        // must dispatch nothing and leave the menu open.
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(&mut store, vec![]);
+
+        assert!(store.trigger_menu_right_action().is_none());
+        assert!(store.state.active_menu.is_some(), "menu stays open");
+    }
+
+    #[test]
+    fn activating_loop_row_opens_action_submenu() {
+        // Spec task-loops-menu-rows: a loops-list row activation records the
+        // target and pushes the per-loop action submenu onto the stack.
+        let mut store = store_with_empty_session();
+        store.state.pending_loop_list_menu = true;
+        apply_loop_list(
+            &mut store,
+            vec![list_loop_record("loop-aaa", "写书", "active")],
+        );
+        assert!(store.state.active_menu.is_some(), "loops menu open");
+
+        store.dispatch_menu_action(crate::menu::MenuAction::Local(
+            crate::menu::LocalAction::OpenLoopActions("loop-aaa".into()),
+        ));
+
+        assert_eq!(store.state.loop_actions_target.as_deref(), Some("loop-aaa"));
+        match store.state.active_menu.as_ref() {
+            Some(crate::menu::MenuBuildResult::Ready(spec)) => {
+                assert_eq!(
+                    spec.id.as_str(),
+                    crate::menu::registry::MENU_LOOP_ACTIONS,
+                    "action submenu is on top"
+                );
+                assert!(
+                    spec.items
+                        .iter()
+                        .any(|item| item.id == "loop_actions.pause"),
+                    "verbs are offered"
+                );
+            }
+            other => panic!("expected Ready action submenu, got {other:?}"),
         }
     }
 
