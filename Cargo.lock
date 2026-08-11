@@ -1597,8 +1597,8 @@ dependencies = [
 
 [[package]]
 name = "octos-core"
-version = "2.0.3-rc.1"
-source = "git+https://github.com/octos-org/octos?rev=725451747f3cbc33bf76ee57320af6c2c78d0567#725451747f3cbc33bf76ee57320af6c2c78d0567"
+version = "2.0.3-rc.2"
+source = "git+https://github.com/octos-org/octos?rev=57a60fd7eb56992b78c1d7929ff7eaaae0325363#57a60fd7eb56992b78c1d7929ff7eaaae0325363"
 dependencies = [
  "chrono",
  "eyre",
