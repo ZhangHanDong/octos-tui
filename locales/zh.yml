@@ -1615,6 +1615,8 @@ status:
   activity_skill_registry: "技能注册表"
   activity_permission_profile_mismatch: "权限档案不匹配"
   activity_runtime_status: "运行时状态"
+  activity_cursor_unhealthy: "游标异常"
+  cursor_unhealthy: "流游标异常：重放可能丢失事件；请重新连接以重新水合"
   activity_tool_config: "工具配置"
   activity_recovery_suggestion: "恢复建议"
   activity_agent_output: "智能体输出"
