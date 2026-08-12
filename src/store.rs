@@ -9674,12 +9674,9 @@ impl Store {
         // remedy — "reconnect to rehydrate" — and nothing ever confirmed the
         // stream recovered, or that it hadn't. Re-read status here; the probe
         // deduplicates against one already queued.
-        if self
-            .state
-            .capabilities
-            .as_ref()
-            .is_some_and(|caps| caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ))
-        {
+        if self.state.capabilities.as_ref().is_some_and(|caps| {
+            caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+        }) {
             self.state.enqueue_session_status_probe(session_id);
         }
         drain
@@ -37480,7 +37477,9 @@ now analyzing the bus module"
         // post-reconnect situation.
         store
             .state
-            .set_runtime_status(SessionRuntimeStatus::from(session_status_result(&session_id)));
+            .set_runtime_status(SessionRuntimeStatus::from(session_status_result(
+                &session_id,
+            )));
         store.state.pending_autonomy_hydration.clear();
 
         store.apply_client_event(ClientEvent::SessionHydrate(SessionHydrateResult {
@@ -37501,12 +37500,16 @@ now analyzing the bus module"
         }));
 
         assert!(
-            store.state.pending_autonomy_hydration.iter().any(|command| {
-                matches!(
-                    command,
-                    AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
-                )
-            }),
+            store
+                .state
+                .pending_autonomy_hydration
+                .iter()
+                .any(|command| {
+                    matches!(
+                        command,
+                        AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
+                    )
+                }),
             "a hydrate must re-read status: {:?}",
             store.state.pending_autonomy_hydration
         );
