@@ -27025,6 +27025,47 @@ now analyzing the bus module"
         assert!(warned, "an unhealthy cursor must raise a warning");
     }
 
+    /// The synthetic fixtures above build the result by hand, which proves the
+    /// branch but not that a real server payload reaches it. This drives the
+    /// actual 5.4 KB `session/status/read` reply captured off the octos mock
+    /// running scenario 187 `status-cursor-unhealthy` — every field the server
+    /// sends, deserialised into the client's own type.
+    #[test]
+    fn the_mock_scenario_187_payload_raises_the_warning() {
+        let frame: serde_json::Value = serde_json::from_str(include_str!(
+            "../fixtures/mock_status_read_unhealthy_cursor.json"
+        ))
+        .expect("fixture parses");
+        let result: SessionStatusReadResult =
+            serde_json::from_value(frame["result"].clone()).expect("server payload deserialises");
+        assert_eq!(
+            result.cursor.as_ref().map(|cursor| cursor.healthy),
+            Some(false),
+            "fixture must be the unhealthy-cursor scenario"
+        );
+
+        let mut store = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
+        store.apply_client_event(ClientEvent::SessionStatus(SessionStatusClientEvent {
+            result,
+            message: "Runtime status refreshed".into(),
+        }));
+
+        assert!(
+            store.state.status.contains("reconnect"),
+            "status line: {:?}",
+            store.state.status
+        );
+        assert!(
+            store
+                .state
+                .activity
+                .iter()
+                .any(|item| matches!(item.kind, ActivityKind::Warning)
+                    && item.status.contains("lossy")),
+            "the captured payload must raise the warning"
+        );
+    }
+
     /// `session/status/read` is POLLED, so a still-unhealthy cursor must not
     /// re-warn on every refresh — one warning per transition into the state.
     #[test]
