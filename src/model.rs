@@ -4642,6 +4642,13 @@ pub struct AppState {
     /// warning fires when a session ENTERS the state and again only after it
     /// recovers — otherwise a persistently degraded stream would bury the
     /// activity feed under identical rows.
+    ///
+    /// It is also the live truth the status bar's degraded-stream chip reads,
+    /// which is why membership must track the CURRENT report rather than
+    /// "already warned": the one-shot row renders inside a collapsed activity
+    /// group and the status slot it writes is overwritten by the next command,
+    /// so the chip is the only surface that survives to the moment the operator
+    /// wonders why a turn is silent.
     pub unhealthy_cursors: std::collections::HashSet<SessionKey>,
 
     /// Turns whose output the freeze above ACTUALLY suppressed: a delta or a

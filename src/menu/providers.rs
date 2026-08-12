@@ -6902,6 +6902,21 @@ fn status_runtime_items(ctx: &MenuContext<'_>) -> Vec<MenuItem> {
             .with_description(health),
         );
     }
+    // Next to Health deliberately: `health` is the runtime's self-report and
+    // `cursor` is whether events still reach THIS client, and they disagree —
+    // the field report was `Health — ok` beside a snapshot pane reading
+    // `cursor: degraded | replay`. The cursor used to be preview-only, so the
+    // rows said "ok" about a stream that was dropping events.
+    if let Some(cursor) = status_cursor_value(status) {
+        items.push(
+            MenuItem::new(
+                "status.cursor",
+                t!("menu.status.item.cursor.label"),
+                MenuAction::Noop,
+            )
+            .with_description(cursor),
+        );
+    }
     if let Some(usage) = status_usage_value(status) {
         items.push(
             MenuItem::new(
@@ -9205,6 +9220,64 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|row| row.label == "tool_discovery" && row.value == "enabled")
+        );
+    }
+
+    /// The server reports two independent things: `health` — the runtime's
+    /// self-report — and `cursor.healthy` — whether events still reach THIS
+    /// client. They disagree, and the field report is what that looks like: the
+    /// menu list read `Health — ok` while the snapshot pane beside it read
+    /// `cursor: degraded | replay`. The cursor was preview-only
+    /// (`status_preview_rows`), so anyone reading the rows rather than the
+    /// debug pane took "ok" off a stream that was dropping events.
+    #[test]
+    fn status_menu_lists_the_stream_cursor_beside_health() {
+        let registry = core_menu_registry();
+        let capabilities =
+            CapabilitySet::from_methods([AppUiActionKind::SessionStatusRead.method()]);
+        let session_id = SessionKey("local:test".into());
+        let mut status = runtime_status(&session_id);
+        status.cursor = Some(SessionCursorStatus {
+            cursor: None,
+            replay_supported: true,
+            healthy: false,
+            detail: Some("durable cursor diverged".into()),
+        });
+        let ctx = MenuContext {
+            availability: AvailabilityContext::protocol(&capabilities),
+            app: MenuAppSnapshot {
+                runtime_status: Some(&status),
+                selected_session_id: Some(&session_id),
+                ..MenuAppSnapshot::default()
+            },
+            terminal: TerminalSize::default(),
+            theme_name: None,
+            selected_path: &[],
+        };
+
+        let MenuBuildResult::Ready(spec) = registry.build(&MenuId::from(MENU_STATUS), &ctx) else {
+            panic!("expected status menu");
+        };
+
+        let health = spec
+            .items
+            .iter()
+            .find(|item| item.label == "Health")
+            .expect("health row");
+        assert_eq!(health.description.as_deref(), Some("healthy (ws ok)"));
+        let stream = spec
+            .items
+            .iter()
+            .find(|item| item.label == "Stream")
+            .expect("a degraded cursor must be a row, not preview-only");
+        let description = stream.description.as_deref().expect("stream description");
+        assert!(
+            description.contains("degraded"),
+            "the row must name the state: {description}"
+        );
+        assert!(
+            description.contains("durable cursor diverged"),
+            "the row must carry the server's reason: {description}"
         );
     }
 

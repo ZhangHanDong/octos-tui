@@ -9666,6 +9666,22 @@ impl Store {
             sections.join(", ")
         };
         self.state.status = t!("status.session_hydrated", summary = summary).into_owned();
+        // A `SessionHydrateResult` carries a bare `UiCursor` (stream + seq) and
+        // no health at all, and the only other probe on this path
+        // (`probe_active_session_status_if_missing`) fires solely when NO status
+        // is cached. So the client kept rendering the PRE-reconnect health
+        // forever: the operator followed the unhealthy-cursor warning's own
+        // remedy — "reconnect to rehydrate" — and nothing ever confirmed the
+        // stream recovered, or that it hadn't. Re-read status here; the probe
+        // deduplicates against one already queued.
+        if self
+            .state
+            .capabilities
+            .as_ref()
+            .is_some_and(|caps| caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ))
+        {
+            self.state.enqueue_session_status_probe(session_id);
+        }
         drain
     }
 
@@ -37486,6 +37502,55 @@ now analyzing the bus module"
             "the same streaming turn is preserved across hydrate"
         );
         assert_eq!(live_reply.text, "streaming so far");
+    }
+
+    /// "reconnect to rehydrate" is the remedy the unhealthy-cursor warning
+    /// prints, and hydrate is where that remedy lands — but a
+    /// `SessionHydrateResult` carries only a `UiCursor` (stream + seq), no
+    /// health at all. The one existing probe fires only when NO status is
+    /// cached, so after a reconnect the client kept showing the pre-reconnect
+    /// health forever: the operator did the fix and nothing ever confirmed it
+    /// worked, or that it hadn't.
+    #[test]
+    fn hydrate_refreshes_status_so_stream_health_is_re_reported_after_a_reconnect() {
+        use crate::client_event::ClientEvent;
+        let mut store = protocol_store_with_methods(&[methods::SESSION_STATUS_READ]);
+        let session_id = store.state.sessions[0].id.clone();
+        // A cached status makes `probe_active_session_status_if_missing` — the
+        // only pre-existing probe on this path — a no-op, which is exactly the
+        // post-reconnect situation.
+        store
+            .state
+            .set_runtime_status(SessionRuntimeStatus::from(session_status_result(&session_id)));
+        store.state.pending_autonomy_hydration.clear();
+
+        store.apply_client_event(ClientEvent::SessionHydrate(SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 7,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: None,
+        }));
+
+        assert!(
+            store.state.pending_autonomy_hydration.iter().any(|command| {
+                matches!(
+                    command,
+                    AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
+                )
+            }),
+            "a hydrate must re-read status: {:?}",
+            store.state.pending_autonomy_hydration
+        );
     }
 
     #[test]

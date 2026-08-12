@@ -3210,11 +3210,20 @@ mod tests {
     /// screen rather than sitting in state nobody paints. Without it the whole
     /// point of the change (an operator can tell a broken stream from a slow
     /// agent) rests on an untested assumption.
+    ///
+    /// It drives the render off `unhealthy_cursors` and leaves `status` at
+    /// "ready", because the earlier version of this test did neither: it pushed
+    /// the activity row AND set the status slot, then asserted on text both
+    /// carry — so the slot alone satisfied it. In the field the row turned out
+    /// to render inside a COLLAPSED activity group ("1 action(s)", body hidden
+    /// until Ctrl+O) and the slot was overwritten seconds later, leaving
+    /// nothing legible on screen while the assertion stayed green.
     #[test]
     fn render_shows_the_unhealthy_cursor_warning_and_its_remedy() {
+        let session_id = SessionKey("local:test".into());
         let mut app = AppState::new(
             vec![SessionView {
-                id: SessionKey("local:test".into()),
+                id: session_id.clone(),
                 title: "test".into(),
                 profile_id: Some("coding".into()),
                 messages: vec![Message::assistant("ready")],
@@ -3226,13 +3235,7 @@ mod tests {
             None,
             false,
         );
-        let message = t!("status.cursor_unhealthy").into_owned();
-        app.push_activity(ActivityItem::new(
-            ActivityKind::Warning,
-            t!("status.activity_cursor_unhealthy").into_owned(),
-            message.clone(),
-        ));
-        app.status = message;
+        app.unhealthy_cursors.insert(session_id);
 
         let text = rendered_text(&app);
 
@@ -3243,6 +3246,52 @@ mod tests {
         assert!(
             text.contains("lossy"),
             "the warning must name the risk: {text}"
+        );
+    }
+
+    /// The activity row fires once, on the transition into unhealthy, and the
+    /// status slot it also writes is overwritten by the next command's feedback
+    /// — in the field, by the `/status` menu's own "Menu: status". So minutes
+    /// later the screen is back to looking healthy while the stream is still
+    /// dropping events. The degraded state is a CONDITION, not an event: it
+    /// stays on the status bar until the server says the cursor recovered,
+    /// exactly like the loop chip.
+    #[test]
+    fn status_bar_holds_the_degraded_stream_chip_until_the_cursor_recovers() {
+        let session_id = SessionKey("local:test".into());
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: session_id.clone(),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+
+        assert!(
+            !rendered_text(&app).contains("stream degraded"),
+            "a healthy stream must not carry the chip"
+        );
+
+        app.unhealthy_cursors.insert(session_id.clone());
+        // Whatever the last command reported still owns the transient slot.
+        app.status = "Menu: status".into();
+        let text = rendered_text(&app);
+        assert!(
+            text.contains("stream degraded"),
+            "the chip must outlive the transient status: {text}"
+        );
+
+        app.unhealthy_cursors.remove(&session_id);
+        assert!(
+            !rendered_text(&app).contains("stream degraded"),
+            "recovery must clear the chip"
         );
     }
 
