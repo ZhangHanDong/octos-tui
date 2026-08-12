@@ -3205,6 +3205,47 @@ mod tests {
         }
     }
 
+    /// The store raises this on `cursor.healthy: false`; this is the other half
+    /// of that chain — that the warning and its remedy actually reach the
+    /// screen rather than sitting in state nobody paints. Without it the whole
+    /// point of the change (an operator can tell a broken stream from a slow
+    /// agent) rests on an untested assumption.
+    #[test]
+    fn render_shows_the_unhealthy_cursor_warning_and_its_remedy() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        let message = t!("status.cursor_unhealthy").into_owned();
+        app.push_activity(ActivityItem::new(
+            ActivityKind::Warning,
+            t!("status.activity_cursor_unhealthy").into_owned(),
+            message.clone(),
+        ));
+        app.status = message;
+
+        let text = rendered_text(&app);
+
+        assert!(
+            text.contains("reconnect"),
+            "the remedy must be on screen: {text}"
+        );
+        assert!(
+            text.contains("lossy"),
+            "the warning must name the risk: {text}"
+        );
+    }
+
     #[test]
     fn render_active_state_uses_bottom_status_without_split_progress_pane() {
         let turn_id = TurnId::new();
