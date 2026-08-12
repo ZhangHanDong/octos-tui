@@ -126,6 +126,7 @@ app:
     stop_to_close: "/stop to close"
     pending_decision_help: "Waiting on you — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
     parked_decision_banner: "⚠ Parked on you for %{elapsed} — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
+    cursor_degraded: "⚠ stream degraded — replay may be lossy; reconnect"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"
@@ -1638,6 +1639,8 @@ menu:
         label: Capabilities
       connection:
         label: Connection
+      cursor:
+        label: Stream
       refresh:
         label: Refresh server status
       server:
