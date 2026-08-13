@@ -2036,7 +2036,11 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             // interrupt-restore's menu-close retry (which must never clobber
             // real text). Cleared BEFORE the close so that retry sees the
             // empty composer it needs.
-            if slash_help_capture_active(store) {
+            //
+            // Scoped to the popup's OWN token: once the draft carries
+            // arguments the composer holds the user's work, not the popup's,
+            // and dismissing the autocomplete must not destroy it.
+            if slash_help_capture_active(store) && slash_help_draft_is_bare_token(store) {
                 store.state.set_composer_text("");
             }
             // Esc closes/backs out of menus, EXCEPT the root onboarding wizard
@@ -2150,6 +2154,30 @@ fn slash_help_capture_active(store: &Store) -> bool {
 
 fn slash_help_query_active(store: &Store) -> bool {
     slash_help_capture_active(store) && store.state.composer.len() > 1
+}
+
+/// True when the composer holds NOTHING BUT the token the slash popup opened
+/// on and filters by — `/`, `/mcp`, or `/mcp ` mid-completion. That text is the
+/// popup's own, so Esc dismisses it along with the popup.
+///
+/// Anything more is the user's draft and survives the dismiss. Two shapes count
+/// as more: arguments after the command token (`sync_slash_help_search_query`
+/// explicitly supports these — it filters on the FIRST token precisely so
+/// "/btw what are you…" keeps matching), and a boxed-up paste, which need not
+/// contain whitespace at all (a pasted URL or base64 body is one long token).
+fn slash_help_draft_is_bare_token(store: &Store) -> bool {
+    if matches!(
+        store.state.composer_presentation(),
+        crate::model::ComposerPresentation::Collapsed(_)
+    ) {
+        return false;
+    }
+    store
+        .state
+        .composer
+        .trim_end()
+        .strip_prefix('/')
+        .is_some_and(|stripped| !stripped.contains(char::is_whitespace))
 }
 
 /// With the slash popup filtering, Enter EXECUTES the draft only when it
@@ -3474,6 +3502,89 @@ mod tests {
             entries.iter().map(|s| s.to_string()).collect(),
         );
         store
+    }
+
+    /// Esc's slash dismiss is scoped to the popup's OWN token. A draft that
+    /// carries arguments — typed or pasted — is the user's work and must
+    /// survive: `set_composer_text("")` used to wipe the lot, so closing the
+    /// autocomplete on `/mcp upsert server <pasted body>` destroyed the body.
+    #[test]
+    fn esc_keeps_a_slash_draft_that_carries_arguments() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        for ch in "mcp upsert server ".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_terminal_event(
+            &mut store,
+            Event::Paste("{\n  \"name\": \"docs\",\n  \"cmd\": \"npx docs-mcp\"\n}".into()),
+        );
+        assert!(store.state.menu_stack.is_active(), "precondition: popup up");
+        let draft = store.state.composer.clone();
+        assert!(draft.starts_with("/mcp upsert server {"));
+
+        handle_key(&mut store, key(KeyCode::Esc));
+        assert!(
+            !store.state.menu_stack.is_active(),
+            "Esc still closes the popup"
+        );
+        assert_eq!(
+            store.state.composer, draft,
+            "the typed command and its pasted body survive the dismiss"
+        );
+    }
+
+    /// The same protection for a whitespace-free pasted blob (a URL, a base64
+    /// body): the argument test above keys on whitespace, which such a paste
+    /// has none of — the boxed-up paste itself is what marks it as real work.
+    #[test]
+    fn esc_keeps_a_slash_draft_holding_a_whitespace_free_paste() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        for ch in "fetch".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_terminal_event(&mut store, Event::Paste("x".repeat(500)));
+        let draft = store.state.composer.clone();
+
+        handle_key(&mut store, key(KeyCode::Esc));
+        assert!(!store.state.menu_stack.is_active());
+        assert_eq!(
+            store.state.composer, draft,
+            "a boxed paste is never 'just the filter token'"
+        );
+    }
+
+    /// The bare token IS the popup's own text: Esc still dismisses it, so the
+    /// next `/` reopens the popup instead of appending into a leftover.
+    #[test]
+    fn esc_still_dismisses_a_bare_slash_token() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        for ch in "mcp".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+
+        handle_key(&mut store, key(KeyCode::Esc));
+        assert!(!store.state.menu_stack.is_active());
+        assert_eq!(
+            store.state.composer, "",
+            "a bare command token is the popup's own draft — Esc dismisses it"
+        );
+
+        // And a token completed to "/mcp " for argument typing is still bare.
+        handle_key(&mut store, key(KeyCode::Char('/')));
+        for ch in "mcp ".chars() {
+            handle_key(&mut store, key(KeyCode::Char(ch)));
+        }
+        handle_key(&mut store, key(KeyCode::Esc));
+        assert_eq!(
+            store.state.composer, "",
+            "a trailing space is not an argument"
+        );
     }
 
     #[test]
