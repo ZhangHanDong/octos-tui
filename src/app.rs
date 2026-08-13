@@ -914,7 +914,15 @@ fn composer_height_for_size(app: &AppState, terminal_width: u16, terminal_height
             COMPOSER_CHROME_ROWS
                 + composer_visible_input_rows(&text, terminal_width, terminal_height)
         }
-        ComposerPresentation::Empty | ComposerPresentation::Collapsed(_) => COMPOSER_MIN_HEIGHT,
+        // The collapsed draft is laid out from its display string (chip glyph in
+        // place of the pasted run), so a typed command around the chip gets the
+        // rows it needs. A paste-only draft is one chip on one row — exactly
+        // COMPOSER_MIN_HEIGHT, as before.
+        ComposerPresentation::Collapsed(collapse) => {
+            COMPOSER_CHROME_ROWS
+                + composer_visible_input_rows(&collapse.display, terminal_width, terminal_height)
+        }
+        ComposerPresentation::Empty => COMPOSER_MIN_HEIGHT,
     }
 }
 
@@ -5051,7 +5059,13 @@ fn composer_cursor_row_and_width(
             (view.cursor_row, view.cursor_width)
         }
         ComposerPresentation::Collapsed(collapse) => {
-            (0, "[paste ]".width() + collapse.summary.width())
+            let view = composer_input_view(
+                &collapse.display,
+                collapse.cursor,
+                area.width,
+                area.height.saturating_sub(COMPOSER_CHROME_ROWS),
+            );
+            (view.cursor_row, view.cursor_width)
         }
     }
 }

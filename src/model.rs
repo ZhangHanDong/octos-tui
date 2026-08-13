@@ -4907,7 +4907,7 @@ impl ComposerPresentation {
         match self {
             Self::Empty => 0,
             Self::Inline(text) => text.rsplit('\n').next().unwrap_or("").width(),
-            Self::Collapsed(collapse) => "[paste ]".width() + collapse.summary.width(),
+            Self::Collapsed(collapse) => collapse.display.rsplit('\n').next().unwrap_or("").width(),
         }
     }
 }
@@ -4916,6 +4916,20 @@ impl ComposerPresentation {
 pub struct ComposerCollapse {
     pub summary: String,
     pub preview: String,
+    /// What the composer actually draws: the draft with the collapsed block
+    /// swapped for its `[paste N lines · M chars]` chip. Text typed around the
+    /// paste stays put, so the chip renders exactly where the paste landed
+    /// rather than at the head of the row with the typed command hidden inside
+    /// it. With no live paste span the chip stands for the whole draft and this
+    /// is just the chip.
+    pub display: String,
+    /// Byte range of the chip glyph inside [`Self::display`]. The renderer
+    /// styles this run as the chip and everything around it as ordinary text.
+    pub chip: std::ops::Range<usize>,
+    /// `composer_cursor_index` mapped into [`Self::display`]. A caret inside
+    /// the collapsed block pins to the chip's end — the block is atomic, there
+    /// is no position "within" it.
+    pub cursor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9718,7 +9732,12 @@ impl AppState {
     }
 
     pub fn composer_presentation(&self) -> ComposerPresentation {
-        composer_presentation_for_text(&self.composer, self.composer_pasted)
+        composer_presentation_for_text(
+            &self.composer,
+            self.composer_pasted,
+            self.composer_paste_span.clone(),
+            self.composer_cursor_index(),
+        )
     }
 
     fn clamp_composer_cursor(&self, cursor: usize) -> usize {
@@ -9880,7 +9899,12 @@ fn paste_should_collapse(text: &str) -> bool {
         || text.lines().count().max(1) >= PASTE_COLLAPSE_LINE_THRESHOLD
 }
 
-fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPresentation {
+fn composer_presentation_for_text(
+    text: &str,
+    from_paste: bool,
+    paste_span: Option<std::ops::Range<usize>>,
+    cursor: usize,
+) -> ComposerPresentation {
     const PREVIEW_CHARS: usize = 88;
 
     if text.is_empty() {
@@ -9890,7 +9914,9 @@ fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPrese
     let char_count = text.chars().count();
     let line_count = text.lines().count().max(1);
     // Pastes collapse aggressively; anything else only when huge (typed input is
-    // never collapsed at the low paste thresholds).
+    // never collapsed at the low paste thresholds). Note this decision is made
+    // over the WHOLE draft — narrowing the chip below never changes WHETHER the
+    // composer collapses, only which bytes the chip stands for.
     let should_collapse = if from_paste {
         paste_should_collapse(text)
     } else {
@@ -9901,22 +9927,62 @@ fn composer_presentation_for_text(text: &str, from_paste: bool) -> ComposerPrese
         return ComposerPresentation::Inline(text.to_string());
     }
 
+    // Which bytes the chip covers. A recorded paste span is usable only while it
+    // still addresses live, char-aligned bytes AND is itself worth boxing up —
+    // otherwise the chip falls back to the whole draft (the pre-span behavior,
+    // and what a restored/wholesale-set draft always gets since it carries no
+    // span). Covering just the pasted run is what keeps a typed prefix like
+    // "/mcp upsert server " rendering AHEAD of the chip instead of vanishing
+    // inside it.
+    let block = paste_span
+        .filter(|span| {
+            span.start < span.end
+                && span.end <= text.len()
+                && text.is_char_boundary(span.start)
+                && text.is_char_boundary(span.end)
+                && paste_should_collapse(&text[span.clone()])
+        })
+        .unwrap_or(0..text.len());
+    let block_text = &text[block.clone()];
+    let block_chars = block_text.chars().count();
+    let block_lines = block_text.lines().count().max(1);
+
     // Rendered INSIDE the chip, e.g. "[paste 18 lines · 1240 chars]" — the
-    // counts belong to the bracket rather than trailing it as loose text.
-    let summary = if line_count > 1 {
-        format!("{line_count} lines · {char_count} chars")
+    // counts belong to the bracket rather than trailing it as loose text, and
+    // they describe the PASTE, not any text typed around it.
+    let summary = if block_lines > 1 {
+        format!("{block_lines} lines · {block_chars} chars")
     } else {
-        format!("{char_count} chars")
+        format!("{block_chars} chars")
     };
-    let preview_source = text
+    let preview_source = block_text
         .lines()
         .find(|line| !line.trim().is_empty())
         .map(str::trim)
         .unwrap_or("<blank paste>");
 
+    let glyph = format!("[paste {summary}]");
+    let mut display = String::with_capacity(text.len() - block_text.len() + glyph.len());
+    display.push_str(&text[..block.start]);
+    let chip = display.len()..display.len() + glyph.len();
+    display.push_str(&glyph);
+    display.push_str(&text[block.end..]);
+
+    // The block is atomic: a caret anywhere inside it pins to the chip's end.
+    let cursor = if cursor <= block.start {
+        cursor
+    } else if cursor >= block.end {
+        chip.end + (cursor - block.end)
+    } else {
+        chip.end
+    };
+
     ComposerPresentation::Collapsed(ComposerCollapse {
         summary,
         preview: truncate_chars(preview_source, PREVIEW_CHARS),
+        display,
+        chip,
+        cursor,
     })
 }
 
@@ -11798,6 +11864,86 @@ mod tests {
             .map(|i| format!("pasted line {i}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A paste that lands AFTER typed text must keep the chip WHERE THE PASTE
+    /// IS. The presentation used to swallow the whole draft into one chip
+    /// printed at the head of the row, so `/mcp upsert server ` + a pasted JSON
+    /// body read as if the paste came first and the command had vanished.
+    #[test]
+    fn collapsed_paste_renders_after_the_typed_command() {
+        let mut state = paste_test_state();
+        for ch in "/mcp upsert server ".chars() {
+            state.insert_composer_char(ch);
+        }
+        let block = "{\n  \"name\": \"docs\",\n  \"cmd\": \"npx docs-mcp\"\n}";
+        state.insert_pasted_text(block);
+
+        let ComposerPresentation::Collapsed(collapse) = state.composer_presentation() else {
+            panic!("a 4-line paste should collapse");
+        };
+        assert_eq!(
+            &collapse.display[..collapse.chip.start],
+            "/mcp upsert server ",
+            "the typed command renders inline, ahead of the chip"
+        );
+        assert_eq!(
+            &collapse.display[collapse.chip.clone()],
+            format!("[paste 4 lines · {} chars]", block.chars().count()),
+            "the chip counts the PASTE, not the whole draft"
+        );
+        assert_eq!(
+            &collapse.display[collapse.chip.end..],
+            "",
+            "nothing was typed after the paste"
+        );
+        assert_eq!(
+            collapse.preview, "{",
+            "the preview reads the pasted block, not the typed prefix"
+        );
+        assert_eq!(
+            collapse.cursor, collapse.chip.end,
+            "the caret sits just past the chip, where the paste ended"
+        );
+    }
+
+    /// Text on BOTH sides of the paste keeps its order — the chip is an atom
+    /// sitting between the two runs. Reachable by pasting into the middle of a
+    /// restored draft (a restored draft carries no paste span of its own).
+    #[test]
+    fn collapsed_paste_keeps_the_text_on_both_sides() {
+        let mut state = paste_test_state();
+        state.composer = "before  after".into();
+        state.composer_cursor = Some("before ".len());
+        state.insert_pasted_text(&big_paste_block());
+
+        let ComposerPresentation::Collapsed(collapse) = state.composer_presentation() else {
+            panic!("a 20-line paste should collapse");
+        };
+        assert_eq!(&collapse.display[..collapse.chip.start], "before ");
+        assert_eq!(&collapse.display[collapse.chip.end..], " after");
+        assert_eq!(
+            collapse.cursor, collapse.chip.end,
+            "the caret lands where the paste ended, not at the end of the draft"
+        );
+    }
+
+    /// With no recorded span (a draft restored or set wholesale) the chip still
+    /// stands for the ENTIRE draft — the pre-span behavior.
+    #[test]
+    fn collapsed_draft_without_a_paste_span_still_covers_everything() {
+        let mut state = paste_test_state();
+        state.composer = (1..=40)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let ComposerPresentation::Collapsed(collapse) = state.composer_presentation() else {
+            panic!("40 typed lines collapse via the typed threshold");
+        };
+        assert_eq!(collapse.chip.start, 0);
+        assert_eq!(collapse.chip.end, collapse.display.len());
+        assert!(collapse.summary.contains("40 lines"));
     }
 
     /// #382: the atomic delete drains ONLY the pasted span — typed text

@@ -4735,6 +4735,56 @@ mod tests {
         assert!(text.contains("state"));
     }
 
+    /// The `[paste …]` chip renders WHERE THE PASTE LANDED. A typed slash
+    /// command ahead of the paste used to be swallowed into a chip drawn at
+    /// column 0, so a `/mcp upsert server ` + pasted-JSON draft read as if the
+    /// paste came before the command and the command itself had vanished.
+    #[test]
+    fn render_composer_keeps_the_typed_command_ahead_of_the_paste_chip() {
+        let mut app = AppState::new(
+            vec![SessionView {
+                id: SessionKey("local:test".into()),
+                title: "test".into(),
+                profile_id: Some("coding".into()),
+                messages: vec![Message::assistant("ready")],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            0,
+            "ready".into(),
+            None,
+            false,
+        );
+        for ch in "/mcp upsert server ".chars() {
+            app.insert_composer_char(ch);
+        }
+        app.insert_pasted_text("{\n  \"name\": \"docs\",\n  \"cmd\": \"npx docs-mcp\"\n}");
+
+        let (buffer, cursor) = rendered_buffer_and_cursor_with_size(
+            &app,
+            Palette::for_theme(ThemeName::Codex),
+            80,
+            24,
+        );
+        let rows = rendered_rows(&buffer);
+        let chip_row = row_index_containing(&rows, "[paste ");
+
+        assert!(
+            rows[chip_row].contains("/mcp upsert server [paste 4 lines"),
+            "the command must precede the chip on the same row, got {:?}",
+            rows[chip_row]
+        );
+        assert!(
+            rows.join("\n").contains("preview: {"),
+            "the preview still reads the pasted block"
+        );
+        assert_eq!(
+            chip_row,
+            usize::from(cursor.y),
+            "the caret sits on the chip row, just past the chip"
+        );
+    }
+
     #[test]
     fn render_transcript_includes_activity_cards_and_dense_footer() {
         let turn_id = TurnId::new();
