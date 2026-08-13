@@ -6271,7 +6271,7 @@ mod render;
 #[allow(unused_imports)]
 pub(crate) use render::*;
 mod activity_nav;
-mod markdown_highlight;
+pub(crate) mod markdown_highlight;
 #[allow(unused_imports)]
 pub(crate) use activity_nav::*;
 
