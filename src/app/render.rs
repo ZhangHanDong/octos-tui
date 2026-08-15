@@ -1895,6 +1895,18 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
             app.run_state,
             SessionRunState::InProgress | SessionRunState::Blocked { .. }
         );
+    // A degraded stream cursor is a CONDITION, not an event: replay may drop
+    // this session's events, so a live turn can sit silent forever and read as
+    // nothing worse than a slow agent. The store's one-shot warning row lands
+    // in a collapsed activity group (body hidden until Ctrl+O) and the copy it
+    // writes to the transient slot is overwritten by the next command's
+    // feedback — in the field, by `/status`'s own "Menu: status". So the chip
+    // holds the bar until the server reports the cursor recovered, on the same
+    // reasoning as the loop chip above.
+    let cursor_chip = active_session_id
+        .as_ref()
+        .is_some_and(|session_id| app.unhealthy_cursors.contains(session_id))
+        .then(|| t!("app.statusbar.cursor_degraded").into_owned());
     let (state_marker, state_label, state_style) = if waiting_on_operator {
         (
             "?".to_string(),
@@ -1956,6 +1968,15 @@ pub(super) fn render_status(app: &AppState, palette: Palette) -> Paragraph<'stat
                 .map(|chip| format!(" | {chip}"))
                 .unwrap_or_default(),
             palette.muted().bg(palette.surface_alt),
+        ),
+        Span::styled(
+            cursor_chip
+                .map(|chip| format!(" | {chip}"))
+                .unwrap_or_default(),
+            Style::default()
+                .fg(palette.highlight)
+                .add_modifier(Modifier::BOLD)
+                .bg(palette.surface_alt),
         ),
         Span::styled(" | ", palette.muted().bg(palette.surface_alt)),
         Span::styled(app.status.clone(), palette.muted().bg(palette.surface_alt)),

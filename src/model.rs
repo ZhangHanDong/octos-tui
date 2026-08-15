@@ -4727,6 +4727,19 @@ pub struct AppState {
     /// the value is the interrupted turn id, so a LATER turn on the same
     /// session is never gated. Cleared on the turn's terminal.
     pub interrupted_turns: std::collections::HashMap<SessionKey, TurnId>,
+    /// Sessions whose last `session/status/read` reported `cursor.healthy:
+    /// false`. A latch, not a log: `session/status/read` is polled, so the
+    /// warning fires when a session ENTERS the state and again only after it
+    /// recovers — otherwise a persistently degraded stream would bury the
+    /// activity feed under identical rows.
+    ///
+    /// It is also the live truth the status bar's degraded-stream chip reads,
+    /// which is why membership must track the CURRENT report rather than
+    /// "already warned": the one-shot row renders inside a collapsed activity
+    /// group and the status slot it writes is overwritten by the next command,
+    /// so the chip is the only surface that survives to the moment the operator
+    /// wonders why a turn is silent.
+    pub unhealthy_cursors: std::collections::HashSet<SessionKey>,
 
     /// Turns whose output the freeze above ACTUALLY suppressed: a delta or a
     /// canonical persisted frame arrived after the Esc and was dropped.
@@ -6731,6 +6744,7 @@ impl AppState {
             run_state_started_at,
             pre_token_turns: std::collections::HashMap::new(),
             interrupted_turns: std::collections::HashMap::new(),
+            unhealthy_cursors: std::collections::HashSet::new(),
             interrupt_dropped_output: std::collections::HashSet::new(),
             unread_turns: std::collections::HashMap::new(),
             pending_turn_steers: std::collections::VecDeque::new(),

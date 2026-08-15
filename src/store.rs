@@ -9674,6 +9674,19 @@ impl Store {
             sections.join(", ")
         };
         self.state.status = t!("status.session_hydrated", summary = summary).into_owned();
+        // A `SessionHydrateResult` carries a bare `UiCursor` (stream + seq) and
+        // no health at all, and the only other probe on this path
+        // (`probe_active_session_status_if_missing`) fires solely when NO status
+        // is cached. So the client kept rendering the PRE-reconnect health
+        // forever: the operator followed the unhealthy-cursor warning's own
+        // remedy — "reconnect to rehydrate" — and nothing ever confirmed the
+        // stream recovered, or that it hadn't. Re-read status here; the probe
+        // deduplicates against one already queued.
+        if self.state.capabilities.as_ref().is_some_and(|caps| {
+            caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
+        }) {
+            self.state.enqueue_session_status_probe(session_id);
+        }
         drain
     }
 
@@ -10285,6 +10298,9 @@ impl Store {
         // M22-D: snapshot the stamp BEFORE consuming the result so
         // we can compare it against the staged permission profile.
         let stamp = event.result.runtime_policy_stamp.clone();
+        // Same reason: `set_runtime_status` consumes the result below.
+        let session_id = event.result.session_id.clone();
+        let cursor_healthy = event.result.cursor.as_ref().map(|cursor| cursor.healthy);
         let message = event.message;
         self.state
             .set_runtime_status(SessionRuntimeStatus::from(event.result));
@@ -10311,6 +10327,40 @@ impl Store {
             message.clone(),
         ));
         self.state.status = message;
+        self.warn_on_unhealthy_cursor(&session_id, cursor_healthy);
+    }
+
+    /// Surface `cursor.healthy: false` — the server's warning that stream
+    /// replay may drop events.
+    ///
+    /// Until now it was decoded onto the status model and never read, so a
+    /// broken stream was indistinguishable from a slow agent: the turn simply
+    /// sat there. This is the predictive signal; `protocol/replay_lossy` is the
+    /// after-the-fact one, and both point the operator at the same remedy.
+    ///
+    /// `session/status/read` is POLLED, so the warning fires on the transition
+    /// into unhealthy, not on every refresh — otherwise a persistently degraded
+    /// stream would bury the activity feed under identical rows.
+    fn warn_on_unhealthy_cursor(&mut self, session_id: &SessionKey, healthy: Option<bool>) {
+        match healthy {
+            Some(false) => {
+                if !self.state.unhealthy_cursors.insert(session_id.clone()) {
+                    return;
+                }
+                let message = t!("status.cursor_unhealthy").into_owned();
+                self.state.push_activity(ActivityItem::new(
+                    ActivityKind::Warning,
+                    t!("status.activity_cursor_unhealthy").into_owned(),
+                    message.clone(),
+                ));
+                self.state.status = message;
+            }
+            // Recovered, or a server that reports no cursor block at all: clear
+            // the latch so a later relapse warns again.
+            _ => {
+                self.state.unhealthy_cursors.remove(session_id);
+            }
+        }
     }
 
     fn apply_tool_status_event(&mut self, event: ToolStatusClientEvent) {
@@ -27153,6 +27203,73 @@ now analyzing the bus module"
         assert!(help_menu_labels(&store).contains(&"/permissions".to_string()));
     }
 
+    /// `cursor.healthy: false` is the server saying stream replay may drop
+    /// events — the difference between "the agent is thinking" and "the stream
+    /// is broken, reconnect". It was decoded onto the status model and never
+    /// read, so the operator had no way to tell those apart.
+    #[test]
+    fn unhealthy_status_cursor_warns_that_the_stream_may_drop_events() {
+        let mut store = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
+        let session_id = store.state.sessions[0].id.clone();
+        let mut result = session_status_result(&session_id);
+        result.cursor = Some(SessionCursorStatus {
+            cursor: None,
+            replay_supported: true,
+            healthy: false,
+            detail: Some("durable cursor diverged".into()),
+        });
+
+        store.apply_client_event(ClientEvent::SessionStatus(SessionStatusClientEvent {
+            result,
+            message: "Runtime status refreshed".into(),
+        }));
+
+        assert!(
+            store.state.status.contains("reconnect"),
+            "status line must tell the operator to reconnect: {:?}",
+            store.state.status
+        );
+        let warned = store.state.activity.iter().any(|item| {
+            matches!(item.kind, ActivityKind::Warning) && item.status.contains("lossy")
+        });
+        assert!(warned, "an unhealthy cursor must raise a warning");
+    }
+
+    /// `session/status/read` is POLLED, so a still-unhealthy cursor must not
+    /// re-warn on every refresh — one warning per transition into the state.
+    #[test]
+    fn a_still_unhealthy_cursor_does_not_re_warn_on_every_poll() {
+        let mut store = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
+        let session_id = store.state.sessions[0].id.clone();
+        let unhealthy = |session_id: &SessionKey| {
+            let mut result = session_status_result(session_id);
+            result.cursor = Some(SessionCursorStatus {
+                cursor: None,
+                replay_supported: true,
+                healthy: false,
+                detail: None,
+            });
+            result
+        };
+
+        for _ in 0..3 {
+            store.apply_client_event(ClientEvent::SessionStatus(SessionStatusClientEvent {
+                result: unhealthy(&session_id),
+                message: "Runtime status refreshed".into(),
+            }));
+        }
+
+        let warnings = store
+            .state
+            .activity
+            .iter()
+            .filter(|item| {
+                matches!(item.kind, ActivityKind::Warning) && item.status.contains("lossy")
+            })
+            .count();
+        assert_eq!(warnings, 1, "one warning per transition, not per poll");
+    }
+
     #[test]
     fn session_status_client_event_updates_cached_runtime_status() {
         let mut store = protocol_store_with_methods(&[methods::APPROVAL_SCOPES_LIST]);
@@ -37782,6 +37899,61 @@ now analyzing the bus module"
             "the same streaming turn is preserved across hydrate"
         );
         assert_eq!(live_reply.text, "streaming so far");
+    }
+
+    /// "reconnect to rehydrate" is the remedy the unhealthy-cursor warning
+    /// prints, and hydrate is where that remedy lands — but a
+    /// `SessionHydrateResult` carries only a `UiCursor` (stream + seq), no
+    /// health at all. The one existing probe fires only when NO status is
+    /// cached, so after a reconnect the client kept showing the pre-reconnect
+    /// health forever: the operator did the fix and nothing ever confirmed it
+    /// worked, or that it hadn't.
+    #[test]
+    fn hydrate_refreshes_status_so_stream_health_is_re_reported_after_a_reconnect() {
+        use crate::client_event::ClientEvent;
+        let mut store = protocol_store_with_methods(&[methods::SESSION_STATUS_READ]);
+        let session_id = store.state.sessions[0].id.clone();
+        // A cached status makes `probe_active_session_status_if_missing` — the
+        // only pre-existing probe on this path — a no-op, which is exactly the
+        // post-reconnect situation.
+        store
+            .state
+            .set_runtime_status(SessionRuntimeStatus::from(session_status_result(
+                &session_id,
+            )));
+        store.state.pending_autonomy_hydration.clear();
+
+        store.apply_client_event(ClientEvent::SessionHydrate(SessionHydrateResult {
+            session_id: session_id.clone(),
+            cursor: octos_core::ui_protocol::UiCursor {
+                stream: session_id.0.clone(),
+                seq: 7,
+            },
+            context: None,
+            context_state: None,
+            messages: None,
+            threads: None,
+            turns: None,
+            pending_approvals: None,
+            pending_questions: None,
+            replayed_envelopes: None,
+            replayed_tool_envelopes: None,
+        }));
+
+        assert!(
+            store
+                .state
+                .pending_autonomy_hydration
+                .iter()
+                .any(|command| {
+                    matches!(
+                        command,
+                        AppUiCommand::ReadSessionStatus(params) if params.session_id == session_id
+                    )
+                }),
+            "a hydrate must re-read status: {:?}",
+            store.state.pending_autonomy_hydration
+        );
     }
 
     #[test]

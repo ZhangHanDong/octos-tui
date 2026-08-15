@@ -134,6 +134,7 @@ app:
     awaiting_fleet: "waiting on %{outstanding} of %{total} peers: %{peers}"
     pending_decision_help: "Waiting on you — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
     parked_decision_banner: "⚠ Parked on you for %{elapsed} — Ctrl+R/Alt+A answer · Ctrl+C interrupt"
+    cursor_degraded: "⚠ stream degraded — replay may be lossy; reconnect"
     tool_output_expanded: "tool output expanded"
   btw:
     answering: "Answering…"
@@ -867,6 +868,8 @@ status:
   activity_skill_registry: "skill registry"
   activity_permission_profile_mismatch: "permission profile mismatch"
   activity_runtime_status: "runtime status"
+  activity_cursor_unhealthy: "cursor unhealthy"
+  cursor_unhealthy: "Stream cursor unhealthy: replay may be lossy; reconnect to rehydrate"
   activity_tool_config: "tool config"
   activity_recovery_suggestion: "Recovery suggestion"
   activity_agent_output: "agent output"
@@ -1653,6 +1656,8 @@ menu:
         label: Capabilities
       connection:
         label: Connection
+      cursor:
+        label: Stream
       refresh:
         label: Refresh server status
       server:
