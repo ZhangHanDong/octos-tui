@@ -65,3 +65,152 @@ pub fn pick_effect_name(seed: u64) -> &'static str {
     let mut rng = ttfx::utils::rng::Rng::seeded(seed);
     SPLASH_EFFECTS[rng.choice_index(SPLASH_EFFECTS.len())]
 }
+
+use std::io::Write;
+
+use eyre::{Result, WrapErr, eyre};
+use ttfx::engine::ctx::{Clock, EngineCtx};
+use ttfx::engine::effect::Effect;
+use ttfx::engine::terminal::TerminalConfig;
+use ttfx::utils::rng::Rng;
+
+/// How long the animation may run before it is truncated to the final logo.
+pub const SPLASH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOpts {
+    /// 0 disables frame pacing (tests); production uses 60.
+    pub frame_rate: i64,
+    /// Virtual clock: effects that read time advance per frame, no sleeping.
+    pub virtual_clock: bool,
+    pub seed: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RunStats {
+    pub frames: usize,
+    pub truncated: bool,
+}
+
+/// One prepared splash: a built ttfx effect plus its engine context.
+pub struct SplashSession {
+    effect: Box<dyn Effect>,
+    ctx: EngineCtx,
+    text: String,
+    rows: u16,
+}
+
+impl SplashSession {
+    pub fn new(effect_name: &str, text: &str, opts: SessionOpts) -> Result<Self> {
+        if text.trim().is_empty() {
+            return Err(eyre!("splash input text is empty"));
+        }
+        // Default effect config via ttfx's own CLI, exactly like its
+        // --random-effect path does.
+        let parsed = <ttfx::cli::Cli as clap::Parser>::try_parse_from(["ttfx", effect_name])
+            .map_err(|e| eyre!("unknown ttfx effect {effect_name}: {e}"))?;
+        let effect = parsed
+            .effect
+            .ok_or_else(|| eyre!("ttfx parsed no effect for {effect_name}"))?
+            .build_effect();
+
+        let config = TerminalConfig {
+            frame_rate: opts.frame_rate,
+            // Pin the canvas to the input text so every frame has exactly
+            // `rows` lines regardless of (or absent) real terminal dimensions.
+            ignore_terminal_dimensions: true,
+            no_color: std::env::var_os("NO_COLOR").is_some(),
+            ..TerminalConfig::default()
+        };
+        let clock = if opts.virtual_clock {
+            Clock::virtual_with_frame_rate(config.frame_rate.max(1))
+        } else {
+            Clock::real()
+        };
+        let ctx = EngineCtx::new(text, config, Rng::seeded(opts.seed), clock)
+            .map_err(|e| eyre!("ttfx engine init failed: {e:?}"))?;
+        let (_, rows) = text_dimensions(text);
+        Ok(SplashSession {
+            effect,
+            ctx,
+            text: text.to_string(),
+            rows,
+        })
+    }
+
+    /// Drive the effect to completion, `should_stop`, or error. Always ends by
+    /// painting the plain input text into the canvas area (deterministic final
+    /// state) and parking the cursor on the line below it.
+    ///
+    /// Raw-mode safe: rows are repositioned with `\r` + cursor-up instead of
+    /// relying on cooked-mode `\n` (ttfx frames join rows with bare `\n`).
+    pub fn run(
+        &mut self,
+        out: &mut impl Write,
+        mut should_stop: impl FnMut() -> bool,
+    ) -> Result<RunStats> {
+        self.effect
+            .build(&mut self.ctx)
+            .map_err(|e| eyre!("ttfx effect build failed: {e:?}"))?;
+
+        // Reserve the canvas: rows-1 newlines put the cursor at column 0 of
+        // the bottom canvas row (invariant between frames).
+        out.write_all(
+            "\r\n"
+                .repeat(self.rows.saturating_sub(1) as usize)
+                .as_bytes(),
+        )
+        .wrap_err("splash: reserve canvas")?;
+
+        let mut stats = RunStats {
+            frames: 0,
+            truncated: false,
+        };
+        let result: Result<()> = (|| {
+            loop {
+                if should_stop() {
+                    stats.truncated = true;
+                    return Ok(());
+                }
+                let Some(frame) = self.effect.next_frame(&mut self.ctx) else {
+                    return Ok(());
+                };
+                self.paint(out, &frame)?;
+                stats.frames += 1;
+                self.ctx.terminal.enforce_framerate();
+            }
+        })();
+
+        // Final paint runs on success AND truncation; a paint error skips it.
+        if result.is_ok() {
+            let text = self.text.clone();
+            self.paint(out, &text)?;
+        }
+        // Park below the canvas either way.
+        out.write_all(b"\r\n").wrap_err("splash: park cursor")?;
+        out.flush().ok();
+        result.map(|_| stats)
+    }
+
+    /// Draw `rows` lines over the reserved canvas area. Expects the cursor at
+    /// column 0 of the bottom canvas row; restores that invariant on return.
+    fn paint(&self, out: &mut impl Write, frame: &str) -> Result<()> {
+        let up = self.rows.saturating_sub(1);
+        if up > 0 {
+            write!(out, "\x1b[{up}A").wrap_err("splash: cursor up")?;
+        }
+        let mut first = true;
+        for line in frame.split('\n') {
+            if !first {
+                out.write_all(b"\r\n").wrap_err("splash: row break")?;
+            }
+            first = false;
+            // Clear the row before drawing so a shorter final paint fully
+            // covers the last animation frame.
+            out.write_all(b"\r\x1b[2K").wrap_err("splash: clear row")?;
+            out.write_all(line.as_bytes()).wrap_err("splash: row")?;
+        }
+        out.write_all(b"\r").wrap_err("splash: home")?;
+        out.flush().wrap_err("splash: flush")
+    }
+}

@@ -82,3 +82,65 @@ fn splash_text_carries_logo_and_version() {
     assert!(text.contains(env!("CARGO_PKG_VERSION")));
     assert!(text.lines().count() >= 6, "logo should be multi-line");
 }
+
+use octoscode::splash::{SessionOpts, SplashSession};
+
+fn test_opts() -> SessionOpts {
+    SessionOpts {
+        frame_rate: 0,
+        virtual_clock: true,
+        seed: 7,
+    }
+}
+
+#[test]
+fn curated_effects_produce_frames_on_virtual_clock() {
+    for name in SPLASH_EFFECTS {
+        let mut session = SplashSession::new(name, &splash_text(), test_opts())
+            .unwrap_or_else(|e| panic!("{name}: session builds: {e}"));
+        let mut out: Vec<u8> = Vec::new();
+        let stats = session
+            .run(&mut out, || false)
+            .unwrap_or_else(|e| panic!("{name}: run ok: {e}"));
+        assert!(stats.frames >= 1, "{name}: produced no frames");
+        assert!(
+            !stats.truncated,
+            "{name}: untruncated run reported truncated"
+        );
+        assert!(!out.is_empty(), "{name}: wrote no output");
+    }
+}
+
+#[test]
+fn truncated_run_ends_with_full_logo() {
+    let text = splash_text();
+    let mut session = SplashSession::new("decrypt", &text, test_opts()).expect("session builds");
+    let mut out: Vec<u8> = Vec::new();
+    let mut calls = 0;
+    let stats = session
+        .run(&mut out, || {
+            calls += 1;
+            calls > 3
+        })
+        .expect("run ok");
+    assert!(stats.truncated);
+    let rendered = String::from_utf8_lossy(&out);
+    // The final paint must include every logo line and the version footer,
+    // after the last animation frame (i.e. in the trailing portion).
+    let tail = &rendered[rendered.len().saturating_sub(text.len() * 3)..];
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(
+            tail.contains(line.trim_end()),
+            "final paint missing: {line:?}"
+        );
+    }
+    assert!(tail.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn play_swallows_engine_errors() {
+    // Empty input makes the splash session build fail; the run path must
+    // surface that as Err (never panic), which `play` then discards.
+    let result = SplashSession::new("decrypt", "", test_opts());
+    assert!(result.is_err(), "empty input should fail session build");
+}
