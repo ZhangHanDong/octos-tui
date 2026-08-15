@@ -214,3 +214,79 @@ impl SplashSession {
         out.flush().wrap_err("splash: flush")
     }
 }
+
+/// Play the startup splash if gating allows. Every failure is swallowed:
+/// the splash is decoration and must never block or delay startup beyond
+/// its own deadline (specs/task-startup-splash.spec: 失败静默).
+pub fn play(cli: &crate::cli::Cli) {
+    use std::io::IsTerminal;
+
+    let (term_cols, term_rows) = crossterm::terminal::size().unwrap_or((0, 0));
+    let gate = SplashGate {
+        no_splash_flag: cli.no_splash,
+        env_disabled: std::env::var_os("OCTOSCODE_NO_SPLASH").is_some(),
+        stdout_is_tty: std::io::stdout().is_terminal(),
+        ci: std::env::var_os("CI").is_some(),
+        term_cols,
+        term_rows,
+    };
+    if !should_play(&gate) {
+        return;
+    }
+    let _ = play_inner();
+}
+
+fn play_inner() -> Result<()> {
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()) ^ d.as_secs())
+        .unwrap_or(0);
+    let mut session = SplashSession::new(
+        pick_effect_name(seed),
+        &splash_text(),
+        SessionOpts {
+            frame_rate: 60,
+            virtual_clock: false,
+            seed,
+        },
+    )?;
+
+    // Raw mode for echo-free any-key skip; the guard restores it on every
+    // exit path (the panic hook in main.rs also disables raw mode, so a
+    // double-disable is harmless).
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        }
+    }
+    crossterm::terminal::enable_raw_mode().wrap_err("splash: raw mode")?;
+    let _guard = RawGuard;
+    let mut stdout = std::io::stdout().lock();
+    crossterm::execute!(stdout, crossterm::cursor::Hide).ok();
+
+    let deadline = std::time::Instant::now() + SPLASH_DEADLINE;
+    session.run(&mut stdout, || {
+        std::time::Instant::now() >= deadline || key_or_resize_pending()
+    })?;
+    Ok(())
+}
+
+/// Drain pending terminal events; any key press or resize stops the splash.
+/// Errors read as "stop" — never let event plumbing wedge the animation.
+fn key_or_resize_pending() -> bool {
+    use crossterm::event::{Event, KeyEventKind, poll, read};
+    loop {
+        match poll(std::time::Duration::ZERO) {
+            Ok(true) => match read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => return true,
+                Ok(Event::Resize(..)) => return true,
+                Ok(_) => continue,
+                Err(_) => return true,
+            },
+            Ok(false) => return false,
+            Err(_) => return true,
+        }
+    }
+}
