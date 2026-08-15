@@ -53,6 +53,7 @@ octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端�
 - src/lib.rs
 - src/splash.rs
 - src/cli.rs
+- src/transport.rs
 - tests/splash_contract.rs
 - specs/**
 

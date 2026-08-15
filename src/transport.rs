@@ -9081,6 +9081,7 @@ mod tests {
             scroll_mode: crate::cli::ScrollMode::Native,
             vim_mode: false,
             steer_mid_turn: false,
+            no_splash: false,
         };
 
         let launch = launch_from_cli(&cli);
@@ -10482,6 +10483,7 @@ mod tests {
             scroll_mode: crate::cli::ScrollMode::Native,
             vim_mode: false,
             steer_mid_turn: false,
+            no_splash: false,
         };
 
         let launch = launch_from_cli(&cli);
