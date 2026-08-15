@@ -6966,6 +6966,314 @@ mod tests {
         assert_eq!(remove.params["name"], "deep-search");
     }
 
+    /// The ws handshake advertises `projection.envelope.v2`, and a server that
+    /// honors it stops sending `message/delta` + `turn/completed` entirely —
+    /// the reply text and the turn terminal ride inside `projection/envelope`
+    /// instead. This is the exact frame a live server emits for a reasoning
+    /// delta; it has to reach the v2 notification, because the v1 arm is
+    /// dropped on the floor (`store.rs` `UiNotification::Envelope(_) => None`)
+    /// and a dropped terminal leaves the UI spinning on "Working" forever with
+    /// the answer only visible after a restart re-hydrates the session.
+    #[test]
+    fn projection_envelope_v2_frame_decodes_to_the_v2_notification() {
+        let mut pending = HashMap::new();
+        let frame = json!({
+            "jsonrpc": "2.0",
+            "method": "projection/envelope",
+            "params": {
+                "session_id": "probe-features-2",
+                "thread_id": "09910166-03a0-4037-8d34-e27d634ef2a9",
+                "seq": 1,
+                "cursor": {"stream": "probe-features-2\u{0}~cwd-74427c29e62e0989", "seq": 7},
+                "turn_id": "09910166-03a0-4037-8d34-e27d634ef2a9",
+                "payload": {"type": "reasoning_delta", "data": {"text": "The"}}
+            }
+        })
+        .to_string();
+
+        let event = rpc_text_to_app_event_with_pending(&frame, &mut pending)
+            .expect("frame decodes")
+            .expect("client event");
+
+        let ClientEvent::App(app_event) = event else {
+            panic!("expected an app event");
+        };
+        let AppUiEvent::Protocol(notification) = *app_event else {
+            panic!("expected a protocol notification");
+        };
+        assert!(
+            matches!(notification, UiNotification::EnvelopeV2(_)),
+            "v2 wire payload must not decode to the dropped v1 arm: {notification:?}"
+        );
+    }
+
+    /// End-to-end repro of the ws-only stall, replayed from frames captured
+    /// off a live server. The client submits with its OWN turn id; the server
+    /// answers `turn/started` carrying a DIFFERENT (thread-shaped) id and then
+    /// streams every envelope under that server id. The reply must still land
+    /// and the turn must still settle — otherwise the composer spins on
+    /// "Working" forever and the answer only appears after a restart
+    /// re-hydrates the session, which is the reported symptom.
+    #[test]
+    fn envelope_v2_turn_under_a_server_assigned_turn_id_lands_and_settles() {
+        const SERVER_TURN: &str = "b6a0e44e-8336-4cc0-a9db-93439010b313";
+        let session = "probe-term-1";
+
+        let mut store = crate::store::Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![AppUiSession {
+                id: SessionKey(session.into()),
+                title: "test".into(),
+                profile_id: Some("alan".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "ready".into(),
+            target: None,
+            readonly: false,
+        });
+
+        // The client's own submit: this is where the client-side turn id and
+        // the InProgress run state come from.
+        store.state.composer = "hello".into();
+        let command = store.compose_command().expect("submit starts a turn");
+        let AppUiCommand::SubmitPrompt(params) = command else {
+            panic!("expected a submit-prompt command");
+        };
+        assert_ne!(
+            params.turn_id.0.to_string(),
+            SERVER_TURN,
+            "repro requires the client and server to disagree on the turn id"
+        );
+
+        let mut pending = HashMap::new();
+        let frames = [
+            json!({"jsonrpc":"2.0","method":"turn/started","params":{
+                "session_id": session, "turn_id": SERVER_TURN,
+                "timestamp":"2026-08-10T07:50:12.385814Z"}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": session, "thread_id": SERVER_TURN, "seq": 33,
+                "cursor": {"stream": session, "seq": 39}, "turn_id": SERVER_TURN,
+                "payload": {"type":"assistant_delta","data":{
+                    "text":"Hello! ",
+                    "assistant_segment_id": "b6a0e44e-8336-4cc0-a9db-93439010b313:assistant:1"}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": session, "thread_id": SERVER_TURN, "seq": 43,
+                "cursor": {"stream": session, "seq": 52}, "turn_id": SERVER_TURN,
+                "payload": {"type":"assistant_persisted","data":{
+                    "text":"Hello! How can I help you today?",
+                    "assistant_segment_id": "b6a0e44e-8336-4cc0-a9db-93439010b313:assistant:1",
+                    "meta": {"message_id":"probe-term-1:1:1786348294194329000",
+                             "persisted_at":"2026-08-10T07:51:34.194329Z"}}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": session, "thread_id": SERVER_TURN, "seq": 44,
+                "cursor": {"stream": session, "seq": 53}, "turn_id": SERVER_TURN,
+                "payload": {"type":"turn_terminal","data":{
+                    "outcome":"completed",
+                    "token_usage":{"input_tokens":87,"output_tokens":43}}}}}),
+        ];
+
+        for frame in frames {
+            let event = rpc_text_to_app_event_with_pending(&frame.to_string(), &mut pending)
+                .expect("frame decodes")
+                .expect("client event");
+            let ClientEvent::App(app_event) = event else {
+                panic!("expected an app event for {frame}");
+            };
+            store.apply_event(*app_event);
+        }
+
+        let transcript = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("How can I help you today?"),
+            "assistant answer never reached the transcript: {transcript:?}"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_none(),
+            "terminal left the turn live, so the spinner never clears"
+        );
+        assert_ne!(
+            store.state.run_state,
+            crate::model::SessionRunState::InProgress,
+            "run state stuck InProgress after the turn terminal"
+        );
+    }
+
+    /// A `projection/envelope` frame WITHOUT `turn_id` decodes to the v1
+    /// `UiNotification::Envelope` arm. That arm used to return `None`, so a v1
+    /// server's reply text and turn terminal vanished silently: the composer
+    /// spun on "Working" forever and the answer only surfaced after a restart
+    /// re-hydrated the session. v1 carries the same payloads as v2 (minus the
+    /// segment id, and spelling the terminal `turn_completed`), so it must be
+    /// applied, not discarded.
+    #[test]
+    fn envelope_v1_turn_lands_and_settles_like_v2() {
+        const THREAD: &str = "b6a0e44e-8336-4cc0-a9db-93439010b313";
+        let session = "v1-envelope-session";
+
+        let mut store = crate::store::Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![AppUiSession {
+                id: SessionKey(session.into()),
+                title: "test".into(),
+                profile_id: Some("alan".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "ready".into(),
+            target: None,
+            readonly: false,
+        });
+        store.state.composer = "hello".into();
+        store.compose_command().expect("submit starts a turn");
+
+        let mut pending = HashMap::new();
+        // No `turn_id` anywhere: this is the v1 wire shape.
+        let frames = [
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": session, "thread_id": THREAD, "seq": 1,
+                "payload": {"type":"assistant_delta","data":{"text":"Hello! "}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": session, "thread_id": THREAD, "seq": 2,
+                "payload": {"type":"assistant_persisted","data":{
+                    "text":"Hello! How can I help you today?",
+                    "meta": {"message_id":"v1:1:1786348294194329000",
+                             "persisted_at":"2026-08-10T07:51:34.194329Z"}}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": session, "thread_id": THREAD, "seq": 3,
+                "payload": {"type":"turn_completed","data":{
+                    "token_usage":{"input_tokens":87,"output_tokens":43}}}}}),
+        ];
+
+        for frame in frames {
+            let event = rpc_text_to_app_event_with_pending(&frame.to_string(), &mut pending)
+                .expect("frame decodes")
+                .expect("client event");
+            let ClientEvent::App(app_event) = event else {
+                panic!("expected an app event for {frame}");
+            };
+            store.apply_event(*app_event);
+        }
+
+        let transcript = store.state.sessions[0]
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("How can I help you today?"),
+            "v1 assistant answer never reached the transcript: {transcript:?}"
+        );
+        assert!(
+            store.state.sessions[0].live_reply.is_none(),
+            "v1 terminal left the turn live, so the spinner never clears"
+        );
+        assert_ne!(
+            store.state.run_state,
+            crate::model::SessionRunState::InProgress,
+            "run state stuck InProgress after the v1 turn terminal"
+        );
+    }
+
+    /// Envelopes arrive with the session key SPLIT: `session_id` carries the
+    /// base key and the topic rides alongside in `topic` (verified against a
+    /// live server — opening `alan:local:tui#coding` yields
+    /// `session_id='alan:local:tui' topic='coding'`). The TUI keys its sessions
+    /// by the FULL key, so routing deltas on the bare `session_id` finds no
+    /// session and discards the whole turn: nothing renders, the spinner never
+    /// clears, and the answer only appears once a restart re-hydrates.
+    #[test]
+    fn envelope_with_split_session_topic_routes_to_the_full_key_session() {
+        const THREAD: &str = "aaae41c6-9491-4913-8167-4de07c2a57b1";
+        let full_key = "alan:local:tui#coding";
+        let base_key = "alan:local:tui";
+        let topic = "coding";
+
+        let mut store = crate::store::Store::from_snapshot(AppUiSnapshot {
+            sessions: vec![AppUiSession {
+                id: SessionKey(full_key.into()),
+                title: "coding".into(),
+                profile_id: Some("alan".into()),
+                messages: vec![],
+                tasks: vec![],
+                live_reply: None,
+            }],
+            selected_session: 0,
+            status: "ready".into(),
+            target: None,
+            readonly: false,
+        });
+        store.state.composer = "hello".into();
+        store.compose_command().expect("submit starts a turn");
+
+        let mut pending = HashMap::new();
+        let frames = [
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": base_key, "topic": topic, "thread_id": THREAD,
+                "seq": 1, "turn_id": THREAD,
+                "payload": {"type":"assistant_delta","data":{
+                    "text":"Hello! ",
+                    "assistant_segment_id": "aaae41c6:assistant:1"}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": base_key, "topic": topic, "thread_id": THREAD,
+                "seq": 2, "turn_id": THREAD,
+                "payload": {"type":"assistant_persisted","data":{
+                    "text":"Hello! How can I help you today?",
+                    "assistant_segment_id": "aaae41c6:assistant:1",
+                    "meta": {"message_id":"m1","persisted_at":"2026-08-10T07:51:34.194329Z"}}}}}),
+            json!({"jsonrpc":"2.0","method":"projection/envelope","params":{
+                "session_id": base_key, "topic": topic, "thread_id": THREAD,
+                "seq": 3, "turn_id": THREAD,
+                "payload": {"type":"turn_terminal","data":{
+                    "outcome":"completed",
+                    "token_usage":{"input_tokens":87,"output_tokens":43}}}}}),
+        ];
+
+        for frame in frames {
+            let event = rpc_text_to_app_event_with_pending(&frame.to_string(), &mut pending)
+                .expect("frame decodes")
+                .expect("client event");
+            let ClientEvent::App(app_event) = event else {
+                panic!("expected an app event for {frame}");
+            };
+            store.apply_event(*app_event);
+        }
+
+        let session = store
+            .state
+            .sessions
+            .iter()
+            .find(|session| session.id.0 == full_key)
+            .expect("the topic-keyed session still exists");
+        let transcript = session
+            .messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("How can I help you today?"),
+            "answer never reached the topic-keyed session: {transcript:?}"
+        );
+        assert!(
+            session.live_reply.is_none(),
+            "terminal never settled the topic-keyed session's turn"
+        );
+        assert_ne!(
+            store.state.run_state,
+            crate::model::SessionRunState::InProgress,
+            "run state stuck InProgress: the spinner never clears"
+        );
+    }
+
     #[test]
     fn profile_skill_results_decode_to_client_events() {
         let mut pending = HashMap::new();
