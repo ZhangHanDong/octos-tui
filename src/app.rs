@@ -1699,7 +1699,7 @@ fn elide_middle_terminal_line(text: &str, max_chars: usize) -> String {
 /// columns, so a row built from the result can never exceed its column budget
 /// and wrap. Never splits a char and never byte-slices, so it cannot panic on
 /// a multibyte boundary. The returned string's display width is `<= max_cols`.
-fn truncate_to_display_width(text: &str, max_cols: usize) -> String {
+pub(crate) fn truncate_to_display_width(text: &str, max_cols: usize) -> String {
     if text.width() <= max_cols {
         return text.to_string();
     }
