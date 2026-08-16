@@ -1,6 +1,6 @@
 //! Contract tests for specs/task-startup-splash.spec.
 
-use octoscode::splash::{SPLASH_EFFECTS, SplashGate, pick_effect_name, should_play, splash_text};
+use octoscode::splash::{SPLASH_EFFECTS, SplashGate, pick_effect_args, should_play, splash_text};
 
 /// A gate whose every condition allows playback; tests flip one field each.
 fn open_gate() -> SplashGate {
@@ -68,10 +68,10 @@ fn should_play_false_when_terminal_narrower_than_logo() {
 #[test]
 fn pick_effect_stays_in_curated_list() {
     for seed in 0..64u64 {
-        let name = pick_effect_name(seed);
+        let args = pick_effect_args(seed);
         assert!(
-            SPLASH_EFFECTS.contains(&name),
-            "seed {seed} picked {name}, not in SPLASH_EFFECTS"
+            SPLASH_EFFECTS.contains(&args),
+            "seed {seed} picked {args:?}, not in SPLASH_EFFECTS"
         );
     }
 }
@@ -95,8 +95,9 @@ fn test_opts() -> SessionOpts {
 
 #[test]
 fn curated_effects_produce_frames_on_virtual_clock() {
-    for name in SPLASH_EFFECTS {
-        let mut session = SplashSession::new(name, &splash_text(), test_opts())
+    for args in SPLASH_EFFECTS {
+        let name = args[0];
+        let mut session = SplashSession::new(args, &splash_text(), test_opts())
             .unwrap_or_else(|e| panic!("{name}: session builds: {e}"));
         let mut out: Vec<u8> = Vec::new();
         let stats = session
@@ -114,7 +115,7 @@ fn curated_effects_produce_frames_on_virtual_clock() {
 #[test]
 fn truncated_run_ends_with_full_logo() {
     let text = splash_text();
-    let mut session = SplashSession::new("decrypt", &text, test_opts()).expect("session builds");
+    let mut session = SplashSession::new(&["decrypt"], &text, test_opts()).expect("session builds");
     let mut out: Vec<u8> = Vec::new();
     let mut calls = 0;
     let stats = session
@@ -141,6 +142,6 @@ fn truncated_run_ends_with_full_logo() {
 fn play_swallows_engine_errors() {
     // Empty input makes the splash session build fail; the run path must
     // surface that as Err (never panic), which `play` then discards.
-    let result = SplashSession::new("decrypt", "", test_opts());
+    let result = SplashSession::new(&["decrypt"], "", test_opts());
     assert!(result.is_err(), "empty input should fail session build");
 }

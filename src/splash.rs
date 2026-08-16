@@ -14,19 +14,34 @@ const LOGO: &str = "\
  ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
   ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
 
-/// Curated effects. Each runs to natural completion at startup, so members
-/// are limited to ~1.7–3.7s natural duration on this logo at 60fps (measured
-/// with the virtual clock; e.g. decrypt = 12.4s was dropped for this reason).
-/// Keep them valid ttfx subcommand names (`ttfx <name>` must parse).
-pub const SPLASH_EFFECTS: [&str; 8] = [
-    "beams",     // 3.5s
-    "sweep",     // 3.7s
-    "wipe",      // 2.3s
-    "rain",      // 2.8s
-    "slide",     // 1.9s
-    "scattered", // 1.8s
-    "middleout", // 1.7s
-    "highlight", // 2.1s
+/// Curated effects as ttfx CLI arg lists (`ttfx <name> [args…]` must parse).
+/// Each runs to natural completion at startup, so members are limited to
+/// ~1.7–4.5s natural duration on this logo at 60fps (e.g. decrypt = 12.4s was
+/// dropped). Durations were measured with the virtual clock — EXCEPT effects
+/// that read wall time (matrix), whose phase lengths are set explicitly in
+/// args because the virtual measure does not predict their real duration.
+pub const SPLASH_EFFECTS: [&[&str]; 9] = [
+    &["beams"],     // 3.5s
+    &["sweep"],     // 3.7s
+    &["wipe"],      // 2.3s
+    &["rain"],      // 2.8s
+    &["slide"],     // 1.9s
+    &["scattered"], // 1.8s
+    &["middleout"], // 1.7s
+    &["highlight"], // 2.1s
+    // Matrix paces its phases on WALL time (not frames), so its duration is
+    // tuned via args: ~3s in release builds, ~5s in debug (heavier frames).
+    &[
+        "matrix",
+        "--rain-time",
+        "1",
+        "--rain-fall-delay-range",
+        "1-4",
+        "--rain-column-delay-range",
+        "1-3",
+        "--resolve-delay",
+        "1",
+    ],
 ];
 
 /// The animated input: logo plus a version footer line.
@@ -71,7 +86,7 @@ pub fn should_play(gate: &SplashGate) -> bool {
 }
 
 /// Deterministic pick from SPLASH_EFFECTS (seeded ttfx Rng, unit-testable).
-pub fn pick_effect_name(seed: u64) -> &'static str {
+pub fn pick_effect_args(seed: u64) -> &'static [&'static str] {
     let mut rng = ttfx::utils::rng::Rng::seeded(seed);
     SPLASH_EFFECTS[rng.choice_index(SPLASH_EFFECTS.len())]
 }
@@ -84,8 +99,9 @@ use ttfx::engine::effect::Effect;
 use ttfx::engine::terminal::TerminalConfig;
 use ttfx::utils::rng::Rng;
 
-/// Hang safety net only: the curated effects finish naturally in ≤3.7s, so
-/// this cap fires only if an effect misbehaves — never in the normal path.
+/// Hang safety net only: the curated effects finish naturally in ≤3.7s
+/// (matrix: ~3s release / ~5s debug), so this cap fires only if an effect
+/// misbehaves — never in the normal path.
 pub const SPLASH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(8000);
 
 /// Beat between the settled logo and the TUI taking over, so the ending
@@ -116,17 +132,18 @@ pub struct SplashSession {
 }
 
 impl SplashSession {
-    pub fn new(effect_name: &str, text: &str, opts: SessionOpts) -> Result<Self> {
+    pub fn new(effect_args: &[&str], text: &str, opts: SessionOpts) -> Result<Self> {
         if text.trim().is_empty() {
             return Err(eyre!("splash input text is empty"));
         }
-        // Default effect config via ttfx's own CLI, exactly like its
-        // --random-effect path does.
-        let parsed = <ttfx::cli::Cli as clap::Parser>::try_parse_from(["ttfx", effect_name])
-            .map_err(|e| eyre!("unknown ttfx effect {effect_name}: {e}"))?;
+        // Effect config via ttfx's own CLI (like its --random-effect path);
+        // extra args tune effect phases, e.g. matrix --rain-time.
+        let argv = std::iter::once("ttfx").chain(effect_args.iter().copied());
+        let parsed = <ttfx::cli::Cli as clap::Parser>::try_parse_from(argv)
+            .map_err(|e| eyre!("bad ttfx effect args {effect_args:?}: {e}"))?;
         let effect = parsed
             .effect
-            .ok_or_else(|| eyre!("ttfx parsed no effect for {effect_name}"))?
+            .ok_or_else(|| eyre!("ttfx parsed no effect for {effect_args:?}"))?
             .build_effect();
 
         let config = TerminalConfig {
@@ -257,7 +274,7 @@ fn play_inner() -> Result<()> {
         .map(|d| u64::from(d.subsec_nanos()) ^ d.as_secs())
         .unwrap_or(0);
     let mut session = SplashSession::new(
-        pick_effect_name(seed),
+        pick_effect_args(seed),
         &splash_text(),
         SessionOpts {
             frame_rate: 60,

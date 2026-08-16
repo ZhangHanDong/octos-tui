@@ -29,10 +29,12 @@ octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端�
   尺寸），任一跳过条件命中即返回 false。CLI 新增 `--no-splash` 标志。
 - **内容**：`OCTOS` figlet 风格 ASCII art（const 字符串，约 40 列宽）+ 尾行
   `octoscode v{CARGO_PKG_VERSION}`。
-- **随机效果**：从精选列表 `SPLASH_EFFECTS` 中随机抽取；准入标准为在本 logo 输入上
-  60fps 自然时长 1.7–3.7s（虚拟时钟实测；如 `decrypt` 12.4s 被淘汰）。现行成员：
-  `beams`、`sweep`、`wipe`、`rain`、`slide`、`scattered`、`middleout`、`highlight`。
-  随机种子取 `SystemTime` 纳秒，选择函数 `pick_effect_name(seed)` 可用固定种子单测。
+- **随机效果**：从精选列表 `SPLASH_EFFECTS`（ttfx CLI 参数列表形式，支持按效果调参）
+  随机抽取；准入标准为在本 logo 输入上 60fps 自然时长 ~1.7–4.5s（虚拟时钟实测；如
+  `decrypt` 12.4s 被淘汰）。现行成员：`beams`、`sweep`、`wipe`、`rain`、`slide`、
+  `scattered`、`middleout`、`highlight`，以及墙钟驱动、经 `--rain-time 1` 等参数
+  调短的 `matrix`（release 约 3s）。随机种子取 `SystemTime` 纳秒，选择函数
+  `pick_effect_args(seed)` 可用固定种子单测。
 - **帧循环**：`run_splash(effect, ctx, out, should_stop)` 使用 ttfx 公开原语
   `prep_canvas` → 循环 { `should_stop()` 为真即中断；`next_frame` → `print_frame` →
   `enforce_framerate` } → `restore_cursor`；`out: &mut impl Write` 与 `Clock`（real /
