@@ -10,7 +10,7 @@ estimate: 1d
 octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端之前）在主屏播放
 一段 OCTOS ASCII logo 动画，用 [ttfx](https://github.com/omacom-io/ttfx) 引擎的公开
 原语（`Effect::build`/`next_frame` + `Terminal` 帧原语）在 octos-tui 侧自建帧循环渲染。
-每次启动从精选效果列表随机抽一个并**自然播完**（精选成员以自然时长 1.7–3.7s 为准入
+每次启动从精选效果列表随机抽一个并**自然播完**（精选成员以自然时长 ~1.7–4.5s 为准入
 标准），按键可随时跳过，8000ms 仅作防挂安全网；结束时（无论跑完还是截断）在原地留下
 完整 logo + 版本号作为 banner，自然跑完后停顿 450ms 再进入 TUI（按键可打断停顿）。
 动画是纯装饰，任何失败都静默跳过，绝不阻断启动。
@@ -61,6 +61,7 @@ octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端�
 - src/cli.rs
 - src/transport.rs
 - docs/ARCHITECTURE.md
+- README.md
 - tests/splash_contract.rs
 - specs/**
 
