@@ -91,6 +91,13 @@ pub fn pick_effect_args(seed: u64) -> &'static [&'static str] {
     SPLASH_EFFECTS[rng.choice_index(SPLASH_EFFECTS.len())]
 }
 
+/// Curated entry for a specific effect name (`OCTOSCODE_SPLASH_EFFECT=matrix`
+/// pins the pick). Curated-only on purpose: arbitrary ttfx effects would break
+/// the duration guarantees the list encodes.
+pub fn effect_args_for(name: &str) -> Option<&'static [&'static str]> {
+    SPLASH_EFFECTS.iter().copied().find(|args| args[0] == name)
+}
+
 use std::io::Write;
 
 use eyre::{Result, WrapErr, eyre};
@@ -273,8 +280,14 @@ fn play_inner() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()) ^ d.as_secs())
         .unwrap_or(0);
+    // OCTOSCODE_SPLASH_EFFECT pins a curated effect by name (e.g. `matrix`);
+    // unset or unknown names fall back to the seeded random pick.
+    let effect_args = std::env::var("OCTOSCODE_SPLASH_EFFECT")
+        .ok()
+        .and_then(|name| effect_args_for(name.trim()))
+        .unwrap_or_else(|| pick_effect_args(seed));
     let mut session = SplashSession::new(
-        pick_effect_args(seed),
+        effect_args,
         &splash_text(),
         SessionOpts {
             frame_rate: 60,

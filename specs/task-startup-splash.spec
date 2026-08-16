@@ -34,7 +34,8 @@ octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端�
   `decrypt` 12.4s 被淘汰）。现行成员：`beams`、`sweep`、`wipe`、`rain`、`slide`、
   `scattered`、`middleout`、`highlight`，以及墙钟驱动、经 `--rain-time 1` 等参数
   调短的 `matrix`（release 约 3s）。随机种子取 `SystemTime` 纳秒，选择函数
-  `pick_effect_args(seed)` 可用固定种子单测。
+  `pick_effect_args(seed)` 可用固定种子单测。`OCTOSCODE_SPLASH_EFFECT=<name>` 可按名
+  钉选精选条目（保留其调参；仅限精选列表，未知名回落随机——时长保证不被绕过）。
 - **帧循环**：`run_splash(effect, ctx, out, should_stop)` 使用 ttfx 公开原语
   `prep_canvas` → 循环 { `should_stop()` 为真即中断；`next_frame` → `print_frame` →
   `enforce_framerate` } → `restore_cursor`；`out: &mut impl Write` 与 `Clock`（real /
@@ -100,6 +101,12 @@ octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端�
   假设 stdout 为 TTY、无关闭标志与环境变量、非 CI、终端宽度足够
   当 调用 should_play
   那么 返回 true
+
+场景: 钉选效果仅解析精选名
+  测试: effect_pin_resolves_curated_names_only
+  假设 OCTOSCODE_SPLASH_EFFECT 语义由 effect_args_for 实现
+  当 以 "matrix" 与非精选名 "decrypt" 分别查询
+  那么 "matrix" 返回含调参的精选条目、"decrypt" 返回 None
 
 场景: 随机效果取自精选列表
   测试: pick_effect_stays_in_curated_list

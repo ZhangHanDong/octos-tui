@@ -1,6 +1,8 @@
 //! Contract tests for specs/task-startup-splash.spec.
 
-use octoscode::splash::{SPLASH_EFFECTS, SplashGate, pick_effect_args, should_play, splash_text};
+use octoscode::splash::{
+    SPLASH_EFFECTS, SplashGate, effect_args_for, pick_effect_args, should_play, splash_text,
+};
 
 /// A gate whose every condition allows playback; tests flip one field each.
 fn open_gate() -> SplashGate {
@@ -74,6 +76,20 @@ fn pick_effect_stays_in_curated_list() {
             "seed {seed} picked {args:?}, not in SPLASH_EFFECTS"
         );
     }
+}
+
+#[test]
+fn effect_pin_resolves_curated_names_only() {
+    let matrix = effect_args_for("matrix").expect("matrix is curated");
+    assert_eq!(matrix[0], "matrix");
+    assert!(
+        matrix.contains(&"--rain-time"),
+        "pinned matrix must keep its tuned args"
+    );
+    assert!(
+        effect_args_for("decrypt").is_none(),
+        "non-curated name pins nothing"
+    );
 }
 
 #[test]
