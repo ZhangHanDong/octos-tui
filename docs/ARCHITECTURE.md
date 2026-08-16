@@ -507,6 +507,7 @@ added without a row here.
 | `src/highlight.rs` | 172 | Fenced-code-block syntax highlighting for the transcript renderer |
 | `src/insert_history.rs` | 1603 | Insert finalized history lines into the terminal's **normal scrollback**, |
 | `src/sanitize.rs` | 160 | Terminal control-sequence sanitisation for server-supplied text. |
+| `src/splash.rs` | 292 | Startup splash: a ttfx-rendered OCTOS logo animation played on the main screen before the event loop claims the terminal. |
 | `src/terminal_probe.rs` | 243 | Terminal detection and color adaptation for octoscode. |
 | `src/theme.rs` | 204 | Terminal-aware palettes and theme-specific colors. |
 | `src/tui_terminal.rs` | 1171 | Inline-viewport terminal — ported and trimmed from codex-rs `tui/src/custom_terminal.rs`. |

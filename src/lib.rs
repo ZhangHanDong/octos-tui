@@ -23,6 +23,7 @@ pub mod menu;
 pub mod model;
 pub mod profiles;
 pub mod sanitize;
+pub mod splash;
 pub mod store;
 pub mod terminal_probe;
 pub mod theme;

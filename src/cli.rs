@@ -148,6 +148,9 @@ pub struct Cli {
     /// Mid-turn prompts steer the live turn instead of staging FIFO
     /// (opt-in; default off — prompts queue and run in order).
     pub steer_mid_turn: bool,
+    /// Skip the ttfx startup animation (also skipped for non-TTY/CI, or via
+    /// OCTOSCODE_NO_SPLASH).
+    pub no_splash: bool,
 }
 
 /// Version string like `0.2.2-rc.7 (94e43fd 2026-07-17)` — the Cargo version
@@ -264,6 +267,10 @@ struct CliArgs {
     /// `/steer` (persist with `/saveconfig`).
     #[arg(long = "steer-mid-turn")]
     pub steer_mid_turn: bool,
+
+    /// Skip the startup logo animation.
+    #[arg(long = "no-splash")]
+    pub no_splash: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -417,6 +424,9 @@ impl Cli {
             // the default when the flag is absent.
             vim_mode: args.vim_mode || file_config.vim_mode.unwrap_or(false),
             steer_mid_turn: args.steer_mid_turn || file_config.steer_mid_turn.unwrap_or(false),
+            // Flag + OCTOSCODE_NO_SPLASH env only — no config-file key
+            // (CliFileConfig is deny_unknown_fields; spec gates via these two).
+            no_splash: args.no_splash,
         })
     }
 }
@@ -925,6 +935,15 @@ mod tests {
         .expect_err("endpoint and stdio command should conflict");
 
         assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    /// specs/task-startup-splash.spec: --no-splash disables the startup animation.
+    #[test]
+    fn cli_parses_no_splash_flag() {
+        let cli = Cli::try_parse_from(["octoscode", "--no-splash"]).expect("cli parses");
+        assert!(cli.no_splash);
+        let cli = Cli::try_parse_from(["octoscode"]).expect("cli parses");
+        assert!(!cli.no_splash);
     }
 
     #[test]

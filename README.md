@@ -321,6 +321,7 @@ so plain `octoscode` is the real thing, not the mock.
 --steer-mid-turn         inject a prompt typed mid-turn into the RUNNING turn
                          (default off: mid-turn prompts queue FIFO and each runs
                          as its own turn, in the order typed)
+--no-splash              skip the startup logo animation
 ```
 
 `--endpoint` and `--stdio-command` are mutually exclusive — pick one transport.
@@ -363,6 +364,25 @@ allows it, using only restrained ANSI colors for borders, accents, and errors.
 
 Set the palette at launch with `--theme <name>`, or switch live with `/theme`
 (a `*`-marked menu; the change repaints immediately and survives reconnects).
+
+### Startup splash
+
+Every interactive launch opens with a short [ttfx](https://github.com/omacom-io/ttfx)-rendered
+OCTOS logo animation on the main screen, picked at random from a curated set:
+
+```text
+beams, sweep, wipe, rain, slide, scattered, middleout, highlight, matrix
+```
+
+Each effect runs to its natural end (~2–4s), settles on the full logo for a
+beat, then the TUI starts. Press any key to skip straight in. The animation
+never blocks startup: it is skipped automatically when stdout is not a TTY,
+when `CI` is set, or when the terminal is smaller than the logo, and any
+internal error silently falls through to a normal launch.
+
+- `--no-splash` or `OCTOSCODE_NO_SPLASH=1` turns it off.
+- `OCTOSCODE_SPLASH_EFFECT=matrix` pins a specific effect (any name from the
+  curated set; unknown names fall back to the random pick).
 
 ### In-session keys and slash commands
 
@@ -509,6 +529,8 @@ source/fallback locale, so any untranslated string falls back to English.
 | `OCTOSCODE_BIN` | Forces a specific built `octoscode` binary for harnesses. |
 | `OCTOSCODE_DIR` | Points Octos harness scripts at this standalone TUI repo. |
 | `OCTOSCODE_NO_AUTO_INSTALL` | Disables backend auto-install (a missing `octos` then errors). |
+| `OCTOSCODE_NO_SPLASH` | Disables the startup logo animation (same as `--no-splash`). |
+| `OCTOSCODE_SPLASH_EFFECT` | Pins the splash to one curated effect, e.g. `matrix`. |
 
 > **Renamed from `octos-tui`.** Every `OCTOS_TUI_*` variable is now
 > `OCTOSCODE_*`. The one exception that still works is
