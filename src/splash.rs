@@ -14,10 +14,20 @@ const LOGO: &str = "\
  ╚██████╔╝╚██████╗   ██║   ╚██████╔╝███████║
   ╚═════╝  ╚═════╝   ╚═╝    ╚═════╝ ╚══════╝";
 
-/// Curated effects, chosen for reading well when truncated at ~1.5s.
-/// Members may be tuned after visual testing; keep them valid ttfx
-/// subcommand names (`ttfx <name>` must parse).
-pub const SPLASH_EFFECTS: [&str; 6] = ["decrypt", "beams", "sweep", "wipe", "slice", "expand"];
+/// Curated effects. Each runs to natural completion at startup, so members
+/// are limited to ~1.7–3.7s natural duration on this logo at 60fps (measured
+/// with the virtual clock; e.g. decrypt = 12.4s was dropped for this reason).
+/// Keep them valid ttfx subcommand names (`ttfx <name>` must parse).
+pub const SPLASH_EFFECTS: [&str; 8] = [
+    "beams",     // 3.5s
+    "sweep",     // 3.7s
+    "wipe",      // 2.3s
+    "rain",      // 2.8s
+    "slide",     // 1.9s
+    "scattered", // 1.8s
+    "middleout", // 1.7s
+    "highlight", // 2.1s
+];
 
 /// The animated input: logo plus a version footer line.
 pub fn splash_text() -> String {
@@ -74,8 +84,13 @@ use ttfx::engine::effect::Effect;
 use ttfx::engine::terminal::TerminalConfig;
 use ttfx::utils::rng::Rng;
 
-/// How long the animation may run before it is truncated to the final logo.
-pub const SPLASH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Hang safety net only: the curated effects finish naturally in ≤3.7s, so
+/// this cap fires only if an effect misbehaves — never in the normal path.
+pub const SPLASH_DEADLINE: std::time::Duration = std::time::Duration::from_millis(8000);
+
+/// Beat between the settled logo and the TUI taking over, so the ending
+/// doesn't jump-cut. Cut short by any key press.
+pub const SPLASH_HOLD: std::time::Duration = std::time::Duration::from_millis(450);
 
 #[derive(Debug, Clone, Copy)]
 pub struct SessionOpts {
@@ -267,9 +282,18 @@ fn play_inner() -> Result<()> {
     crossterm::execute!(stdout, crossterm::cursor::Hide).ok();
 
     let deadline = std::time::Instant::now() + SPLASH_DEADLINE;
-    session.run(&mut stdout, || {
+    let stats = session.run(&mut stdout, || {
         std::time::Instant::now() >= deadline || key_or_resize_pending()
     })?;
+
+    // Hold the settled logo for a beat before the TUI takes over — a skipped
+    // run means the user is in a hurry, so no hold there.
+    if !stats.truncated {
+        let hold_until = std::time::Instant::now() + SPLASH_HOLD;
+        while std::time::Instant::now() < hold_until && !key_or_resize_pending() {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    }
     Ok(())
 }
 

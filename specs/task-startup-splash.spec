@@ -10,9 +10,10 @@ estimate: 1d
 octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端之前）在主屏播放
 一段 OCTOS ASCII logo 动画，用 [ttfx](https://github.com/omacom-io/ttfx) 引擎的公开
 原语（`Effect::build`/`next_frame` + `Terminal` 帧原语）在 octos-tui 侧自建帧循环渲染。
-每次启动从精选效果列表随机抽一个，播放受 1500ms 上限与按键跳过约束；结束时（无论跑完
-还是截断）在原地留下完整 logo + 版本号作为 banner，然后正常进入 TUI。动画是纯装饰，
-任何失败都静默跳过，绝不阻断启动。
+每次启动从精选效果列表随机抽一个并**自然播完**（精选成员以自然时长 1.7–3.7s 为准入
+标准），按键可随时跳过，8000ms 仅作防挂安全网；结束时（无论跑完还是截断）在原地留下
+完整 logo + 版本号作为 banner，自然跑完后停顿 450ms 再进入 TUI（按键可打断停顿）。
+动画是纯装饰，任何失败都静默跳过，绝不阻断启动。
 
 ## 已定决策
 
@@ -28,16 +29,18 @@ octoscode 启动时（`backend_ensure` 之后、`event_loop::run` 接管终端�
   尺寸），任一跳过条件命中即返回 false。CLI 新增 `--no-splash` 标志。
 - **内容**：`OCTOS` figlet 风格 ASCII art（const 字符串，约 40 列宽）+ 尾行
   `octoscode v{CARGO_PKG_VERSION}`。
-- **随机效果**：从精选列表 `SPLASH_EFFECTS`（首版取 `decrypt`、`beams`、`sweep`、
-  `wipe`、`slice`、`expand` 六种，观感实测后可调整成员）中随机抽取；随机种子取
-  `SystemTime` 纳秒，选择函数 `pick_effect(seed) -> EffectCommand` 可用固定种子单测。
+- **随机效果**：从精选列表 `SPLASH_EFFECTS` 中随机抽取；准入标准为在本 logo 输入上
+  60fps 自然时长 1.7–3.7s（虚拟时钟实测；如 `decrypt` 12.4s 被淘汰）。现行成员：
+  `beams`、`sweep`、`wipe`、`rain`、`slide`、`scattered`、`middleout`、`highlight`。
+  随机种子取 `SystemTime` 纳秒，选择函数 `pick_effect_name(seed)` 可用固定种子单测。
 - **帧循环**：`run_splash(effect, ctx, out, should_stop)` 使用 ttfx 公开原语
   `prep_canvas` → 循环 { `should_stop()` 为真即中断；`next_frame` → `print_frame` →
   `enforce_framerate` } → `restore_cursor`；`out: &mut impl Write` 与 `Clock`（real /
   virtual）均可注入，测试用虚拟时钟 + `Vec<u8>` 收帧、不真实 sleep。生产路径的
-  `should_stop` = 超过 1500ms deadline ∨ `crossterm::event::poll(0)` 读到任意按键
-  ∨ 终端 resize；播放期间临时开 raw mode（防按键回显），RAII guard 保证异常路径也
-  关闭 raw mode 并恢复光标。
+  `should_stop` = 超过 8000ms 安全网 deadline ∨ `crossterm::event::poll(0)` 读到任意
+  按键 ∨ 终端 resize；自然跑完后在终态 logo 上停顿 450ms（`SPLASH_HOLD`，按键打断）
+  再返回。播放期间临时开 raw mode（防按键回显），RAII guard 保证异常路径也关闭
+  raw mode 并恢复光标。
 - **终态**：循环结束后统一原样打印完整 logo 文本（默认前景色），使截断与跑完的
   视觉终态一致；banner 留在 scrollback，与 inline scrollback 模型不冲突。
 - **失败静默**：`splash::play` 返回 `()`，内部 `run` 的任何 `Err`（引擎错误、IO 错误、
