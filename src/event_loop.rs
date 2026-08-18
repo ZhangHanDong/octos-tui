@@ -86,7 +86,11 @@ pub fn run(cli: Cli) -> Result<()> {
         saved_visible_history_extent: None,
         saved_inline_screen_size: None,
         mouse_captured: false,
+        live_inline_viewport: None,
     };
+    // Track the inline viewport from frame one so Drop can clear exactly the
+    // rows the TUI painted (menu / composer / status bar), not a row more.
+    guard.live_inline_viewport = Some(terminal.viewport_area);
 
     // i18n: select the UI language before the first render. `t!()` reads this
     // process-global locale, chosen at launch via --lang / OCTOS_LANG / LANG
@@ -460,7 +464,12 @@ where
             update.lines_to_insert,
             live_tail_finalization,
         )
-    }
+    }?;
+    // Keep the guard's clear-on-exit region in lockstep with what the inline
+    // flow actually painted this frame (the viewport moves as the composer
+    // and menus grow/shrink).
+    guard.live_inline_viewport = Some(terminal.viewport_area);
+    Ok(())
 }
 
 fn draw_inline_frame<B>(
@@ -2759,6 +2768,12 @@ struct TerminalGuard {
     /// scrolls the pager). It must never be on in the inline chat flow, where
     /// it would defeat native terminal selection/copy.
     mouse_captured: bool,
+    /// The live inline viewport while running in Inline mode. On drop we
+    /// clear from this row down so the composer's last frames (status bar,
+    /// menu, spinner) don't fossilize in the user's scrollback — the inline
+    /// model deliberately owns NO screen real estate once the TUI is gone
+    /// (finalized output lives above the viewport via `insert_history`).
+    live_inline_viewport: Option<ratatui::layout::Rect>,
 }
 
 impl TerminalGuard {
@@ -2806,6 +2821,9 @@ impl TerminalGuard {
         terminal.invalidate_viewport();
         terminal.last_known_screen_size = size;
         self.mode = RenderMode::AltScreen;
+        // While the overlay owns the alternate screen there is no inline
+        // viewport for Drop to clear.
+        self.live_inline_viewport = None;
         Ok(())
     }
 
@@ -2840,6 +2858,7 @@ impl TerminalGuard {
         }
         terminal.invalidate_viewport();
         self.mode = RenderMode::Inline;
+        self.live_inline_viewport = Some(terminal.viewport_area);
         Ok(())
     }
 }
@@ -2854,6 +2873,20 @@ impl Drop for TerminalGuard {
             }
             if self.mode == RenderMode::AltScreen {
                 let _ = execute!(stdout, LeaveAlternateScreen);
+            }
+            // Clear the inline viewport the TUI painted this session. Without
+            // this, the inline model leaves its last frames — status bar,
+            // composer hint, slash menu — fossilized in the user's scrollback
+            // on exit (and they resurface again whenever an alt-screen
+            // overlay drops back to the main screen). Finalized transcript
+            // lives ABOVE the viewport via `insert_history`, so clearing from
+            // the viewport top down only touches TUI-owned rows.
+            if let Some(viewport) = self.live_inline_viewport {
+                let _ = execute!(
+                    stdout,
+                    crossterm::cursor::MoveTo(0, viewport.top()),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::FromCursorDown)
+                );
             }
             let _ = disable_raw_mode();
             let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
@@ -4384,6 +4417,7 @@ mod tests {
             saved_visible_history_extent: None,
             saved_inline_screen_size: None,
             mouse_captured: false,
+            live_inline_viewport: None,
         };
         let mut scrollback = ScrollbackTracker::new();
         draw(
@@ -4447,6 +4481,7 @@ mod tests {
             saved_visible_history_extent: None,
             saved_inline_screen_size: None,
             mouse_captured: false,
+            live_inline_viewport: None,
         };
         let mut scrollback = ScrollbackTracker::new();
 
@@ -4507,6 +4542,7 @@ mod tests {
             saved_visible_history_extent: None,
             saved_inline_screen_size: None,
             mouse_captured: false,
+            live_inline_viewport: None,
         };
         let mut scrollback = ScrollbackTracker::new();
 
@@ -4624,6 +4660,7 @@ mod tests {
             saved_visible_history_extent: None,
             saved_inline_screen_size: None,
             mouse_captured: false,
+            live_inline_viewport: None,
         };
         let mut scrollback = ScrollbackTracker::new();
 
@@ -4690,6 +4727,7 @@ mod tests {
             saved_visible_history_extent: None,
             saved_inline_screen_size: None,
             mouse_captured: false,
+            live_inline_viewport: None,
         };
 
         guard
@@ -4749,6 +4787,7 @@ mod tests {
             saved_visible_history_extent: None,
             saved_inline_screen_size: None,
             mouse_captured: false,
+            live_inline_viewport: None,
         };
 
         guard
