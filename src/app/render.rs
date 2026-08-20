@@ -2205,9 +2205,7 @@ fn diff_preview_modal_lines(
                 ),
                 Span::styled(
                     path,
-                    palette
-                        .text()
-                        .add_modifier(ratatui::style::Modifier::BOLD),
+                    palette.text().add_modifier(ratatui::style::Modifier::BOLD),
                 ),
             ]));
             if file.hunks.is_empty() {
@@ -2220,8 +2218,7 @@ fn diff_preview_modal_lines(
                 ]));
             }
             for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-                let selected =
-                    file_idx == diff.selected_file && hunk_idx == diff.selected_hunk;
+                let selected = file_idx == diff.selected_file && hunk_idx == diff.selected_hunk;
                 let marker = if selected { "  › " } else { "  ├ " };
                 lines.push(Line::from(vec![
                     Span::styled(marker, palette.selected()),

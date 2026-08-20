@@ -62,7 +62,6 @@ fn inline_diff_marker_style_for_test(kind: &str, palette: Palette) -> Style {
     diff_line_marker_style(kind, palette)
 }
 mod tests {
-    use super::super::*;
     use super::*;
     use crate::{
         cli::ThemeName,
@@ -2671,12 +2670,7 @@ mod tests {
                     hunks: vec![
                         DiffPreviewHunk {
                             header: "@@ -1 +1 @@".into(),
-                            lines: vec![mixed_hunk_line(
-                                "added",
-                                "first-hunk-body",
-                                None,
-                                Some(1),
-                            )],
+                            lines: vec![mixed_hunk_line("added", "first-hunk-body", None, Some(1))],
                         },
                         DiffPreviewHunk {
                             header: "@@ -9 +9 @@".into(),
@@ -14847,7 +14841,6 @@ mod tests {
     }
 }
 mod running_row_regression {
-    use super::super::*;
     use super::*;
     use crate::model::*;
     use crate::store::Store;

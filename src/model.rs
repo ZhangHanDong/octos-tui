@@ -5568,9 +5568,7 @@ impl UserQuestionEntry {
             }
         } else {
             let already = self.option_selected.get(row).copied().unwrap_or(false);
-            for slot in &mut self.option_selected {
-                *slot = false;
-            }
+            self.option_selected.fill(false);
             if let Some(slot) = self.option_selected.get_mut(row) {
                 *slot = !already;
             }

@@ -5920,9 +5920,7 @@ mod tests {
 
     /// A renderable preview tall enough that the overlay has real scroll room
     /// at the 100x30 terminal the overlay tests pin.
-    fn diff_result_with_long_hunk(
-        session_id: SessionKey,
-    ) -> crate::model::DiffPreviewGetResult {
+    fn diff_result_with_long_hunk(session_id: SessionKey) -> crate::model::DiffPreviewGetResult {
         crate::model::DiffPreviewGetResult {
             status: "ready".into(),
             source: "pending_store".into(),
@@ -6021,7 +6019,10 @@ mod tests {
         scroll_current_surface_up(&mut store, 3);
         assert_eq!(store.state.diff_preview.scroll, 3, "wheel up scrolls up");
         scroll_current_surface_down(&mut store, 3);
-        assert_eq!(store.state.diff_preview.scroll, 0, "wheel down scrolls down");
+        assert_eq!(
+            store.state.diff_preview.scroll, 0,
+            "wheel down scrolls down"
+        );
 
         // Esc collapses to inline — the preview itself stays open.
         handle_key(&mut store, key(KeyCode::Esc));
