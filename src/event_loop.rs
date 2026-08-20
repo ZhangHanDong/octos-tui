@@ -27,6 +27,7 @@ use crate::{
     cli::Cli,
     client_event::ClientEvent,
     insert_history::insert_history_lines_with_size,
+    menu::preview_layout,
     model::{AppState, AppUiCommand, ApprovalModalAction, FocusPane},
     store::Store,
     theme::Palette,
@@ -2020,6 +2021,15 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
             KeyCode::Enter => {
                 return handle_composer_enter(store);
             }
+            // The page keys are not composer edits, and the preview pane is on
+            // screen behind this draft — scroll it rather than swallowing them.
+            // (`<`/`>` are NOT bound here: in this branch a character is text.)
+            KeyCode::PageUp => {
+                scroll_menu_preview(store, -(preview_layout::PREVIEW_SCROLL_STEP as isize));
+            }
+            KeyCode::PageDown => {
+                scroll_menu_preview(store, preview_layout::PREVIEW_SCROLL_STEP as isize);
+            }
             KeyCode::Char(ch) => {
                 store.state.insert_composer_char(ch);
             }
@@ -2136,6 +2146,29 @@ fn handle_menu_key(store: &mut Store, key: KeyEvent) -> KeyAction {
         }
         KeyCode::Up | KeyCode::Char('k') => {
             store.select_prev_menu_item();
+        }
+        // The preview pane (the Snapshot rows) scrolls on PgUp/PgDn — menus
+        // bind neither, so Up/Down/j/k keep driving the item selection on the
+        // left while these move the pane on the right. Rows below the pane
+        // used to be simply unreachable.
+        //
+        // `<`/`>` (and the unshifted `,`/`.`) are the SAME scroll, bound
+        // because PgUp/PgDn are not reliably deliverable here: the chat runs
+        // in the terminal's NORMAL buffer (see `run` — inline viewport, no
+        // alternate screen), and terminals bind the page keys to their own
+        // scrollback in exactly that mode. VS Code is the case in hand — its
+        // `terminal.scrollUpPage`/`scrollDownPage` default to plain PgUp/PgDn
+        // on macOS, `when: terminalFocus && !terminalAltBufferActive`, and
+        // both sit in `commandsToSkipShell`, so the escape sequence never
+        // reaches this process. A plain character always does. Deliberately
+        // placed AFTER the search-capture arms, so in a SEARCHABLE menu these
+        // still type into the filter; previews live on the info menus, which
+        // are not searchable.
+        KeyCode::PageUp | KeyCode::Char('<') | KeyCode::Char(',') => {
+            scroll_menu_preview(store, -(preview_layout::PREVIEW_SCROLL_STEP as isize));
+        }
+        KeyCode::PageDown | KeyCode::Char('>') | KeyCode::Char('.') => {
+            scroll_menu_preview(store, preview_layout::PREVIEW_SCROLL_STEP as isize);
         }
         // RIGHT fires the selected row's quick secondary action (e.g. the
         // loops list's pause⇄resume toggle) and keeps the menu open. Rows
@@ -2255,6 +2288,31 @@ fn slash_help_should_capture_char(store: &Store, ch: char) -> bool {
     // so a user who opened the popup but hasn't started filtering can move the
     // selection. Any other first letter starts the inline filter immediately.
     slash_help_capture_active(store) && (store.state.composer.len() > 1 || !matches!(ch, 'j' | 'k'))
+}
+
+/// Move the active frame's preview scroll, clamped to the SAME bound the
+/// renderer uses ([`preview_layout::max_preview_scroll`]) — so a keypress
+/// either moves the pane or is a genuine no-op at an end, never a press that
+/// silently ticks a counter the renderer has already clamped away.
+fn scroll_menu_preview(store: &mut Store, delta: isize) {
+    let max = preview_layout::max_preview_scroll(active_menu_preview_row_count(store)) as isize;
+    if let Some(frame) = store.state.menu_stack.active_mut() {
+        let next = frame.preview_scroll as isize + delta;
+        frame.preview_scroll = next.clamp(0, max) as usize;
+    }
+}
+
+/// Rows the active menu's preview would render, counted the same way
+/// `menu::render::preview_lines` splits them.
+fn active_menu_preview_row_count(store: &Store) -> usize {
+    let Some(crate::menu::MenuBuildResult::Ready(spec)) = store.state.active_menu.as_ref() else {
+        return 0;
+    };
+    match spec.preview.as_ref() {
+        Some(crate::menu::MenuPreview::Text { body, .. }) => body.lines().count(),
+        Some(crate::menu::MenuPreview::KeyValues { rows, .. }) => rows.len(),
+        None => 0,
+    }
 }
 
 fn slash_help_menu_active(store: &Store) -> bool {
@@ -3643,6 +3701,158 @@ mod tests {
         assert_eq!(
             store.state.composer, "",
             "a trailing space is not an argument"
+        );
+    }
+
+    fn status_menu_store() -> Store {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_STATUS,
+        ));
+        store
+    }
+
+    fn frame_preview_scroll(store: &Store) -> usize {
+        store
+            .state
+            .menu_stack
+            .active()
+            .expect("active frame")
+            .preview_scroll
+    }
+
+    /// PgUp/PgDn scroll the preview pane. Rows past the pane's height used to
+    /// be unreachable entirely — the Snapshot pane silently dropped them.
+    #[test]
+    fn page_keys_scroll_the_menu_preview_and_clamp_at_both_ends() {
+        let mut store = status_menu_store();
+        let rows = active_menu_preview_row_count(&store);
+        assert!(
+            rows > 1,
+            "precondition: the Snapshot preview has rows to scroll, got {rows}"
+        );
+
+        handle_key(&mut store, key(KeyCode::PageDown));
+        assert_eq!(
+            frame_preview_scroll(&store),
+            preview_layout::PREVIEW_SCROLL_STEP.min(rows - 1)
+        );
+
+        // Paging past the end clamps to the shared bound, never beyond.
+        for _ in 0..50 {
+            handle_key(&mut store, key(KeyCode::PageDown));
+        }
+        assert_eq!(
+            frame_preview_scroll(&store),
+            preview_layout::max_preview_scroll(rows),
+            "scrolling stops with the last row at the top of the pane"
+        );
+
+        // And back to the top, without going negative.
+        for _ in 0..50 {
+            handle_key(&mut store, key(KeyCode::PageUp));
+        }
+        assert_eq!(frame_preview_scroll(&store), 0);
+    }
+
+    /// `<`/`>` (and `,`/`.`) are the terminal-proof twin of PgUp/PgDn. The
+    /// chat runs in the terminal's NORMAL buffer, where emulators claim the
+    /// page keys for their own scrollback — VS Code's `terminal.scrollUpPage`
+    /// / `scrollDownPage` default to plain PgUp/PgDn on macOS, gated on
+    /// `!terminalAltBufferActive`, and are skipped from the shell — so the
+    /// escape sequence never reaches this process and the pane looked frozen.
+    /// A plain character always arrives.
+    #[test]
+    fn angle_keys_scroll_the_preview_when_the_terminal_eats_the_page_keys() {
+        let mut store = status_menu_store();
+        let rows = active_menu_preview_row_count(&store);
+        assert!(rows > 1, "precondition: rows to scroll, got {rows}");
+        let step = preview_layout::PREVIEW_SCROLL_STEP.min(rows - 1);
+
+        // `>` arrives as a SHIFTED character on a US layout; `.` is the same
+        // binding unshifted. Both must scroll, and both must come back.
+        for (down, up) in [('>', '<'), ('.', ',')] {
+            handle_key(
+                &mut store,
+                modified_key(KeyCode::Char(down), KeyModifiers::SHIFT),
+            );
+            assert_eq!(
+                frame_preview_scroll(&store),
+                step,
+                "`{down}` pages the preview down"
+            );
+            handle_key(&mut store, key(KeyCode::Char(up)));
+            assert_eq!(
+                frame_preview_scroll(&store),
+                0,
+                "`{up}` pages it back to the top"
+            );
+        }
+    }
+
+    /// A menu opened over a non-empty composer routes keystrokes to the draft,
+    /// which left the page keys dead there. They are not composer edits — the
+    /// pane is on screen and must still scroll — while `<`/`>` stay TEXT.
+    #[test]
+    fn page_keys_still_scroll_the_preview_over_a_composer_draft() {
+        let mut store = status_menu_store();
+        store.state.set_composer_text("half-typed prompt");
+        assert!(
+            menu_composer_edit_active(&store),
+            "precondition: draft branch"
+        );
+
+        handle_key(&mut store, key(KeyCode::PageDown));
+        assert!(
+            frame_preview_scroll(&store) > 0,
+            "PgDn scrolls the pane instead of being swallowed by the draft"
+        );
+
+        handle_key(
+            &mut store,
+            modified_key(KeyCode::Char('>'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            store.state.composer, "half-typed prompt>",
+            "but a character is still text while a draft is being edited"
+        );
+    }
+
+    /// The two axes are independent: item navigation must not disturb the
+    /// preview's scroll, and scrolling must not move the selection.
+    #[test]
+    fn preview_scroll_and_item_selection_are_independent() {
+        let mut store = status_menu_store();
+
+        handle_key(&mut store, key(KeyCode::PageDown));
+        let scrolled = frame_preview_scroll(&store);
+        assert!(scrolled > 0, "precondition: the pane scrolled");
+
+        handle_key(&mut store, key(KeyCode::Down));
+        assert_eq!(
+            frame_preview_scroll(&store),
+            scrolled,
+            "Down leaves the pane where it was"
+        );
+        let selected = store
+            .state
+            .menu_stack
+            .active()
+            .expect("active frame")
+            .selected_index;
+        assert_eq!(selected, 1, "and still moves the selection");
+
+        handle_key(&mut store, key(KeyCode::PageUp));
+        assert_eq!(
+            store
+                .state
+                .menu_stack
+                .active()
+                .expect("active frame")
+                .selected_index,
+            selected,
+            "PgUp scrolls the pane without moving the selection"
         );
     }
 
