@@ -10031,7 +10031,13 @@ impl Store {
                 .is_some_and(|approval| &approval.session_id == session_id)
             {
                 self.state.approval = None;
-                self.state.set_run_state_idle();
+                if self.event_targets_active_session(session_id) {
+                    if self.state.active_turn().is_some() {
+                        self.state.set_run_state_in_progress();
+                    } else if self.state.run_state.is_active() {
+                        self.state.set_run_state_idle();
+                    }
+                }
             }
             // tui#398: an empty hydrate is the reconnect-truth "nothing
             // pending" for this session — clear its background stash too.
@@ -10083,7 +10089,13 @@ impl Store {
                 .is_some_and(|picker| &picker.session_id == session_id)
             {
                 self.state.user_question = None;
-                self.state.set_run_state_idle();
+                if self.event_targets_active_session(session_id) {
+                    if self.state.active_turn().is_some() {
+                        self.state.set_run_state_in_progress();
+                    } else if self.state.run_state.is_active() {
+                        self.state.set_run_state_idle();
+                    }
+                }
             }
             // tui#398: reconnect-truth clear for the background stash too.
             self.state.pending_session_questions.remove(session_id);
