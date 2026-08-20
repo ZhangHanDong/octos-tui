@@ -676,13 +676,17 @@ fn handle_terminal_event_with_input_state(
     now: Instant,
 ) -> KeyAction {
     if let Event::Key(key) = event {
-        // Skip the unbracketed-paste newline heuristic while a modal or a peek
-        // owns the keyboard — both force Composer focus, so without this an
-        // Enter (or pasted newline) lands in the hidden draft and never reaches
-        // the modal's / peek's Enter handler. Those surfaces handle Enter
-        // themselves downstream.
+        // Skip the unbracketed-paste newline heuristic while a modal, a peek,
+        // or a menu owns the keyboard — all three can leave Composer focus in
+        // place (menus are overlays that do not switch focus), so without this
+        // an Enter (or pasted newline) lands in the draft behind the overlay
+        // and never reaches the overlay's own Enter handler. On Windows terminals
+        // a manual Enter press often has next_event_waiting=true (key-release
+        // event queued), which made the heuristic fire for a real Enter and
+        // insert a composer newline instead of selecting the onboarding item.
         if !modal_owns_keyboard(store)
             && !app::agent_view_active(&store.state)
+            && !store.state.menu_stack.is_active()
             && is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
@@ -5597,6 +5601,65 @@ mod tests {
             ),
             KeyAction::Send(_)
         ));
+    }
+
+    /// Regression: on Windows, a manual Enter press often arrives with
+    /// `next_event_waiting=true` (a key-release event is queued right after
+    /// the press). The unbracketed-paste newline heuristic used to fire on
+    /// that signal even while a menu (e.g. the onboarding wizard) was open,
+    /// inserting a newline into the composer behind the overlay instead of
+    /// letting the menu's Enter handler select the highlighted item. The
+    /// heuristic must be skipped whenever any menu owns the keyboard.
+    #[test]
+    fn enter_during_paste_burst_reaches_menu_when_menu_active() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "ready".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+        // Menus are overlays: they do not move focus off the composer, and
+        // the composer may carry prior draft text — exactly the state that
+        // made the heuristic misfire on Windows.
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "draft".into();
+
+        let mut input_state = TerminalInputState::default();
+        let now = Instant::now();
+
+        // next_event_waiting=true is the Windows manual-Enter signature: a
+        // key-release event sits in the queue right after the press.
+        let action = handle_terminal_event_with_input_state(
+            &mut store,
+            Event::Key(key(KeyCode::Enter)),
+            &mut input_state,
+            true, // next_event_waiting
+            now,
+        );
+
+        // The heuristic must NOT have inserted a newline into the composer.
+        assert!(
+            !store.state.composer.contains('\n'),
+            "Enter must not insert a composer newline while a menu is active; got {:?}",
+            store.state.composer
+        );
+        // The key must have reached the menu layer (not been swallowed by the
+        // paste heuristic). Accepting an onboarding item returns Continue
+        // (it advances the wizard / closes the menu) rather than Send.
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "Enter should be handled by the menu and return Continue"
+        );
     }
 
     #[test]
