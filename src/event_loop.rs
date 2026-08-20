@@ -197,14 +197,22 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         if dirty {
             let menu_reserved_now = app::menu_surface_active(&store.state);
-            let menu_just_closed = menu_reserved_last_frame && !menu_reserved_now;
+            // A menu toggle (open OR close) changes the reserved viewport row
+            // block. On close the incremental shrink strands a blank band
+            // (handled below); on open the incremental grow relies on a DECSTBM
+            // scroll-region + partial-clear path that some Windows terminals
+            // (conhost, older Windows Terminal) do not render correctly, leaving
+            // the newly-opened sessions/slash menu invisible. Force a full
+            // visible-screen clear + scrollback re-flush on BOTH edges so the
+            // menu is always painted on a clean surface.
+            let menu_just_toggled = menu_reserved_last_frame != menu_reserved_now;
             menu_reserved_last_frame = menu_reserved_now;
             draw(
                 &mut terminal,
                 &mut guard,
                 &mut store,
                 &mut scrollback,
-                menu_just_closed,
+                menu_just_toggled,
             )?;
             dirty = false;
         }
@@ -321,7 +329,7 @@ fn draw<B>(
     guard: &mut TerminalGuard,
     store: &mut Store,
     scrollback: &mut ScrollbackTracker,
-    menu_just_closed: bool,
+    menu_just_toggled: bool,
 ) -> Result<()>
 where
     B: Backend + io::Write,
@@ -378,11 +386,17 @@ where
     // band gaping between it and the composer (a plain committed re-flush alone
     // can't fix it: `insert_history_lines` would append the fresh copy right
     // below the stranded one, duplicating it). So do exactly what a resize does
-    // for a clean re-render: wipe the visible screen and re-flush the whole
-    // committed transcript flush against the now-shrunk viewport. One frame,
-    // and it only fires on the open→closed edge (see the event loop), so
+    // A menu toggle (open OR close) changes the reserved viewport row block.
+    // On close the incremental shrink strands a blank band between the
+    // transcript and the composer. On open the incremental grow relies on a
+    // DECSTBM scroll-region + partial-clear path that some Windows terminals
+    // (conhost, older Windows Terminal) do not render correctly, leaving the
+    // newly-opened sessions/slash menu invisible. On either edge, do exactly
+    // what a resize does for a clean re-render: wipe the visible screen and
+    // re-flush the whole committed transcript against the new viewport. One
+    // frame, and it only fires on the toggle edge (see the event loop), so
     // repeated menu cycles never accumulate blank bands.
-    if menu_just_closed {
+    if menu_just_toggled {
         terminal.clear_visible_screen()?;
         scrollback.mark_flushed_stale();
     }
