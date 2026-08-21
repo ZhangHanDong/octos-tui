@@ -73,7 +73,7 @@ handshake can flash or stick on an empty inline composer"。直接先画首帧
 已有 profile/会话的常规启动(绝大多数)先画帧异步握手;探测不到本地
 profile 的 first-launch 保留等待。实施时为两种场景各写一个契约测试。
 
-ACK:
+ACK: 知晓。实施优化时按场景分流——常规启动(已有 profile/会话)先画帧异步握手,first-launch(探测不到本地 profile)保留等待。为两种场景各写一个契约测试。
 
 ### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
 
@@ -88,7 +88,7 @@ TUI**,`timeout 2 …` real 2.001s 和 `timeout 5 …` real 5.001s 都只是被 t
 "首帧渲染完成"的日志时间差;把文档"方法 1"一节替换为真实数据,或删除该节
 只保留代码分析。完成后 ACK。
 
-ACK:
+ACK: 已删除"方法 1"一节(commit 待提交),只保留代码分析(方法 2)。测量方法确认有误——`timeout` 的 `real` 时间等于 timeout 参数本身,不携带启动耗时信息。结论(splash 2.15-4.15s)来自代码分析(SPLASH_EFFECTS 注释 + SPLASH_HOLD),不来自错误的测量。
 
 ---
 

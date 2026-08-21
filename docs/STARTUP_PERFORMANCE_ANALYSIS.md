@@ -15,23 +15,7 @@ main()
 
 ## 测量结果
 
-### 方法 1：time 命令（外部测量）
-
-```bash
-# --version（不经过 TUI 启动流程）
-time ./target/release/octoscode --version
-# real 0m0.001s —— 快
-
-# --no-splash --mode mock（跳过 splash 和 backend 下载）
-OCTOSCODE_NO_AUTO_INSTALL=1 time timeout 2 ./target/release/octoscode --no-splash --mode mock
-# real 0m2.001s —— TUI 启动本身 2s（timeout 杀的，实际可能更短）
-
-# --mode mock（有 splash）
-OCTOSCODE_NO_AUTO_INSTALL=1 time timeout 5 ./target/release/octoscode --mode mock
-# real 0m5.001s —— 比 --no-splash 慢 3s，说明 splash 约 3s
-```
-
-### 方法 2：代码分析
+### 代码分析
 
 **splash 动画时长**（`src/splash.rs`）：
 
