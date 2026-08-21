@@ -131,8 +131,8 @@ fn curated_effects_produce_frames_on_virtual_clock() {
 #[test]
 fn truncated_run_ends_with_full_logo() {
     let text = splash_text();
-    let mut session =
-        SplashSession::new(&["decrypt"], &text, test_opts(), 80, String::new()).expect("session builds");
+    let mut session = SplashSession::new(&["decrypt"], &text, test_opts(), 80, String::new())
+        .expect("session builds");
     let mut out: Vec<u8> = Vec::new();
     let mut calls = 0;
     let stats = session

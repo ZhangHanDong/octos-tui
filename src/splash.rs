@@ -147,7 +147,13 @@ pub struct SplashSession {
 }
 
 impl SplashSession {
-    pub fn new(effect_args: &[&str], text: &str, opts: SessionOpts, term_cols: u16, final_color: String) -> Result<Self> {
+    pub fn new(
+        effect_args: &[&str],
+        text: &str,
+        opts: SessionOpts,
+        term_cols: u16,
+        final_color: String,
+    ) -> Result<Self> {
         if text.trim().is_empty() {
             return Err(eyre!("splash input text is empty"));
         }
@@ -408,6 +414,27 @@ fn key_or_resize_pending() -> bool {
     }
 }
 
+/// Convert a `Color` to an SGR foreground color sequence (e.g.
+/// `Color::Rgb(99, 151, 255)` → `\x1b[38;2;99;151;255m`). Returns an empty
+/// string for `Color::Reset` (no color).
+fn color_to_sgr(color: ratatui::style::Color) -> String {
+    use ratatui::style::Color;
+    match color {
+        Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m"),
+        Color::Cyan => "\x1b[36m".to_string(),
+        Color::Blue => "\x1b[34m".to_string(),
+        Color::Magenta => "\x1b[35m".to_string(),
+        Color::Yellow => "\x1b[33m".to_string(),
+        Color::Green => "\x1b[32m".to_string(),
+        Color::Red => "\x1b[31m".to_string(),
+        Color::White => "\x1b[37m".to_string(),
+        Color::Black => "\x1b[30m".to_string(),
+        Color::Reset => String::new(),
+        // Fallback for other colors: use white
+        _ => "\x1b[37m".to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,26 +560,5 @@ mod tests {
             !output.ends_with("\r\n"),
             "cursor must NOT be parked below the canvas"
         );
-    }
-}
-
-/// Convert a `Color` to an SGR foreground color sequence (e.g.
-/// `Color::Rgb(99, 151, 255)` → `\x1b[38;2;99;151;255m`). Returns an empty
-/// string for `Color::Reset` (no color).
-fn color_to_sgr(color: ratatui::style::Color) -> String {
-    use ratatui::style::Color;
-    match color {
-        Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m"),
-        Color::Cyan => "\x1b[36m".to_string(),
-        Color::Blue => "\x1b[34m".to_string(),
-        Color::Magenta => "\x1b[35m".to_string(),
-        Color::Yellow => "\x1b[33m".to_string(),
-        Color::Green => "\x1b[32m".to_string(),
-        Color::Red => "\x1b[31m".to_string(),
-        Color::White => "\x1b[37m".to_string(),
-        Color::Black => "\x1b[30m".to_string(),
-        Color::Reset => String::new(),
-        // Fallback for other colors: use white
-        _ => "\x1b[37m".to_string(),
     }
 }
