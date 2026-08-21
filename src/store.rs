@@ -6490,12 +6490,12 @@ impl Store {
     /// model). Pushes a "running" Tool activity chip immediately — stamped
     /// with a process-unique `local_id` so the completion event can find it —
     /// clears the composer draft, and returns the [`AppUiCommand::LocalShellExec`]
-    /// the transport runs locally off the render loop. An empty `!` is a usage
-    /// warning with no exec.
+    /// the event loop runs locally while the TUI lends its terminal to the
+    /// child. An empty `!` is a usage warning with no exec.
     ///
     /// The command runs on the machine octoscode runs on, NOT the agent's
-    /// sandboxed server `shell` tool, and its output is ephemeral — shown in
-    /// the chip only, never injected into the next turn's context.
+    /// sandboxed server `shell` tool. Its output stays in local terminal
+    /// scrollback and is never injected into the next turn's context.
     fn dispatch_bang_command(&mut self, cmd: &str) -> Option<AppUiCommand> {
         self.state.clear_current_composer_draft();
 
@@ -6516,8 +6516,9 @@ impl Store {
         let local_id = format!("local-shell:{}", TurnId::new().0);
         let running = t!("status.bang_running").into_owned();
         // Label the card with the cwd the command runs in (#364): the child
-        // inherits THIS process's working directory (see the transport's
-        // `spawn_local_shell`), so the running chip can already say where.
+        // inherits THIS process's working directory (see
+        // `run_attached_local_shell_command`), so the running chip can already
+        // say where.
         // `cmd`/cwd are terminal-tainted input for the transcript — sanitize
         // at composition (codex on #513: output was sanitized, labels not).
         let clean_cmd = crate::sanitize::strip_terminal_controls(cmd).into_owned();
@@ -6558,7 +6559,7 @@ impl Store {
     }
 
     /// Fold a completed `!`-bang local shell result back into its "running"
-    /// activity chip, completing it in place with the captured output.
+    /// activity chip after the child-terminal handoff finishes.
     fn apply_local_shell_result(&mut self, event: crate::client_event::LocalShellResultEvent) {
         let success = matches!(event.exit_code, Some(0));
         let status = if success {
@@ -14605,9 +14606,9 @@ impl Store {
 }
 
 /// Display form of the directory a `!`-bang command runs in — the TUI process
-/// cwd, which is exactly what the transport's `spawn_local_shell` hands the
-/// child (same process). Used to label the RUNNING chip; the completion event
-/// then carries the authoritative cwd back from the transport.
+/// cwd, which is exactly what the attached shell runner hands the child (same
+/// process). Used to label the RUNNING chip; the completion event then carries
+/// the authoritative cwd back from the runner.
 fn local_shell_cwd_display() -> Option<String> {
     std::env::current_dir()
         .ok()
@@ -14625,10 +14626,9 @@ fn local_shell_card_detail(cmd: &str, cwd: Option<&str>) -> String {
     }
 }
 
-/// Compose the displayed output for a completed `!`-bang shell result: stdout
-/// then stderr (both already truncated by the transport against the 10 KB
-/// combined cap). Empty output renders a `(no output)` placeholder so the chip
-/// still reads as complete rather than blank.
+/// Compose the displayed result for a completed `!`-bang shell handoff:
+/// completion note first, then any spawn/signal error. Empty data renders a
+/// `(no output)` fallback so the chip still reads as complete rather than blank.
 fn local_shell_output_preview(event: &crate::client_event::LocalShellResultEvent) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if !event.stdout.is_empty() {

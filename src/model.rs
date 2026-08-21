@@ -294,7 +294,7 @@ pub const APPUI_METHOD_LOOP_RESUME: &str = "loop/resume";
 pub const APPUI_METHOD_LOOP_FIRE_NOW: &str = "loop/fire_now";
 
 /// Pseudo-method for the `!`-bang client-local shell exec. This command is
-/// never sent over the UI protocol wire — the transport intercepts it and
+/// never sent over the UI protocol wire — the event loop intercepts it and
 /// runs the command locally — so this string is purely for diagnostics /
 /// `AppUiCommand::method()` exhaustiveness, prefixed `local/` to make the
 /// non-RPC nature obvious.
@@ -899,10 +899,12 @@ pub enum AppUiCommand {
     /// `!`-bang client-local shell exec (Claude Code's `!` model). Runs a
     /// native shell command on the machine octoscode runs on — NOT the
     /// agent's sandboxed server `shell` tool — so it intentionally bypasses
-    /// every server-side guard. Carries NO JSON-RPC method: the transport
-    /// intercepts it directly, spawns the command on its tokio runtime, and
-    /// surfaces the result as a [`crate::client_event::ClientEvent::LocalShellResult`]
-    /// keyed by `local_id`. The mock backend stubs it as a no-op.
+    /// every server-side guard. Carries NO JSON-RPC method: the event loop
+    /// intercepts it directly and surfaces the result as a
+    /// [`crate::client_event::ClientEvent::LocalShellResult`] keyed by
+    /// `local_id`. The event loop intercepts this command so it can suspend the
+    /// TUI and lend the real terminal to the child. The mock backend stubs it
+    /// as a no-op.
     LocalShellExec {
         cmd: String,
         local_id: String,
@@ -997,8 +999,8 @@ impl AppUiCommand {
             Self::PauseLoop(_) => APPUI_METHOD_LOOP_PAUSE,
             Self::ResumeLoop(_) => APPUI_METHOD_LOOP_RESUME,
             Self::FireLoopNow(_) => APPUI_METHOD_LOOP_FIRE_NOW,
-            // `!`-bang local exec never crosses the wire; the transport
-            // intercepts it before building a JSON-RPC request. This pseudo
+            // `!`-bang local exec never crosses the wire; the event loop
+            // intercepts it before backend dispatch. This pseudo
             // method only exists so diagnostics can name the command.
             Self::LocalShellExec { .. } => APPUI_METHOD_LOCAL_SHELL_EXEC,
         }
