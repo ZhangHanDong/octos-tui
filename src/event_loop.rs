@@ -238,7 +238,20 @@ pub fn run(cli: Cli) -> Result<()> {
                         break;
                     }
                     KeyAction::Send(command) => {
-                        send_command(backend.as_mut(), &mut store, *command)
+                        if dispatch_input_command(
+                            backend.as_mut(),
+                            &mut terminal,
+                            &mut guard,
+                            &mut store,
+                            *command,
+                        )? {
+                            // The child owned stdin while crossterm polling was
+                            // paused. Drop any paste timing state and stop this
+                            // pre-handoff input batch; queued focus/resize input
+                            // belongs to the freshly restored TUI.
+                            input_state = TerminalInputState::default();
+                            break;
+                        }
                     }
                 }
                 // A resize invalidates the inline viewport layout; force a repaint.
@@ -617,6 +630,186 @@ fn send_command(backend: &mut dyn AppUiBackend, store: &mut Store, command: AppU
     if let Err(err) = backend.send(command) {
         store.apply_event(AppUiEvent::error("send_failed", format!("{err:#}")));
     }
+}
+
+/// Dispatch a composer command, intercepting local shell escapes before the
+/// backend. Returns `true` when the real terminal was handed to a child, which
+/// tells the input loop to end its pre-handoff crossterm batch.
+fn dispatch_input_command<B>(
+    backend: &mut dyn AppUiBackend,
+    terminal: &mut InlineTerminal<B>,
+    guard: &mut TerminalGuard,
+    store: &mut Store,
+    command: AppUiCommand,
+) -> Result<bool>
+where
+    B: Backend + io::Write,
+{
+    let AppUiCommand::LocalShellExec { cmd, local_id } = command else {
+        send_command(backend, store, command);
+        return Ok(false);
+    };
+
+    let outcome = run_local_shell_with_terminal(terminal, guard, cmd, local_id)?;
+    apply_client_event_and_send_followup(backend, store, outcome.event);
+    if let Some(error) = outcome.restore_error {
+        return Err(error);
+    }
+    Ok(true)
+}
+
+struct LocalShellHandoffOutcome {
+    event: ClientEvent,
+    /// The child result must still be applied before a post-child terminal
+    /// restoration error is surfaced, so its running report never wedges.
+    restore_error: Option<eyre::Report>,
+}
+
+/// Suspend crossterm's TUI modes, run a `!` command with inherited stdio, and
+/// restore the inline TUI afterwards. The handoff stays on the normal screen:
+/// child output remains in native scrollback after return instead of flashing
+/// briefly in an alternate screen and disappearing.
+fn run_local_shell_with_terminal<B>(
+    terminal: &mut InlineTerminal<B>,
+    guard: &mut TerminalGuard,
+    cmd: String,
+    local_id: String,
+) -> Result<LocalShellHandoffOutcome>
+where
+    B: Backend + io::Write,
+{
+    // Install the parent shield before cooked mode makes terminal-generated
+    // signals possible, closing the gap between disabling raw mode and spawn.
+    crate::transport::install_local_shell_parent_signal_shield()?;
+    let prior_mode = guard.mode;
+    let mouse_was_captured = guard.mouse_captured;
+    guard.sync_mouse_capture(terminal, false)?;
+    guard.leave_alt_screen(terminal)?;
+    let reserved_rows = terminal.viewport_area.height.max(1);
+    // Remove the live composer/status rows before placing the child at their
+    // top. Finalized transcript above the viewport is left untouched.
+    terminal.clear()?;
+
+    #[cfg(not(test))]
+    {
+        disable_raw_mode()?;
+        if let Err(error) = execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableFocusChange,
+            Show
+        ) {
+            // Raw mode may already be off and the execute may have applied a
+            // prefix of its commands. Roll every mode forward before
+            // returning instead of leaving a half-suspended TUI.
+            let _ = enable_raw_mode();
+            let _ = execute!(
+                terminal.backend_mut(),
+                EnableBracketedPaste,
+                EnableFocusChange
+            );
+            return Err(error.into());
+        }
+    }
+
+    let mut event = crate::transport::run_attached_local_shell_command(
+        cmd,
+        std::env::current_dir().ok(),
+        local_id,
+    );
+
+    // Restore every mode before the next crossterm poll. Keep the terminal
+    // round-trip independent of the child's exit status: a failed command is
+    // still a normal result, not a reason to strand the parent in cooked mode.
+    // Every cleanup step is attempted; the first error is returned only AFTER
+    // the result event settles the running activity report.
+    let mut restore_error: Option<eyre::Report> = None;
+    #[cfg(not(test))]
+    {
+        if let Err(error) = enable_raw_mode() {
+            restore_error = Some(error.into());
+        }
+        if let Err(error) = execute!(
+            terminal.backend_mut(),
+            EnableBracketedPaste,
+            EnableFocusChange
+        ) && restore_error.is_none()
+        {
+            restore_error = Some(error.into());
+        }
+    }
+
+    let screen_size = match terminal.size() {
+        Ok(size) => size,
+        Err(error) => {
+            if restore_error.is_none() {
+                restore_error = Some(error.into());
+            }
+            terminal.last_known_screen_size
+        }
+    };
+    let fallback_cursor = ratatui::layout::Position {
+        x: 0,
+        y: screen_size.height.saturating_sub(1),
+    };
+    let (cursor, cursor_known) = match terminal.backend_mut().get_cursor_position() {
+        Ok(cursor) => (cursor, true),
+        Err(_) => (fallback_cursor, false),
+    };
+    let rows_below_cursor = screen_size
+        .height
+        .saturating_sub(1)
+        .saturating_sub(cursor.y);
+    let rows_to_reserve = if cursor_known {
+        reserved_rows.max(rows_below_cursor)
+    } else {
+        // Without CPR evidence, walk a full screen: wherever the child left
+        // the cursor, this reaches the bottom and scrolls at least the old
+        // viewport height clear. Output may move farther into scrollback, but
+        // it cannot be overwritten by the restored composer.
+        screen_size.height.max(reserved_rows)
+    };
+
+    // Reserve fresh rows for the TUI before repainting it. Because the child
+    // started at the old viewport top, these line feeds push its last output
+    // above the bottom-pinned composer (and into native scrollback when needed)
+    // instead of letting the first restored frame overwrite it. On a failed
+    // cursor query the bottom-row fallback still guarantees the old viewport's
+    // full-screen fallback still guarantees the old viewport is reserved.
+    let reserve_result: io::Result<()> = (|| {
+        for _ in 0..rows_to_reserve {
+            terminal.backend_mut().write_all(b"\r\n")?;
+        }
+        io::Write::flush(terminal.backend_mut())
+    })();
+    if let Err(error) = reserve_result
+        && restore_error.is_none()
+    {
+        restore_error = Some(error.into());
+    }
+    terminal.last_known_cursor_pos = fallback_cursor;
+    terminal.set_visible_history_extent(terminal.viewport_area.top(), terminal.viewport_area.top());
+    terminal.invalidate_viewport();
+
+    if prior_mode == RenderMode::AltScreen
+        && let Err(error) = guard.enter_alt_screen(terminal)
+        && restore_error.is_none()
+    {
+        restore_error = Some(error);
+    }
+    if let Err(error) = guard.sync_mouse_capture(terminal, mouse_was_captured)
+        && restore_error.is_none()
+    {
+        restore_error = Some(error);
+    }
+
+    if event.stdout.is_empty() && event.stderr.is_empty() {
+        event.stdout = t!("status.bang_terminal_complete").into_owned();
+    }
+    Ok(LocalShellHandoffOutcome {
+        event: ClientEvent::LocalShellResult(event),
+        restore_error,
+    })
 }
 
 #[derive(Default)]
@@ -6588,6 +6781,78 @@ mod tests {
         };
         assert_eq!(cmd, "echo hi");
         assert!(store.state.composer.is_empty(), "draft cleared on dispatch");
+    }
+
+    #[test]
+    fn every_bang_command_is_run_through_the_terminal_handoff() {
+        let mut store = store_with_sessions(1);
+        store.state.set_composer_text("!exit 0");
+        let command = store.compose_command().expect("bang dispatches");
+        let mut backend = FakeBackend::new(Vec::new());
+        let mut terminal = InlineTerminal::new(RecordingBackend::new(80, 24)).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 16, 80, 8));
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+            live_inline_viewport: Some(terminal.viewport_area),
+        };
+
+        let handed_off =
+            dispatch_input_command(&mut backend, &mut terminal, &mut guard, &mut store, command)
+                .unwrap();
+
+        assert!(handed_off);
+        assert!(
+            backend.sent.is_empty(),
+            "local shell never reaches the RPC backend"
+        );
+        assert_eq!(guard.mode, RenderMode::Inline, "normal screen is restored");
+        assert_eq!(
+            terminal.backend().buf,
+            b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+            "reserve exactly the old live viewport beneath child output"
+        );
+        let report = store.state.activity.last().expect("settled bang report");
+        assert_eq!(report.success, Some(true));
+        assert_eq!(report.status, "complete");
+        assert!(
+            report
+                .output_preview
+                .as_deref()
+                .is_some_and(|output| !output.is_empty()),
+            "the restored TUI explains that output was shown in the terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_handoff_restores_prior_alt_screen_and_mouse_capture() {
+        let mut terminal = InlineTerminal::new(RecordingBackend::new(80, 24)).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 16, 80, 8));
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+            live_inline_viewport: Some(terminal.viewport_area),
+        };
+        guard.enter_alt_screen(&mut terminal).unwrap();
+        guard.sync_mouse_capture(&mut terminal, true).unwrap();
+
+        let outcome = run_local_shell_with_terminal(
+            &mut terminal,
+            &mut guard,
+            "exit 0".into(),
+            "local-shell:restore-state".into(),
+        )
+        .unwrap();
+
+        assert!(outcome.restore_error.is_none());
+        assert_eq!(guard.mode, RenderMode::AltScreen);
+        assert!(guard.mouse_captured);
     }
 
     /// Enter with a `!` draft DURING a live steer-capable turn must still
