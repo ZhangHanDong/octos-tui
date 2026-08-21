@@ -8988,6 +8988,7 @@ mod tests {
 
     // --- stdio driver end-to-end: exit race + stderr tail + oversized skip ---
 
+    #[cfg(unix)]
     fn drive_stdio_until_disconnect(
         command: &str,
     ) -> (Vec<String>, Vec<(String, String, bool)>, String) {
