@@ -826,10 +826,25 @@ where
     })
 }
 
+/// Window in which a preceding text key counts as evidence that a paste
+/// burst (rapid char delivery) is in progress, used to gate the initial
+/// activation of the unbracketed-paste newline heuristic. A real paste
+/// delivers all characters within microseconds; manual typing has gaps of
+/// 50ms+ even for fast typists. 50ms is conservative enough to avoid
+/// false positives while still catching every paste.
+const PASTE_RAPID_TEXT_WINDOW: Duration = Duration::from_millis(50);
+
 #[derive(Default)]
 struct TerminalInputState {
     unbracketed_paste_until: Option<Instant>,
+    /// Timestamp of the most recent plain-text key (Char with no/ctrl-only
+    /// modifiers) while the composer was focused. Used to distinguish a real
+    /// unbracketed paste (rapid chars followed by Enter) from a lone manual
+    /// Enter on Windows, where next_event_waiting is always true because a
+    /// key-release event is queued right after every press.
+    last_text_key_at: Option<Instant>,
 }
+
 
 impl TerminalInputState {
     fn should_insert_unbracketed_paste_newline(
@@ -837,18 +852,38 @@ impl TerminalInputState {
         now: Instant,
         next_event_waiting: bool,
     ) -> bool {
-        if next_event_waiting || self.unbracketed_paste_active(now) {
+        // Already inside a paste burst: every Enter (and text key) keeps the
+        // window alive so multi-line pastes round-trip correctly.
+        if self.unbracketed_paste_active(now) {
             self.extend_unbracketed_paste(now);
-            true
-        } else {
-            false
+            return true;
         }
+        // Initial activation. next_event_waiting alone is insufficient: on
+        // Windows a manual Enter press queues a key-release event, making
+        // next_event_waiting true for every keypress — which used to turn
+        // every manual Enter into a composer newline. Require a recently
+        // typed text key as evidence that a paste burst (rapid char delivery)
+        // is in progress, not just a lone manual Enter.
+        if next_event_waiting && self.recent_text_key_indicates_paste(now) {
+            self.extend_unbracketed_paste(now);
+            return true;
+        }
+        false
     }
 
     fn note_text_key(&mut self, now: Instant) {
+        // Always record the timestamp so the paste-detection gate can see
+        // rapid char delivery. Extending the active paste window is kept
+        // separate so a lone manual char does not by itself start paste mode.
+        self.last_text_key_at = Some(now);
         if self.unbracketed_paste_active(now) {
             self.extend_unbracketed_paste(now);
         }
+    }
+
+    fn recent_text_key_indicates_paste(&self, now: Instant) -> bool {
+        self.last_text_key_at
+            .is_some_and(|at| now <= at + PASTE_RAPID_TEXT_WINDOW)
     }
 
     fn unbracketed_paste_active(&self, now: Instant) -> bool {
