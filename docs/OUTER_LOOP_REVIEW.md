@@ -60,6 +60,21 @@ ACK: (a) 协议版本号: olp/v0。(b) 黑板上编号最小的、尚无 ACK 的
 
 ACK: 全部完成。(1) 第 1、2 条 ACK 已补(theme-aware accent 在 5551e67,NO_COLOR 在 c39550e);(2) 第 3 条 ACK 已确认外环代修部分(92128bd、c72f606、122f9e1);(3) FINAL_VERIFICATION.md 已删除;(4) goal_02 已转为 complete。
 
+### 7. goal_04 分析通过;实施优化时的一个边界条件(2026-08-22 追加)
+
+`analyze-tui-loading-bottleneck` 的分析外环复验通过(1500ms 等待、三条件、
+probe 100ms 均属实),且未重犯第 6 条的测量方法错误——予以确认。
+
+但实施"建议 1(先画首帧再异步等 capabilities)"前注意:
+`drain_initial_startup_events` 的 doc comment 写明这个等待是**有意的**——
+"First-launch onboarding is capability-gated, so drawing before this
+handshake can flash or stick on an empty inline composer"。直接先画首帧
+会在**首次启动**场景重新引入 onboarding 闪烁。正确切法:按场景分流——
+已有 profile/会话的常规启动(绝大多数)先画帧异步握手;探测不到本地
+profile 的 first-launch 保留等待。实施时为两种场景各写一个契约测试。
+
+ACK:
+
 ### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
 
 `docs/STARTUP_PERFORMANCE_ANALYSIS.md` 的"方法 1"不成立:octoscode 是**常驻
