@@ -2772,6 +2772,32 @@ impl OnboardingWizardState {
         self.api_key.as_ref().is_some_and(|key| !key.is_empty())
     }
 
+    /// A staged key with the empty string filtered out — the ONLY form that
+    /// may leave the client. `/onboard key` with no argument stages
+    /// `Some("")`; pre-keyless the empty-key gate kept it off the wire, but
+    /// keyless dispatches pass that gate, and serializing `"api_key": ""`
+    /// trips the server's key-without-env rejection (review round, #562).
+    fn staged_api_key(&self) -> Option<SecretString> {
+        self.api_key.clone().filter(|key| !key.is_empty())
+    }
+
+    /// Whether the STAGED selection needs no API key: the catalog marks the
+    /// family keyless AND the staged route does not itself demand a key env.
+    /// The route override matters because key requirements are per-ENDPOINT —
+    /// a keyless family can expose a keyed hosted route (the AutoDL pattern),
+    /// which must keep requiring its key. Fails closed when the catalog is
+    /// absent (callers handle that case by fetching it first).
+    pub fn selection_is_keyless(&self, catalog: Option<&ProfileLlmCatalogResult>) -> bool {
+        let route_keyed = self
+            .provider
+            .route
+            .api_key_env
+            .as_deref()
+            .is_some_and(|env| !env.trim().is_empty());
+        !route_keyed
+            && catalog.is_some_and(|catalog| catalog.family_is_keyless(&self.provider.family_id))
+    }
+
     pub fn selection_ready(&self) -> bool {
         !self.provider.family_id.trim().is_empty()
             && !self.provider.model_id.trim().is_empty()
@@ -2877,6 +2903,10 @@ impl OnboardingWizardState {
         if !self.selection_ready() {
             return OnboardingProviderStatus::NotSelected;
         }
+        // NOTE: this method has no catalog access, so `KeyMissing` is a false
+        // positive for keyless families (local/ollama/vllm). Callers that can
+        // see the catalog should prefer `selection_is_keyless`; today no
+        // renderer surfaces KeyMissing, so the inaccuracy is latent.
         if !self.has_api_key() {
             return OnboardingProviderStatus::KeyMissing;
         }
@@ -2884,6 +2914,16 @@ impl OnboardingWizardState {
     }
 
     pub fn apply_selection(&mut self, selection: LlmSelectionConfig) {
+        // A staged key belongs to the family it was pasted for: switching
+        // families must not let it ride along to a different endpoint
+        // (keyless local servers made this silent — security pass, #562).
+        if !self
+            .provider
+            .family_id
+            .eq_ignore_ascii_case(&selection.family_id)
+        {
+            self.api_key = None;
+        }
         self.provider = selection;
         self.provider_tested = false;
         self.provider_pending = None;
@@ -2924,7 +2964,7 @@ impl OnboardingWizardState {
         self.selection_ready().then(|| ProfileLlmUpsertParams {
             profile_id: self.effective_profile_id(current_profile),
             selection: self.provider.clone(),
-            api_key: self.api_key.clone(),
+            api_key: self.staged_api_key(),
             set_primary,
         })
     }
@@ -2933,7 +2973,7 @@ impl OnboardingWizardState {
         self.selection_ready().then(|| ProfileLlmTestParams {
             profile_id: self.effective_profile_id(current_profile),
             selection: self.provider.clone(),
-            api_key: self.api_key.clone(),
+            api_key: self.staged_api_key(),
         })
     }
 
@@ -2944,7 +2984,7 @@ impl OnboardingWizardState {
         self.selection_ready().then(|| ProfileLlmFetchModelsParams {
             profile_id: self.effective_profile_id(current_profile),
             selection: self.provider.clone(),
-            api_key: self.api_key.clone(),
+            api_key: self.staged_api_key(),
         })
     }
 
@@ -2986,7 +3026,7 @@ impl OnboardingWizardState {
                 api_type: route.api_type.clone(),
                 ..Default::default()
             },
-            api_key: self.api_key.clone(),
+            api_key: self.staged_api_key(),
         })
     }
 
@@ -3987,19 +4027,43 @@ pub struct ProfileLlmCatalogResult {
 }
 
 impl ProfileLlmCatalogResult {
-    /// Whether the catalog reports `family_id` as keyless — an EMPTY key-env,
-    /// the server's marker for local server families (local/ollama/vllm).
+    /// The catalog entry for `family_id`. Lookup is case-INsensitive: catalog
+    /// keys are canonical, but typed selections (`/onboard select LOCAL …`)
+    /// arrive verbatim, and the codebase's existing convention for family ids
+    /// is tolerance (`eq_ignore_ascii_case`, see the aliasing note in
+    /// store.rs). Exact match is tried first.
+    pub fn family_entry(&self, family_id: &str) -> Option<&Value> {
+        let family_id = family_id.trim();
+        if family_id.is_empty() {
+            return None;
+        }
+        self.families.get(family_id).or_else(|| {
+            self.families
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(family_id))
+                .map(|(_, value)| value)
+        })
+    }
+
+    /// The trimmed, non-empty key-env the catalog declares for `family_id`.
+    /// Single home for the `"env"` field of the server contract.
+    pub fn family_key_env(&self, family_id: &str) -> Option<&str> {
+        self.family_entry(family_id)?
+            .get("env")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|env| !env.is_empty())
+    }
+
+    /// Whether the catalog reports `family_id` as keyless — the server's
+    /// marker for local server families (local/ollama/vllm). The wire
+    /// contract types key-env fields as `string | null` optional, so for a
+    /// PRESENT family an empty string, JSON null, or absent `env` all mean
+    /// "no key required"; an unknown family stays keyed (fail closed).
     /// Keyless families save and test without an API key; requiring one
     /// dead-ended their onboarding (octos#2096 review round).
     pub fn family_is_keyless(&self, family_id: &str) -> bool {
-        let family_id = family_id.trim();
-        !family_id.is_empty()
-            && self
-                .families
-                .get(family_id)
-                .and_then(|family| family.get("env"))
-                .and_then(Value::as_str)
-                .is_some_and(str::is_empty)
+        self.family_entry(family_id).is_some() && self.family_key_env(family_id).is_none()
     }
 }
 
@@ -4056,6 +4120,21 @@ pub struct LlmConfiguredProvider {
 }
 
 impl LlmConfiguredProvider {
+    /// Whether this saved provider's key requirement is satisfied: it has a
+    /// stored key, OR its own record declares no key-env (keyless local
+    /// families publish `has_api_key: false` with an empty/absent
+    /// `api_key_env`). Gating session-open on `has_api_key` alone dead-ended
+    /// a rehydrated keyless primary after every TUI restart (red-team pass,
+    /// #562). Deliberately catalog-independent — at restart the catalog may
+    /// not be fetched yet.
+    pub fn key_satisfied(&self) -> bool {
+        self.has_api_key
+            || self
+                .api_key_env
+                .as_deref()
+                .is_none_or(|env| env.trim().is_empty())
+    }
+
     pub fn to_model_status(&self) -> ModelStatus {
         let provider = non_empty(self.provider.clone())
             .or_else(|| self.family_id.clone())
@@ -10794,6 +10873,127 @@ fn preview_id_from_text(text: &str) -> Option<PreviewId> {
 mod tests {
     use super::*;
     use octos_core::Message;
+
+    fn catalog(json: serde_json::Value) -> ProfileLlmCatalogResult {
+        serde_json::from_value(json).expect("catalog fixture deserializes")
+    }
+
+    /// The wire contract types key-env as `string | null` optional: for a
+    /// PRESENT family, empty string, null, and absent env all mean keyless;
+    /// unknown families stay keyed (fail closed). Lookup tolerates case and
+    /// whitespace, matching the codebase's family-id aliasing convention.
+    #[test]
+    fn family_is_keyless_covers_env_contract_variants() {
+        let catalog = catalog(serde_json::json!({
+            "families": {
+                "local": { "env": "" },
+                "nullenv": { "env": null },
+                "noenv": {},
+                "keyed": { "env": "X_KEY" }
+            }
+        }));
+        assert!(catalog.family_is_keyless("local"));
+        assert!(catalog.family_is_keyless("nullenv"));
+        assert!(catalog.family_is_keyless("noenv"));
+        assert!(catalog.family_is_keyless("LOCAL"));
+        assert!(catalog.family_is_keyless(" local "));
+        assert!(!catalog.family_is_keyless("keyed"));
+        assert!(!catalog.family_is_keyless("absent"));
+        assert!(!catalog.family_is_keyless(""));
+        assert!(!catalog.family_is_keyless("   "));
+        assert_eq!(catalog.family_key_env("keyed"), Some("X_KEY"));
+        assert_eq!(catalog.family_key_env("local"), None);
+    }
+
+    /// Key requirements are per-ENDPOINT: a staged route carrying its own
+    /// key-env stays keyed even under a keyless family (AutoDL pattern), and
+    /// a missing catalog fails closed.
+    #[test]
+    fn selection_is_keyless_respects_route_override_and_missing_catalog() {
+        let catalog = catalog(serde_json::json!({
+            "families": { "local": { "env": "" } }
+        }));
+        let mut state = OnboardingWizardState {
+            provider: LlmSelectionConfig {
+                family_id: "local".into(),
+                model_id: "local-default".into(),
+                route: LlmRouteConfig {
+                    route_id: "official".into(),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            ..OnboardingWizardState::default()
+        };
+        assert!(state.selection_is_keyless(Some(&catalog)));
+        assert!(!state.selection_is_keyless(None), "no catalog fails closed");
+        state.provider.route.api_key_env = Some("HOSTED_KEY".into());
+        assert!(
+            !state.selection_is_keyless(Some(&catalog)),
+            "a keyed route overrides a keyless family"
+        );
+    }
+
+    /// A staged key never leaves the client empty (`/onboard key` with no
+    /// argument stages Some("")), and switching families clears it — a key
+    /// belongs to the endpoint it was pasted for.
+    #[test]
+    fn staged_key_is_filtered_empty_and_cleared_on_family_switch() {
+        let mut state = OnboardingWizardState {
+            provider: LlmSelectionConfig {
+                family_id: "openai".into(),
+                model_id: "gpt-4o".into(),
+                route: LlmRouteConfig {
+                    route_id: "official".into(),
+                    ..LlmRouteConfig::default()
+                },
+                ..LlmSelectionConfig::default()
+            },
+            api_key: Some(SecretString::new("")),
+            ..OnboardingWizardState::default()
+        };
+        let params = state.build_test_params(Some("p")).expect("selection ready");
+        assert!(params.api_key.is_none(), "empty key stays off the wire");
+
+        state.api_key = Some(SecretString::new("sk-real"));
+        // Same family: key survives.
+        state.apply_selection(LlmSelectionConfig {
+            family_id: "openai".into(),
+            model_id: "gpt-4o-mini".into(),
+            ..LlmSelectionConfig::default()
+        });
+        assert!(state.has_api_key(), "same-family reselect keeps the key");
+        // Different family: key is cleared.
+        state.apply_selection(LlmSelectionConfig {
+            family_id: "local".into(),
+            model_id: "local-default".into(),
+            ..LlmSelectionConfig::default()
+        });
+        assert!(
+            !state.has_api_key(),
+            "family switch must not carry the old key"
+        );
+    }
+
+    /// Saved-provider key satisfaction is record-based (catalog-independent):
+    /// a stored key satisfies, and so does a record that declares no key-env
+    /// (keyless local families publish has_api_key=false).
+    #[test]
+    fn configured_provider_key_satisfied_variants() {
+        let provider = |has_key: bool, env: Option<&str>| -> LlmConfiguredProvider {
+            serde_json::from_value(serde_json::json!({
+                "provider": "x", "model": "y",
+                "has_api_key": has_key,
+                "api_key_env": env,
+            }))
+            .expect("provider fixture deserializes")
+        };
+        assert!(provider(true, Some("OPENAI_API_KEY")).key_satisfied());
+        assert!(provider(false, None).key_satisfied());
+        assert!(provider(false, Some("")).key_satisfied());
+        assert!(provider(false, Some("  ")).key_satisfied());
+        assert!(!provider(false, Some("OPENAI_API_KEY")).key_satisfied());
+    }
     use octos_core::ui_protocol::{
         UiArtifactPaneItem, UiArtifactPaneSnapshot, UiGitHistoryItem, UiGitPaneSnapshot,
         UiGitStatusItem, UiWorkspacePaneEntry, UiWorkspacePaneSnapshot,

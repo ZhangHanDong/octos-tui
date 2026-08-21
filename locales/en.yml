@@ -302,6 +302,7 @@ onboarding:
   value_saved: "%{value} (saved)"
   value_suggested: "%{value} (suggested)"
   api_key_saved: "saved in profile"
+  api_key_not_needed: "not needed (keyless)"
   value_not_set: "not set"
   action_edit: "Enter edit"
   make_default:
@@ -702,6 +703,7 @@ status:
   onboarding_provider_selection_incomplete: "Onboarding provider selection is incomplete"
   onboarding_api_key_empty_onboard: "Onboarding API key is empty; use /onboard key <secret>"
   onboarding_api_key_empty_provider: "Onboarding API key is empty; use /provider key <secret>"
+  onboarding_loading_catalog: "Loading the provider catalog to check key requirements — retry once it loads"
   saving_provider: "Saving provider"
   saving_provider_config: "Saving provider configuration"
   onboarding_fallback_selection_incomplete: "Onboarding fallback provider selection is incomplete"

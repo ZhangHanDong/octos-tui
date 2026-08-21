@@ -284,6 +284,7 @@ onboarding:
   value_saved: "%{value}（已保存）"
   value_suggested: "%{value}（建议）"
   api_key_saved: "已保存于档案"
+  api_key_not_needed: "无需密钥（keyless）"
   value_not_set: "未设置"
   action_edit: "回车编辑"
   make_default:
@@ -1461,6 +1462,7 @@ status:
   onboarding_provider_selection_incomplete: "引导供应商选择不完整"
   onboarding_api_key_empty_onboard: "引导 API 密钥为空；请使用 /onboard key <secret>"
   onboarding_api_key_empty_provider: "引导 API 密钥为空；请使用 /provider key <secret>"
+  onboarding_loading_catalog: "正在加载提供商目录以检查密钥要求——加载完成后请重试"
   saving_provider: "正在保存供应商"
   saving_provider_config: "正在保存供应商配置"
   onboarding_fallback_selection_incomplete: "引导备用供应商选择不完整"
