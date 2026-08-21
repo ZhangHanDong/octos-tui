@@ -5286,6 +5286,18 @@ fn mock_profile_llm_catalog() -> ProfileLlmCatalogResult {
             }]
         }),
     );
+    // Keyless local-server family (empty env) so --mock runs can exercise the
+    // keyless onboarding path at all (red-team pass, octoscode#562).
+    families.insert(
+        "local".into(),
+        serde_json::json!({
+            "env": "",
+            "models": [{
+                "id": "local-default",
+                "endpoints": [{"id": "official", "label": "Official API (local)"}]
+            }]
+        }),
+    );
     families.insert(
         "minimax".into(),
         serde_json::json!({

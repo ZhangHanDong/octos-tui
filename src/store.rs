@@ -406,6 +406,15 @@ fn should_record_in_history(prompt: &str) -> bool {
     }
 }
 
+/// Outcome of the shared onboarding empty-key gate
+/// ([`Store::onboarding_require_api_key`]): proceed, or stop dispatch —
+/// optionally substituting a command (the catalog fetch) for the blocked one.
+enum OnboardingKeyGate {
+    Satisfied,
+    // Boxed: AppUiCommand is large and Satisfied is the hot variant.
+    Blocked(Option<Box<AppUiCommand>>),
+}
+
 impl Store {
     pub fn from_snapshot(snapshot: AppUiSnapshot) -> Self {
         Self {
@@ -4162,10 +4171,17 @@ impl Store {
                     } else {
                         self.open_model_config_surface();
                     }
-                    self.focus_provider_api_key_row();
+                    // Keyless selections skip the key-row focus — landing the
+                    // cursor on a field the flow doesn't need contradicts the
+                    // enabled Test/Save rows beside it.
+                    if !self.onboarding_selected_family_is_keyless() {
+                        self.focus_provider_api_key_row();
+                    }
                 } else {
                     self.refresh_active_menu_if_open();
-                    self.focus_provider_api_key_row();
+                    if !self.onboarding_selected_family_is_keyless() {
+                        self.focus_provider_api_key_row();
+                    }
                 }
                 None
             }
@@ -4175,7 +4191,20 @@ impl Store {
                 }
                 let from_family_menu =
                     self.active_menu_id_is(crate::menu::registry::MENU_ONBOARD_FAMILY);
-                self.state.onboarding.provider.family_id = value.trim().to_owned();
+                let new_family = value.trim().to_owned();
+                // A staged key belongs to the family it was pasted for —
+                // switching families must not let it ride along to a
+                // different endpoint (security pass, octoscode#562).
+                if !self
+                    .state
+                    .onboarding
+                    .provider
+                    .family_id
+                    .eq_ignore_ascii_case(&new_family)
+                {
+                    self.state.onboarding.api_key = None;
+                }
+                self.state.onboarding.provider.family_id = new_family;
                 self.state.onboarding.provider.model_id.clear();
                 self.state.onboarding.provider.route = LlmRouteConfig {
                     api_type: Some("openai".into()),
@@ -4848,9 +4877,10 @@ impl Store {
             self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
-        if !self.state.onboarding.has_api_key() {
-            self.state.status = t!("status.onboarding_api_key_empty_onboard").into_owned();
-            return None;
+        if let OnboardingKeyGate::Blocked(command) =
+            self.onboarding_require_api_key("status.onboarding_api_key_empty_onboard")
+        {
+            return command.map(|command| *command);
         }
         self.state.onboarding.last_message = Some(t!("status.saving_provider").into_owned());
         self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Save);
@@ -4956,9 +4986,10 @@ impl Store {
             self.state.status = t!("status.onboarding_fallback_selection_incomplete").into_owned();
             return None;
         };
-        if !self.state.onboarding.has_api_key() {
-            self.state.status = t!("status.onboarding_api_key_empty_provider").into_owned();
-            return None;
+        if let OnboardingKeyGate::Blocked(command) =
+            self.onboarding_require_api_key("status.onboarding_api_key_empty_provider")
+        {
+            return command.map(|command| *command);
         }
         self.state.onboarding.last_message =
             Some(t!("status.saving_fallback_provider").into_owned());
@@ -4967,6 +4998,42 @@ impl Store {
         self.state.status = t!("status.saving_fallback_provider_config").into_owned();
         self.refresh_active_menu_if_open();
         Some(AppUiCommand::ProfileLlmUpsert(params))
+    }
+
+    /// Whether the family currently selected in onboarding is keyless per the
+    /// fetched provider catalog (empty key-env — local/ollama/vllm), with the
+    /// staged route's own key-env overriding toward keyed. Gates that
+    /// normally require an API key are skipped for these selections.
+    fn onboarding_selected_family_is_keyless(&self) -> bool {
+        self.state
+            .onboarding
+            .selection_is_keyless(self.state.profile_llm_catalog.as_ref())
+    }
+
+    /// The single key-satisfaction predicate for onboarding dispatch gates:
+    /// a non-empty key is staged, or the selection is catalog-keyless.
+    fn onboarding_api_key_satisfied(&self) -> bool {
+        self.state.onboarding.has_api_key() || self.onboarding_selected_family_is_keyless()
+    }
+
+    /// Shared empty-key gate for the test/save commands. When no key is staged
+    /// and the catalog was never fetched (command-driven flows skip the menu
+    /// auto-fetch), the selection might be keyless — fetch the catalog and say
+    /// so instead of mis-reporting "API key is empty" (adversarial pass,
+    /// octoscode#562). `Blocked(Some(cmd))` = dispatch `cmd` (the fetch).
+    fn onboarding_require_api_key(&mut self, empty_status: &str) -> OnboardingKeyGate {
+        if self.onboarding_api_key_satisfied() {
+            return OnboardingKeyGate::Satisfied;
+        }
+        if self.state.profile_llm_catalog.is_none() && self.profile_llm_catalog_supported() {
+            self.state.status = t!("status.onboarding_loading_catalog").into_owned();
+            self.refresh_active_menu_if_open();
+            return OnboardingKeyGate::Blocked(Some(Box::new(AppUiCommand::ProfileLlmCatalog(
+                ProfileLlmCatalogParams::default(),
+            ))));
+        }
+        self.state.status = t!(empty_status).into_owned();
+        OnboardingKeyGate::Blocked(None)
     }
 
     fn onboarding_test_provider_command(&mut self) -> Option<AppUiCommand> {
@@ -4987,9 +5054,10 @@ impl Store {
             self.state.status = t!("status.onboarding_provider_selection_incomplete").into_owned();
             return None;
         };
-        if !self.state.onboarding.has_api_key() {
-            self.state.status = t!("status.onboarding_api_key_empty_onboard").into_owned();
-            return None;
+        if let OnboardingKeyGate::Blocked(command) =
+            self.onboarding_require_api_key("status.onboarding_api_key_empty_onboard")
+        {
+            return command.map(|command| *command);
         }
         self.state.onboarding.last_message = Some(t!("status.testing_provider").into_owned());
         self.state.onboarding.provider_pending = Some(OnboardingProviderPending::Test);
@@ -5323,7 +5391,11 @@ impl Store {
                         .is_none_or(|state_profile| state_profile == profile_id)
                 })
                 .and_then(|state| state.primary_provider())
-                .is_some_and(|provider| provider.has_api_key)
+                // key_satisfied, not has_api_key: a rehydrated keyless
+                // primary (local/ollama/vllm) publishes has_api_key=false and
+                // must still unblock session open after a TUI restart
+                // (red-team pass, octoscode#562).
+                .is_some_and(|provider| provider.key_satisfied())
     }
 
     fn local_profile_create_supported(&self) -> bool {
@@ -5774,7 +5846,9 @@ impl Store {
                 )
                 .into_owned(),
             }
-        } else if onboarding.selection_ready() && onboarding.has_api_key() {
+        } else if onboarding.selection_ready()
+            && (onboarding.has_api_key() || self.onboarding_selected_family_is_keyless())
+        {
             OnboardingDoctorOutcome::Warn {
                 reason: t!("status.doctor_provider_unsaved").into_owned(),
                 recovery: t!("status.doctor_provider_unsaved_recovery").into_owned(),
@@ -8497,7 +8571,13 @@ impl Store {
                 let onboarding = self.state.onboarding.clone();
                 let permission_profiles = self.state.permission_profiles.clone();
                 let session_runtime_statuses = self.state.session_runtime_statuses.clone();
-                let profile_llm_catalog = self.state.profile_llm_catalog.clone();
+                // The provider catalog is deliberately NOT carried across a
+                // snapshot rebuild: a reconnect may land on a restarted or
+                // upgraded server whose key-env markers changed, and stale
+                // keyless flags would then steer what gets SENT (a keyless
+                // save). Dropping it costs one lazy refetch — the menu
+                // auto-fetch and the empty-key gate both re-request it
+                // (adversarial pass, octoscode#562).
                 let profile_llm_state = self.state.profile_llm_state.clone();
                 // One-shot re-flush request: a snapshot replay draining
                 // between an aside dismissal and the next draw must not eat
@@ -8627,7 +8707,6 @@ impl Store {
                 state.onboarding = onboarding;
                 state.permission_profiles = permission_profiles;
                 state.session_runtime_statuses = session_runtime_statuses;
-                state.profile_llm_catalog = profile_llm_catalog;
                 state.profile_llm_state = profile_llm_state;
                 state.transcript_reflush_requested = transcript_reflush_requested;
                 state.profile_skills = profile_skills;
@@ -22792,6 +22871,207 @@ now analyzing the bus module"
                 .expect("api key is included for transport")
                 .expose_for_transport(),
             "sk-fallback-secret"
+        );
+    }
+
+    /// A keyless family (empty key-env in the fetched catalog — the octos
+    /// `local`/`ollama`/`vllm` server families) tests and saves WITHOUT an
+    /// API key. The empty-key gate used to dead-end this flow entirely
+    /// (octos#2096 review round).
+    #[test]
+    fn onboarding_keyless_family_tests_and_saves_without_api_key() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+            crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT,
+        ]);
+        store.state.profile_llm_catalog = Some(
+            serde_json::from_value(serde_json::json!({
+                "families": {
+                    "local": { "env": "", "models": [{ "id": "local-default" }] },
+                    "openai": { "env": "OPENAI_API_KEY", "models": [{ "id": "gpt-4o" }] }
+                }
+            }))
+            .expect("catalog fixture deserializes"),
+        );
+
+        store.state.composer =
+            "/onboard select local local-default official http://127.0.0.1:8080/v1".into();
+        assert!(store.compose_command().is_none());
+
+        // No `/onboard key` — the family is keyless, test must still emit.
+        store.state.composer = "/onboard test".into();
+        let command = store
+            .compose_command()
+            .expect("keyless test emits profile/llm/test");
+        let AppUiCommand::ProfileLlmTest(params) = command else {
+            panic!("expected profile/llm/test");
+        };
+        assert_eq!(params.selection.family_id, "local");
+        assert!(
+            params.api_key.is_none(),
+            "no key is sent for keyless families"
+        );
+        store.state.onboarding.provider_pending = None;
+
+        store.state.composer = "/onboard save".into();
+        let command = store
+            .compose_command()
+            .expect("keyless save emits profile/llm/upsert");
+        assert!(matches!(command, AppUiCommand::ProfileLlmUpsert(_)));
+    }
+
+    /// The keyless bypass is scoped to catalog-keyless families: a keyed
+    /// family with no key still hits the empty-key gate.
+    #[test]
+    fn onboarding_keyed_family_still_requires_api_key() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.profile_llm_catalog = Some(
+            serde_json::from_value(serde_json::json!({
+                "families": { "openai": { "env": "OPENAI_API_KEY", "models": [{ "id": "gpt-4o" }] } }
+            }))
+            .expect("catalog fixture deserializes"),
+        );
+        store.state.composer = "/onboard select openai gpt-4o official".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard test".into();
+        assert!(
+            store.compose_command().is_none(),
+            "keyed family without a key must not emit a test"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_api_key_empty_onboard")
+        );
+    }
+
+    fn keyless_catalog() -> crate::model::ProfileLlmCatalogResult {
+        serde_json::from_value(serde_json::json!({
+            "families": { "local": { "env": "", "models": [{ "id": "local-default" }] } }
+        }))
+        .expect("catalog fixture deserializes")
+    }
+
+    /// The fallback-save gate has the same keyless bypass as primary save
+    /// and test — reachable via the /provider composer family.
+    #[test]
+    fn onboarding_keyless_family_saves_fallback_without_api_key() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        store.state.profile_llm_catalog = Some(keyless_catalog());
+        store.state.composer =
+            "/provider select local local-default official http://127.0.0.1:8080/v1".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/provider add-fallback".into();
+        let command = store
+            .compose_command()
+            .expect("keyless fallback save emits profile/llm/upsert");
+        let AppUiCommand::ProfileLlmUpsert(params) = command else {
+            panic!("expected profile/llm/upsert");
+        };
+        assert!(!params.set_primary);
+        assert!(params.api_key.is_none());
+    }
+
+    /// Command-driven flows never open the catalog menus, so the empty-key
+    /// gate must FETCH the catalog (with an accurate status) instead of
+    /// mis-reporting "API key is empty" — and fall back to the empty-key
+    /// message only when the server cannot serve a catalog at all.
+    #[test]
+    fn onboarding_gate_fetches_catalog_when_absent() {
+        let mut store = protocol_store_with_methods(&[
+            crate::model::APPUI_METHOD_PROFILE_LLM_TEST,
+            crate::model::APPUI_METHOD_PROFILE_LLM_CATALOG,
+        ]);
+        assert!(store.state.profile_llm_catalog.is_none());
+        store.state.composer =
+            "/onboard select local local-default official http://127.0.0.1:8080/v1".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard test".into();
+        let command = store.compose_command().expect("gate fetches the catalog");
+        assert!(matches!(command, AppUiCommand::ProfileLlmCatalog(_)));
+        assert_eq!(store.state.status, t!("status.onboarding_loading_catalog"));
+
+        // Old server without profile/llm/catalog: fail closed with the
+        // empty-key message (the only actionable advice left).
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.composer =
+            "/onboard select local local-default official http://127.0.0.1:8080/v1".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard test".into();
+        assert!(store.compose_command().is_none());
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_api_key_empty_onboard")
+        );
+    }
+
+    /// A staged key belongs to the family it was pasted for — switching
+    /// families through the selection flow clears it.
+    #[test]
+    fn onboarding_family_switch_clears_staged_key() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.composer = "/onboard select openai gpt-4o official".into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard key sk-cloud-secret".into();
+        assert!(store.compose_command().is_none());
+        assert!(store.state.onboarding.has_api_key());
+        store.state.composer =
+            "/onboard select local local-default official http://127.0.0.1:8080/v1".into();
+        assert!(store.compose_command().is_none());
+        assert!(
+            !store.state.onboarding.has_api_key(),
+            "family switch must clear the staged key"
+        );
+    }
+
+    /// A route carrying its own key-env stays keyed even under a keyless
+    /// family (per-endpoint requirement — AutoDL pattern).
+    #[test]
+    fn keyed_route_override_blocks_keyless_family() {
+        let mut store = protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_TEST]);
+        store.state.profile_llm_catalog = Some(keyless_catalog());
+        store.state.composer =
+            "/onboard select local local-default hosted https://hosted.example/v1 HOSTED_API_KEY"
+                .into();
+        assert!(store.compose_command().is_none());
+        store.state.composer = "/onboard test".into();
+        assert!(
+            store.compose_command().is_none(),
+            "keyed route under a keyless family still requires its key"
+        );
+        assert_eq!(
+            store.state.status,
+            t!("status.onboarding_api_key_empty_onboard")
+        );
+    }
+
+    /// A rehydrated keyless primary (has_api_key=false, no key-env) must
+    /// still count as a saved provider after a TUI restart — gating on
+    /// has_api_key alone forced a full re-onboard every restart.
+    #[test]
+    fn saved_keyless_primary_counts_after_restart() {
+        let mut store =
+            protocol_store_with_methods(&[crate::model::APPUI_METHOD_PROFILE_LLM_UPSERT]);
+        assert!(!store.state.onboarding.provider_saved, "restart state");
+        let llm_state = |env: serde_json::Value| -> crate::model::ProfileLlmListResult {
+            serde_json::from_value(serde_json::json!({
+                "profile_id": "octos",
+                "primary": {
+                    "provider": "local", "model": "local-default",
+                    "has_api_key": false, "api_key_env": env, "selected": true
+                }
+            }))
+            .expect("llm state fixture deserializes")
+        };
+        store.state.profile_llm_state = Some(llm_state(serde_json::Value::Null));
+        assert!(
+            store.profile_has_saved_primary_provider("octos"),
+            "keyless primary unblocks session open"
+        );
+        store.state.profile_llm_state = Some(llm_state(serde_json::json!("OPENAI_API_KEY")));
+        assert!(
+            !store.profile_has_saved_primary_provider("octos"),
+            "keyed primary without a stored key stays blocked"
         );
     }
 
