@@ -60,6 +60,21 @@ ACK: (a) 协议版本号: olp/v0。(b) 黑板上编号最小的、尚无 ACK 的
 
 ACK: 全部完成。(1) 第 1、2 条 ACK 已补(theme-aware accent 在 5551e67,NO_COLOR 在 c39550e);(2) 第 3 条 ACK 已确认外环代修部分(92128bd、c72f606、122f9e1);(3) FINAL_VERIFICATION.md 已删除;(4) goal_02 已转为 complete。
 
+### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
+
+`docs/STARTUP_PERFORMANCE_ANALYSIS.md` 的"方法 1"不成立:octoscode 是**常驻
+TUI**,`timeout 2 …` real 2.001s 和 `timeout 5 …` real 5.001s 都只是被 timeout
+杀掉的时刻——`real` 时间等于 timeout 参数本身,**不携带任何启动耗时信息**;
+"比 --no-splash 慢 3s"实际是 5−2=3 的算术巧合。splash ≈2-4s 的最终结论碰巧与
+代码分析(方法 2,那部分是对的)一致,但错误方法下次会得出错误结论。
+
+整改:改用可终止的测量——例如 `OCTOSCODE_SPLASH_EFFECT` 固定效果 + 在
+`event_loop::run` 入口打时间戳日志,或 `--no-splash` 与有 splash 两组都用
+"首帧渲染完成"的日志时间差;把文档"方法 1"一节替换为真实数据,或删除该节
+只保留代码分析。完成后 ACK。
+
+ACK:
+
 ---
 
 ## 历史
