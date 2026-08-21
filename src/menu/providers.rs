@@ -3828,9 +3828,15 @@ fn onboarding_provider_disabled_reason(
     method: &'static str,
 ) -> Option<String> {
     action_missing_reason(ctx, method).or_else(|| {
+        // Keyless families (empty key-env in the catalog: local/ollama/vllm)
+        // test and save without an API key — don't disable their actions.
+        let keyless = ctx
+            .app
+            .profile_llm_catalog
+            .is_some_and(|catalog| catalog.family_is_keyless(&state.provider.family_id));
         if !state.selection_ready() {
             Some(t!("onboarding.disabled.provider_incomplete").into_owned())
-        } else if !state.has_api_key() {
+        } else if !state.has_api_key() && !keyless {
             Some(t!("onboarding.disabled.api_key_empty").into_owned())
         } else {
             None

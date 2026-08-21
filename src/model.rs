@@ -3986,6 +3986,23 @@ pub struct ProfileLlmCatalogResult {
     pub families: serde_json::Map<String, Value>,
 }
 
+impl ProfileLlmCatalogResult {
+    /// Whether the catalog reports `family_id` as keyless — an EMPTY key-env,
+    /// the server's marker for local server families (local/ollama/vllm).
+    /// Keyless families save and test without an API key; requiring one
+    /// dead-ended their onboarding (octos#2096 review round).
+    pub fn family_is_keyless(&self, family_id: &str) -> bool {
+        let family_id = family_id.trim();
+        !family_id.is_empty()
+            && self
+                .families
+                .get(family_id)
+                .and_then(|family| family.get("env"))
+                .and_then(Value::as_str)
+                .is_some_and(str::is_empty)
+    }
+}
+
 impl<'de> Deserialize<'de> for ProfileLlmCatalogResult {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
