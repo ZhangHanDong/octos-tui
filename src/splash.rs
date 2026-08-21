@@ -333,8 +333,13 @@ fn play_inner(theme: &crate::cli::ThemeName) -> Result<()> {
         .unwrap_or_else(|| pick_effect_args(seed));
     let (term_cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
     // Theme-aware final color: match the launch banner's accent color.
+    // Honor NO_COLOR: if set, the final paint is plain (no color).
     let palette = crate::theme::Palette::for_theme(*theme);
-    let final_color = color_to_sgr(palette.accent);
+    let final_color = if std::env::var_os("NO_COLOR").is_some() {
+        String::new()
+    } else {
+        color_to_sgr(palette.accent)
+    };
     let mut session = SplashSession::new(
         effect_args,
         &splash_text(),
