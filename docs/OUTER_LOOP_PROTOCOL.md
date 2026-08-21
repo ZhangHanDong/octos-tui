@@ -1,0 +1,79 @@
+# Outer-Loop Protocol (OLP) — v0 草案
+
+> 让任意外部模型(Claude Code / Codex / 脚本化 agent)以标准方式**计划、监控、
+> 审查、指导** octos 的长程 goal 执行。本协议规范化的是已在实战中验证过的信道,
+> 不发明新机制;L1/L2 是短期补齐路线。
+>
+> `protocol: olp/v0`
+
+## 角色
+
+| 角色 | 职责 | 模型档位 |
+|---|---|---|
+| **operator**(人) | 宏观指令(`/goal`)、终审、审批 | — |
+| **runtime**(octos serve + master/peers) | 长程执行:goal keeper 推进、peer 并行干活 | 苦力档(k3 / cheap lanes) |
+| **outer agent**(本协议的对象) | 计划、事件驱动监控、交付审查、指导、基建维护 | 强档(Fable / GPT) |
+
+## L0 信道矩阵(现状即可用,全部已实证)
+
+### 下行:outer → runtime
+
+| 信道 | 载体 | 时效 | 用途 |
+|---|---|---|---|
+| 会话常驻约束 | `AGENTS.md`(octos prompt_layer 自动注入每个 session) | session boot | 纪律、协议本身的引导 |
+| 任务级指导 | `docs/OUTER_LOOP_REVIEW.md`(带日期条目 + `ACK:` 行) | master 每轮读 | 审查意见、整改要求 |
+| 既成事实 | 原子 git commit | 立即 | 代修、基建修复 |
+| 事件提示(辅助) | inbox `<session-hash>.notes` | 下一 turn,阅后即焚 | 仅事件通知;**不承载需记忆的指令** |
+
+### 上行:runtime → outer
+
+| 信道 | 载体 | 特性 |
+|---|---|---|
+| 事件流 | serve 日志 `peer-goal:*` / escalation / `transitioned goal` 行 | outer 侧 tail+filter,事件驱动零轮询 |
+| 交付物 | `peers/<slug>/result.md`(frontmatter: `slug/outcome/updated_unix/turn`) | 每轮交付 |
+| 权威账本 | `goal-ledgers/<goal_id>` | durable,重启幸存 |
+| 求助 | escalation(park 于 approval/question) | 分级升级,见 R3 |
+| 代码 | git log / diff | 审查对象 |
+
+## 协议语义(核心规则)
+
+- **R1 — ACK 义务**:`docs/OUTER_LOOP_REVIEW.md` 中的每条意见,runtime 侧执行后
+  必须在条目下补 `ACK: <做了什么 / 为何不做>`。无 ACK 视为未读,outer 有权打回交付。
+- **R2 — 诚实验证声明**:runtime 侧每个交付必须声明验证级别之一:
+  `verified`(跑过 `cargo test --all-targets` + clippy + fmt)/
+  `partially-verified`(列出跑了什么)/ `unverified`(说明原因,如无工具链)。
+  声称 verified 但复验不符,视为协议违例,outer 打回并记入黑板。
+- **R3 — 升级分级**:escalation 三级——runtime 自决(重试/换法)→ outer 裁决
+  (技术取舍、批不批一个方案)→ operator 裁决(权限审批、范围变更、对外动作)。
+  outer 不得代替 operator 按下审批;operator 缺席时 escalation 保持 park。
+- **R4 — 工作区共存**:同一工作区多写者(master/peers/outer)各自只
+  `git add` 自己改的文件,禁止 `git add -A`;改动即原子 commit,不留长时间
+  未提交状态。
+- **R5 — 指导幂等**:outer 的意见带日期与编号,内容自包含可重放;同一意见
+  重复投递不产生重复执行(以 ACK 为去重依据)。
+- **R6 — 版本协商**:本文件头部 `protocol: olp/vN`;`AGENTS.md` 引用同版本。
+  信道语义变更必须升版本。
+
+## 接入清单(一个新的 outer agent 需要知道的全部)
+
+1. 数据根:`~/.octos/instances/<cwd-hash>/profiles/<profile>/data`
+   (cwd-hash = 项目目录的 DefaultHasher 十六进制;L1 将提供查询命令代替自算)。
+2. 挂事件监听:tail serve 日志,过滤 `peer-goal:|escalation|transitioned goal|ERROR`。
+3. 读本文件 + `docs/OUTER_LOOP_REVIEW.md` 了解当前指导上下文。
+4. 审查交付:`peers/*/result.md` → git diff → 独立复验(R2)。
+5. 写指导:黑板追加条目;紧急基建问题直接原子 commit(R4)。
+
+## 路线
+
+- **L1(小改动,高收益)**:`octos goal status --json` / `octos peer list --json`
+  只读观测命令;`result.md` frontmatter schema 固化;per-turn hook 挂机制化验证
+  (peer 完成 → 自动 test → 结果写 ledger);sub_providers 苦力车道配置模板。
+- **L2**:带 ACK 的 `session/steer` 旁路 API(WS/HTTP),替代"黑板等 master 读"
+  的被动时效;事件订阅端点替代日志 tail。
+
+## 已知局限(v0)
+
+- inbox notes 阅后即焚,曾实测吞掉过指导——故 R 系列规则不依赖它。
+- 日志文件按进程启动日期滚动而非自然日;tail -F 需同时跟前后两天的文件。
+- session-hash 使用 Rust DefaultHasher,跨 Rust 版本不保证稳定(上游注释已声明);
+  outer 不得将其用于持久寻址。
