@@ -62,7 +62,6 @@ fn inline_diff_marker_style_for_test(kind: &str, palette: Palette) -> Style {
     diff_line_marker_style(kind, palette)
 }
 mod tests {
-    use super::super::*;
     use super::*;
     use crate::{
         cli::ThemeName,
@@ -14724,7 +14723,6 @@ mod tests {
     }
 }
 mod running_row_regression {
-    use super::super::*;
     use super::*;
     use crate::model::*;
     use crate::store::Store;
