@@ -1,7 +1,7 @@
 spec: task
 name: "协议 v1:result schema、ACK 语法、车道模板、可执行合约"
 tags: [requirements, generated-draft, olp, protocol, octoscode]
-depends: [REQ-OLP-CTRL, REQ-OLP-EXEC, REQ-OLP-OBS]
+depends: [task-req-olp-ctrl-steer, task-req-olp-exec-peer, task-req-olp-obs-cli]
 satisfies: [REQ-OLP-PROTO]
 ---
 

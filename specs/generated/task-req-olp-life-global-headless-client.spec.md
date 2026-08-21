@@ -1,7 +1,7 @@
 spec: task
 name: "Global 运行时生命周期:驾驶舱脚本、注入纪律、headless client"
 tags: [requirements, generated-draft, olp, lifecycle, herdr, tmux, headless, octoscode]
-depends: [REQ-OLP-CTRL, REQ-OLP-OBS]
+depends: [task-req-olp-ctrl-steer, task-req-olp-obs-cli]
 satisfies: [REQ-OLP-LIFE]
 ---
 

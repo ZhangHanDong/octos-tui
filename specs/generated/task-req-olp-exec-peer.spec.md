@@ -1,7 +1,7 @@
 spec: task
 name: "执行硬化:peer 工具链、默认隔离、机制化验证"
 tags: [requirements, generated-draft, olp, peer, verification, octos]
-depends: [REQ-OLP-OBS]
+depends: [task-req-olp-obs-cli]
 satisfies: [REQ-OLP-EXEC]
 ---
 

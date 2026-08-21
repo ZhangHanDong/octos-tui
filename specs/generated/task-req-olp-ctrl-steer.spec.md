@@ -1,7 +1,7 @@
 spec: task
 name: "控制面:带确认的 steer、审查者通道、升级通知"
 tags: [requirements, generated-draft, olp, steer, escalation, octos]
-depends: [REQ-OLP-OBS]
+depends: [task-req-olp-obs-cli]
 satisfies: [REQ-OLP-CTRL]
 ---
 
