@@ -31,10 +31,8 @@ operator;审批按键(y/s/n 及其等价)在任何情况下 MUST NOT 经脚本�
 [REQ-OLP-LIFE-WATCH] 实例非计划终止(驾驶舱会话消失或 serve 锁在无
 关停指令下释放)时,外环 MUST 通知 operator;MUST NOT 静默自动重启。
 
-[REQ-OLP-LIFE-HEADLESS] octoscode MUST 提供 `--headless` client 模式
-(阶段 2):承担全部 client 协议职责(capabilities 握手、session/open、
-消费 peer/staged 打开 peer 会话、事件泵),不渲染、不读键盘;指令入口
-仅 REQ-OLP-CTRL 的 steer,观测仅 REQ-OLP-OBS;与 TUI 以 serve 锁互斥。
+(阶段 2 headless client 已拆分为独立需求 REQ-OLP-HEADLESS——corpus
+规则:一个 ready work unit 对应一份任务合约。)
 
 ## Scenarios
 
@@ -52,11 +50,6 @@ Scenario: 后端等价性
   Given 同一条 prompt 分别经 herdr 后端与 tmux 后端注入空闲 composer
   When master 的下一个 turn 开始
   Then 两种后端下 turn 的用户消息内容一致
-
-Scenario: headless 模式打开 peer 会话
-  Given octoscode --headless 连接 serve 且 master handoff 了一个 peer
-  When peer/staged 通知到达
-  Then peer 会话被打开并开始执行(无任何渲染输出)
 
 Scenario: 非计划终止告警
   Given global 实例正在运行且无人下达关停
