@@ -141,10 +141,13 @@ pub struct SplashSession {
     /// frames, whose SGR color sequences (`\x1b[38;5;196m` etc.) would inflate
     /// `UnicodeWidthStr::width` and collapse the pad to 0 (Bug 1).
     block_pad: usize,
+    /// SGR color sequence for the final paint, matching the launch banner's
+    /// accent color (theme-aware). Empty string means no color (default).
+    final_color: String,
 }
 
 impl SplashSession {
-    pub fn new(effect_args: &[&str], text: &str, opts: SessionOpts, term_cols: u16) -> Result<Self> {
+    pub fn new(effect_args: &[&str], text: &str, opts: SessionOpts, term_cols: u16, final_color: String) -> Result<Self> {
         if text.trim().is_empty() {
             return Err(eyre!("splash input text is empty"));
         }
@@ -183,6 +186,7 @@ impl SplashSession {
             text: text.to_string(),
             rows,
             block_pad,
+            final_color,
         })
     }
 
@@ -232,10 +236,10 @@ impl SplashSession {
 
         // Final paint runs on success AND truncation; a paint error skips it.
         // The final frame is painted in the launch banner's accent color
-        // (Codex theme blue) so the splash → banner handoff is color-smooth.
+        // (theme-aware) so the splash → banner handoff is color-smooth.
         if result.is_ok() {
             let text = self.text.clone();
-            let colored = format!("\x1b[38;2;99;151;255m{text}\x1b[0m");
+            let colored = format!("{}{}\x1b[0m", self.final_color, text);
             self.paint(out, &colored)?;
         }
         // Move the cursor back UP to the canvas top row (paint left it at the
@@ -313,10 +317,10 @@ pub fn play(cli: &crate::cli::Cli) {
     if !should_play(&gate) {
         return;
     }
-    let _ = play_inner();
+    let _ = play_inner(&cli.theme);
 }
 
-fn play_inner() -> Result<()> {
+fn play_inner(theme: &crate::cli::ThemeName) -> Result<()> {
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()) ^ d.as_secs())
@@ -328,6 +332,9 @@ fn play_inner() -> Result<()> {
         .and_then(|name| effect_args_for(name.trim()))
         .unwrap_or_else(|| pick_effect_args(seed));
     let (term_cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
+    // Theme-aware final color: match the launch banner's accent color.
+    let palette = crate::theme::Palette::for_theme(*theme);
+    let final_color = color_to_sgr(palette.accent);
     let mut session = SplashSession::new(
         effect_args,
         &splash_text(),
@@ -337,6 +344,7 @@ fn play_inner() -> Result<()> {
             seed,
         },
         term_cols,
+        final_color,
     )?;
 
     // Raw mode for echo-free any-key skip; the guard restores it on every
@@ -413,7 +421,7 @@ mod tests {
         // padding (block centered to term_cols).
         let text = "AB\nCD"; // 2 rows, 2 cols each
         let term_cols = 10u16;
-        let session = SplashSession::new(&["beams"], text, test_opts(), term_cols)
+        let session = SplashSession::new(&["beams"], text, test_opts(), term_cols, String::new())
             .expect("session builds");
 
         let mut out = Vec::new();
@@ -444,7 +452,7 @@ mod tests {
         // colored frames.
         let text = "AB\nCD"; // final text: 2 cols wide
         let term_cols = 10u16;
-        let session = SplashSession::new(&["beams"], text, test_opts(), term_cols)
+        let session = SplashSession::new(&["beams"], text, test_opts(), term_cols, String::new())
             .expect("session builds");
 
         // A frame wrapped in SGR sequences, like ttfx's colored output.
@@ -482,6 +490,20 @@ mod tests {
     }
 
     #[test]
+    fn color_to_sgr_maps_theme_accent_colors() {
+        use ratatui::style::Color;
+        // Codex theme blue
+        assert_eq!(
+            color_to_sgr(Color::Rgb(99, 151, 255)),
+            "\x1b[38;2;99;151;255m"
+        );
+        // Terminal theme cyan
+        assert_eq!(color_to_sgr(Color::Cyan), "\x1b[36m");
+        // Reset (no color)
+        assert_eq!(color_to_sgr(Color::Reset), "");
+    }
+
+    #[test]
     fn run_leaves_cursor_on_canvas_top_row() {
         // Bug 2 regression: the TUI's inline viewport starts at the current
         // cursor row, so after the splash the cursor must be back on the
@@ -490,7 +512,7 @@ mod tests {
         // `\x1b[{rows-1}A\r` (cursor up to the canvas top, then home) — and
         // NOT `\r\n` (park below).
         let text = "AB\nCD"; // rows = 2 → cursor-up count = 1
-        let mut session = SplashSession::new(&["beams"], text, test_opts(), 10)
+        let mut session = SplashSession::new(&["beams"], text, test_opts(), 10, String::new())
             .expect("session builds");
 
         let mut out = Vec::new();
@@ -506,5 +528,26 @@ mod tests {
             !output.ends_with("\r\n"),
             "cursor must NOT be parked below the canvas"
         );
+    }
+}
+
+/// Convert a `Color` to an SGR foreground color sequence (e.g.
+/// `Color::Rgb(99, 151, 255)` → `\x1b[38;2;99;151;255m`). Returns an empty
+/// string for `Color::Reset` (no color).
+fn color_to_sgr(color: ratatui::style::Color) -> String {
+    use ratatui::style::Color;
+    match color {
+        Color::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m"),
+        Color::Cyan => "\x1b[36m".to_string(),
+        Color::Blue => "\x1b[34m".to_string(),
+        Color::Magenta => "\x1b[35m".to_string(),
+        Color::Yellow => "\x1b[33m".to_string(),
+        Color::Green => "\x1b[32m".to_string(),
+        Color::Red => "\x1b[31m".to_string(),
+        Color::White => "\x1b[37m".to_string(),
+        Color::Black => "\x1b[30m".to_string(),
+        Color::Reset => String::new(),
+        // Fallback for other colors: use white
+        _ => "\x1b[37m".to_string(),
     }
 }
