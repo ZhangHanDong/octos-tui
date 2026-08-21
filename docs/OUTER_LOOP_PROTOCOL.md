@@ -23,7 +23,7 @@
 | 会话常驻约束 | `AGENTS.md`(octos prompt_layer 自动注入每个 session) | session boot | 纪律、协议本身的引导 |
 | 任务级指导 | `docs/OUTER_LOOP_REVIEW.md`(带日期条目 + `ACK:` 行) | master 每轮读 | 审查意见、整改要求 |
 | 既成事实 | 原子 git commit | 立即 | 代修、基建修复 |
-| 事件提示(辅助) | inbox `<session-hash>.notes` | 下一 turn,阅后即焚 | 仅事件通知;**不承载需记忆的指令** |
+| 事件提示 / **门铃** | inbox `<session-hash>.notes` | 下一 turn,阅后即焚 | 仅事件通知与**黑板指针**("第 N 条已更新,去读并执行");不承载指令内容本身 |
 
 ### 上行:runtime → outer
 
@@ -70,6 +70,14 @@
   (peer 完成 → 自动 test → 结果写 ledger);sub_providers 苦力车道配置模板。
 - **L2**:带 ACK 的 `session/steer` 旁路 API(WS/HTTP),替代"黑板等 master 读"
   的被动时效;事件订阅端点替代日志 tail。
+
+### 推/拉间隙与门铃模式(实测补充)
+
+黑板是拉模型:runtime 侧"每轮任务开始"才读。当 goal 已 complete、master idle
+时,**没有任何自动 turn 会去读新的黑板条目**。v0 的 workaround 是"门铃":
+outer 往 inbox notes 写一条只含指针的通知(内容留在黑板),再由 operator 说
+任意一句话触发下一个 turn——门铃随 prompt 注入,master 循指针读黑板执行。
+L2 的 steer API 将消除"需要 operator 说一句话"这最后一步。
 
 ## 已知局限(v0)
 
