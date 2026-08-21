@@ -1,5 +1,7 @@
 # octoscode 仓库 agent 守则
 
+> protocol: olp/v0 — 完整协议见 `docs/OUTER_LOOP_PROTOCOL.md`
+
 ## 外环审查协议(必须遵守)
 
 本仓库有一个外环审查员(Claude Code)与你协作。协议:
