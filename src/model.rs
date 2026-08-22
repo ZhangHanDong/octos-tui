@@ -4558,6 +4558,27 @@ pub enum GoalObjectiveFold {
     Unfolded,
 }
 
+/// Hit rectangle (screen cells) of the pager's floating "jump to latest"
+/// button. Kept as plain `u16` fields instead of ratatui's `Rect` so the
+/// model layer stays free of UI-crate imports; the renderer converts on the
+/// way in, the mouse handler only needs `contains`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollToBottomHit {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl ScrollToBottomHit {
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        column >= self.x
+            && column < self.x.saturating_add(self.width)
+            && row >= self.y
+            && row < self.y.saturating_add(self.height)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     /// Active TUI palette, chosen at launch (`--theme`/config) and switchable
@@ -4668,6 +4689,13 @@ pub struct AppState {
     /// pinned to the bottom row — the inline chat flow cannot offer that
     /// because committed history lives in the terminal's own scrollback.
     pub transcript_pager_active: bool,
+    /// Screen rect of the pager's floating "jump to latest" arrow button (▼),
+    /// recorded by the renderer each frame — only the renderer knows the
+    /// laid-out transcript area. `None` while the button is hidden (view at
+    /// the bottom, or no pager). A `Cell` because rendering borrows
+    /// `&AppState`; stale by at most one frame (the same discipline as
+    /// [`AppState::agent_view_scroll_max`]).
+    pub scroll_to_bottom_button: std::cell::Cell<Option<ScrollToBottomHit>>,
     /// Agent Dock (#323): collapse the sub-agent strip to a one-line summary
     /// pill (`🐙 N agents · R running · U● unread`) instead of the per-agent
     /// rows. Toggled by Alt+D or the `/agents` menu; a UI preference, not
@@ -6883,6 +6911,7 @@ impl AppState {
             agent_view_scroll: 0,
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
+            scroll_to_bottom_button: std::cell::Cell::new(None),
             agent_dock_collapsed: false,
             peer_dock_collapsed: false,
             goal_objective_fold: GoalObjectiveFold::default(),
@@ -9108,10 +9137,20 @@ impl AppState {
 
     /// Close the transcript pager. The scroll offset is reset so the inline
     /// live tail follows the newest output again instead of inheriting the
-    /// pager's read position.
+    /// pager's read position. The jump-to-latest hit rect is cleared here
+    /// rather than waiting for the next frame: in pinned mode capture stays on
+    /// after the pager closes, and a stale rect would keep eating clicks.
     pub fn exit_transcript_pager(&mut self) {
         self.transcript_pager_active = false;
         self.transcript_scroll = 0;
+        self.scroll_to_bottom_button.set(None);
+    }
+
+    /// Renderer write-back of the pager's "jump to latest" button rect (or
+    /// `None` while hidden) — the same one-frame-stale `Cell` discipline as
+    /// [`Self::record_agent_view_scroll_max`].
+    pub fn record_scroll_to_bottom_button(&self, hit: Option<ScrollToBottomHit>) {
+        self.scroll_to_bottom_button.set(hit);
     }
 
     pub fn scroll_transcript_up(&mut self, lines: usize) {
