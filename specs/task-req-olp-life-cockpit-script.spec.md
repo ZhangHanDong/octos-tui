@@ -18,9 +18,12 @@ task-req-olp-life-headless-client。
 - 脚本子命令即四原语:`launch`、`inject <text>`、`read`、`attach`,外加
   `status` 与 `stop`;session 名固定 `octos-global`,`launch` 以仓库根为
   cwd 启动 octoscode。
-- 后端抽象:探测 herdr 可用则用 herdr(`agent prompt`/`agent read`/
-  `session attach`),否则回退 tmux(`send-keys`/`capture-pane`/
-  `attach`);两后端四原语行为契约一致;都不可用时明确报错退出。
+- 后端抽象与优先序(2026-08-23 实测修订):**tmux 优先**——herdr 0.8 的
+  `agent prompt`/`send-keys` 仅对其一方集成的 named agents 开放,外部
+  TUI pane 的 `pane send-text`/`run` 被静默丢弃(revision 不变),手工
+  `report-agent` 注册也过不了 "active named agent" 闸门。herdr 后端
+  待 octoscode 实现其 agent 集成协议(`report-agent-session` 族)后
+  再启用;届时两后端四原语行为契约一致。都不可用时明确报错退出。
 - `launch` 前置检查:目标 instance 的 `.octos-serve.lock` 被持有则拒绝
   启动并输出持有者 PID(经 lsof/fuser),绝不 kill 或抢锁;同名驾驶舱
   session 已存在同样拒绝。
