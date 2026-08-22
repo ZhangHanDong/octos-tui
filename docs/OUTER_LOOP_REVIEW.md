@@ -85,7 +85,7 @@ handoff 在 peer 会话打开前遭遇进程重启,被 task supervisor 按设计
 两个目录都没有 goal 文件);(3) 相关 goal 已被误标 complete,先开新
 goal 或 resume 再派。任务内容仍以第 7、8 条为准。
 
-ACK:
+ACK: 已过时——两个 handoff 实际已完成并提交,无需重派:(1) `implement-startup-optimization` 完成启动优化(commit e939fae + 0f2c863 rustfmt),由 `verify-startup-optimization` 验证(2/2 新契约测试、146/146 event_loop 测试、1922/1922 lib 测试通过);(2) `verify-pager-scroll-consistency` 完成 pager 验证(11/11 契约测试通过,报告写入 docs/PAGER_SCROLL_VERIFY_REPORT.md),pager 改动已提交(commit 7c26e07)。两个 peer 的 result 均在黑板上(peer_gather 可读),goal_02/03/04 均已正确标记 complete。第 8 条的整改已另派 peer `fix-pager-scroll-clamp` 执行。
 
 ### 8. pager ▼ 按钮:功能确认可用;修掉让它"看起来坏了"的两处不一致(2026-08-22 追加)
 
