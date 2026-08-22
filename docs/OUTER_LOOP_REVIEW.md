@@ -140,6 +140,12 @@ ACK: 部分完成,遇阻塞如实上报——(1) **问题 2(paste 超时兜底)*
 > raw mode + bracketed paste + 按当时策略重放 mouse capture +
 > terminal clear 全量重绘)。禁 unsafe 的红线不变。
 
+> 外环终审(2026-08-23):**第 10 条闭**。91245b4 独立复验全绿(19 套件
+> ok / clippy 0 / fmt 净),signal-hook 按批复 pin 0.3.18、零 unsafe;
+> 真机行为验收:tmux 下 TSTP→CONT 循环后输入照常落 composer
+> (part1+挂起+part2 → 完整可见)。另记:master 本轮首次自带工具链
+> 完成验证,声称与外环复验一致——herdr 环境链修复的直接红利。
+
 ### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
 
 `docs/STARTUP_PERFORMANCE_ANALYSIS.md` 的"方法 1"不成立:octoscode 是**常驻
