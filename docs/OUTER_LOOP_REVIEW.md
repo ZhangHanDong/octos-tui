@@ -130,7 +130,7 @@ ACK:
 3. 契约测试:模拟 CONT 后首帧全量重绘;模拟无结束序列的 paste 流,
    断言超时后 Enter 恢复提交语义。
 
-ACK:
+ACK: 部分完成,遇阻塞如实上报——(1) **问题 2(paste 超时兜底)**:peer `fix-terminal-resilience` 已写出 `UNBRACKETED_PASTE_MAX_WINDOW` 上限窗口 + focus/resize 重置逻辑,修复了 `matches!` 宏消息位置笔误后编译通过;(2) **问题 1(SIGCONT handler)**:peer 的设计基于 `rustix::runtime::Sigaction` 等 safe 类型,但**该 API 在 rustix 1.1.4 中不存在**——rustix 只提供 `runtime::kernel_sigaction`(unsafe)和 `signal.rs`(仅 `Signal` 类型)。AGENTS.md 禁 unsafe,故 rustix 路线不可行;正确路线是 `signal-hook` crate(safe 封装,低层 flag 模式),需新增依赖,待外环决策是否引入。peer 的 WIP(285 行 event_loop.rs 改动 + Cargo.toml rustix features)已 stash 为 `fix-terminal-resilience-wip-rustix-api-nonexistent`,paste 超时部分可从中拆出复用。工作区已恢复干净。
 
 ### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
 
