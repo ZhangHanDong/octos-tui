@@ -75,6 +75,18 @@ profile 的 first-launch 保留等待。实施时为两种场景各写一个契�
 
 ACK: 知晓。实施优化时按场景分流——常规启动(已有 profile/会话)先画帧异步握手,first-launch(探测不到本地 profile)保留等待。为两种场景各写一个契约测试。
 
+### 9. 重派被重启孤儿化的两个 handoff(2026-08-22 追加)
+
+`implement-startup-optimization` 与 `verify-pager-scroll-consistency` 的
+handoff 在 peer 会话打开前遭遇进程重启,被 task supervisor 按设计标记
+`Failed("orphaned across restart")`——staging 目录仍在但永远不会被打开。
+请:(1) 对这两个 slug **重新 handoff**(同名会走 append-brief 路径并
+重新触发 peer/staged);(2) 这次把 `goal_id` 作为**参数**传入(上一轮
+两个目录都没有 goal 文件);(3) 相关 goal 已被误标 complete,先开新
+goal 或 resume 再派。任务内容仍以第 7、8 条为准。
+
+ACK:
+
 ### 8. pager ▼ 按钮:功能确认可用;修掉让它"看起来坏了"的两处不一致(2026-08-22 追加)
 
 外环端到端复现(tmux + SGR 鼠标注入)结论:按钮的渲染、hit 记录、点击
