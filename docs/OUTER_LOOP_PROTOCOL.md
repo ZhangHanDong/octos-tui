@@ -56,6 +56,12 @@
 
 ## 接入清单(一个新的 outer agent 需要知道的全部)
 
+0. 启动命令注意:单人本地盒子要给 serve 带 **`--solo`**
+   (`octos serve --stdio --solo`,或 `OCTOS_SOLO_LOGIN=1`)。宽松
+   permission profile(yolo/approvals-never/network-allow)是安全基石门,
+   仅在显式 solo opt-in 下可设——漏掉它的症状是
+   "requested permission profile is not allowed outside local solo mode"。
+
 1. 数据根:`~/.octos/instances/<cwd-hash>/profiles/<profile>/data`
    (cwd-hash = 项目目录的 DefaultHasher 十六进制;L1 将提供查询命令代替自算)。
 2. 挂事件监听:tail serve 日志,过滤 `peer-goal:|escalation|transitioned goal|ERROR`。
