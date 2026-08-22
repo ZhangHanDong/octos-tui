@@ -177,6 +177,10 @@ pub(super) fn render_live_tail_with_finalization(
     let visible_height = transcript_visible_height(area);
     let total_rows = transcript_visual_rows(&lines, wrap_width);
     let max_scroll = total_rows.saturating_sub(visible_height);
+    // Feed the true maximum back so `scroll_transcript_up/down` clamp to it
+    // (see `transcript_scroll_max`; same discipline as the peek overlay's
+    // `record_agent_view_scroll_max`).
+    app.record_transcript_scroll_max(max_scroll);
     let scroll_from_bottom = app.transcript_scroll.min(max_scroll);
     let scroll_top =
         u16::try_from(max_scroll.saturating_sub(scroll_from_bottom)).unwrap_or(u16::MAX);

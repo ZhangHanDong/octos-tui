@@ -331,6 +331,46 @@ fn pager_scroll_to_bottom_button_click_jumps_to_latest() {
 }
 
 #[test]
+fn pager_page_up_without_overflow_never_enters_reviewing() {
+    // Content fits one screen (max_scroll == 0): PageUp must be a no-op.
+    // Without the render-fed clamp, the bare `saturating_add` kept growing
+    // `transcript_scroll` — the status row claimed "Reviewing history" while
+    // the view, scrollbar and ▼ button (all gated on the real offset) stayed
+    // frozen at the bottom, and a later PageDown first had to unwind the
+    // phantom offset (dead zone).
+    let mut store = chat_store(1);
+    handle_terminal_event(&mut store, ctrl_t());
+    assert!(store.state.transcript_pager_active);
+
+    // Render once so the pager records the real bound, as the live loop does.
+    rendered_frame(&store.state, 80, 24);
+    assert_eq!(
+        store.state.transcript_scroll_max.get(),
+        0,
+        "one exchange must fit a 80x24 transcript pane"
+    );
+
+    for _ in 0..3 {
+        handle_terminal_event(&mut store, key(KeyCode::PageUp));
+    }
+    assert_eq!(
+        store.state.transcript_scroll, 0,
+        "PageUp on a non-overflowing transcript must be clamped to the bottom"
+    );
+
+    let row = status_row(&store.state, 220, 24);
+    assert!(
+        !row.contains("Reviewing"),
+        "no reviewing indicator when nothing overflows; status row: {row:?}"
+    );
+
+    // No dead zone: the clamped offset is still exactly at the bottom, so a
+    // PageDown is absorbed immediately instead of unwinding phantom scroll.
+    handle_terminal_event(&mut store, key(KeyCode::PageDown));
+    assert_eq!(store.state.transcript_scroll, 0);
+}
+
+#[test]
 fn pager_scrollbar_hidden_without_overflow() {
     let mut store = chat_store(1);
     handle_terminal_event(&mut store, ctrl_t());

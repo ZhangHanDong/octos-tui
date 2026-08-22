@@ -4668,6 +4668,20 @@ pub struct AppState {
     /// selected sub-agent's live output. Resets to `Main` on session switch.
     pub chat_view: ChatViewTarget,
     pub transcript_scroll: usize,
+    /// The largest meaningful `transcript_scroll` (wrapped-rows − visible-rows),
+    /// recorded by the transcript renderer each frame — it is the only place
+    /// that knows the wrapped-row count. `scroll_transcript_up/down` clamp
+    /// against it so over-scroll (or scroll keys pressed when the content fits
+    /// the screen, `max_scroll == 0`) can't push the offset past the top and
+    /// leave PageDown/wheel-down "stuck" unwinding a phantom offset — and so
+    /// `transcript_scroll > 0` always means "really reviewing history" (the
+    /// `HintBarMode::PagerReviewing` gate). `usize::MAX` means "not measured
+    /// yet" (unbounded) — the pager always draws before a scroll key is read,
+    /// so production sees a real bound first; the sentinel only relaxes the
+    /// clamp in render-less unit tests. A `Cell` because rendering borrows
+    /// `&AppState`; stale by at most one frame. Same discipline as
+    /// [`Self::agent_view_scroll_max`].
+    pub transcript_scroll_max: std::cell::Cell<usize>,
     /// Scroll offset (rows from the bottom) for the sub-agent peek overlay. Kept
     /// separate from `transcript_scroll` so the main view's scroll is preserved
     /// across a peek, and — critically — so incoming activity rows that bump the
@@ -6908,6 +6922,7 @@ impl AppState {
             selected_task: 0,
             chat_view: ChatViewTarget::Main,
             transcript_scroll: 0,
+            transcript_scroll_max: std::cell::Cell::new(usize::MAX),
             agent_view_scroll: 0,
             agent_view_scroll_max: std::cell::Cell::new(usize::MAX),
             transcript_pager_active: false,
@@ -9133,6 +9148,11 @@ impl AppState {
     pub fn enter_transcript_pager(&mut self) {
         self.transcript_pager_active = true;
         self.transcript_scroll = 0;
+        // The pager's transcript area has its own height/wrap, so any bound
+        // recorded from the inline viewport (or a previous pager frame) is
+        // meaningless; reset to "not measured yet" — the next pager draw
+        // re-records the real bound before a scroll key is read.
+        self.transcript_scroll_max.set(usize::MAX);
     }
 
     /// Close the transcript pager. The scroll offset is reset so the inline
@@ -9153,12 +9173,36 @@ impl AppState {
         self.scroll_to_bottom_button.set(hit);
     }
 
-    pub fn scroll_transcript_up(&mut self, lines: usize) {
-        self.transcript_scroll = self.transcript_scroll.saturating_add(lines);
+    /// Record the transcript's maximum scroll offset (wrapped-rows −
+    /// visible-rows). The renderer is the only code that knows the wrapped-row
+    /// count, so it feeds it back here for `scroll_transcript_up/down` to
+    /// clamp against — same `Cell` discipline as
+    /// [`Self::record_agent_view_scroll_max`].
+    pub fn record_transcript_scroll_max(&self, max: usize) {
+        self.transcript_scroll_max.set(max);
     }
 
+    /// Scroll the transcript toward older output (up), clamped to the
+    /// last-rendered maximum so a non-overflowing transcript (`max_scroll ==
+    /// 0`) never leaves the bottom — and so `transcript_scroll > 0` always
+    /// means a real review offset (the `HintBarMode::PagerReviewing` gate) —
+    /// and so over-scroll at the top can't accumulate a phantom offset that
+    /// Down/PageDown must first unwind.
+    pub fn scroll_transcript_up(&mut self, lines: usize) {
+        self.transcript_scroll = self
+            .transcript_scroll
+            .saturating_add(lines)
+            .min(self.transcript_scroll_max.get());
+    }
+
+    /// Scroll toward the newest output (down). Snaps any over-shoot down to
+    /// the last-rendered maximum BEFORE subtracting — mirrors
+    /// [`Self::scroll_agent_view_down`].
     pub fn scroll_transcript_down(&mut self, lines: usize) {
-        self.transcript_scroll = self.transcript_scroll.saturating_sub(lines);
+        self.transcript_scroll = self
+            .transcript_scroll
+            .min(self.transcript_scroll_max.get())
+            .saturating_sub(lines);
     }
 
     pub fn scroll_transcript_to_latest(&mut self) {
@@ -9360,7 +9404,15 @@ impl AppState {
 
     pub fn preserve_transcript_position_after_append(&mut self, estimated_rows: usize) {
         if self.transcript_scroll > 0 && estimated_rows > 0 {
-            self.transcript_scroll = self.transcript_scroll.saturating_add(estimated_rows);
+            // Clamped against the last-rendered max like `scroll_transcript_up`
+            // (the bound only tightens if content was *removed* — a stale
+            // clamp here can't push the offset past the new top once the next
+            // frame re-records it, and `scroll_transcript_down` snaps any
+            // transient over-shoot before subtracting).
+            self.transcript_scroll = self
+                .transcript_scroll
+                .saturating_add(estimated_rows)
+                .min(self.transcript_scroll_max.get());
         }
     }
 
