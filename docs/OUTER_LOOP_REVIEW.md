@@ -110,7 +110,35 @@ ACK: 已过时——两个 handoff 实际已完成并提交,无需重派:(1) `im
    `tests/pager_visual_continuity_contract.rs`(新增"内容不足一屏时
    PageUp 不进入 Reviewing 且无死区"场景),并跑 `--all-targets`。
 
-ACK:
+ACK: 已按 `agent_view_scroll_max` 先例完成整改(peer `fix-pager-scroll-clamp`)。
+**问题 1**:`AppState` 新增 `Cell<usize> transcript_scroll_max` 字段
+(初始/进 pager 时置 `usize::MAX` = "not measured yet",与
+`agent_view_scroll_max` 同款纪律);渲染侧双路径
+(`app/transcript_build.rs` 的 `transcript_render_model`、
+`app/render.rs` 的 `render_live_tail_with_finalization`,两处均已算
+`max_scroll`)每帧经新 setter `record_transcript_scroll_max` 回写;
+`scroll_transcript_up` 改为 `saturating_add(lines).min(max)`,
+`scroll_transcript_down` 先 `.min(max)` 再 `saturating_sub`(镜像
+`scroll_agent_view_down` 的 snap-before-subtract),
+`preserve_transcript_position_after_append` 同步加 clamp。
+**问题 2**:无需额外改动——clamp 落地后 `transcript_scroll > 0` 自然
+等价于"真的在回看",`HintBarMode::PagerReviewing` 的判定(app.rs:497)
+保持原样即与 metrics 同源。**测试**:
+`tests/pager_visual_continuity_contract.rs` 新增
+`pager_page_up_without_overflow_never_enters_reviewing`(渲染一帧记录
+max_scroll=0 → 连按 3 次 PageUp 断言 `transcript_scroll == 0`、状态行
+无 "Reviewing"、PageDown 无死区)。
+**⚠ 未完成**:`cargo test --all-targets` / `cargo fmt` / `cargo clippy`
+未运行、commit 未提交——peer 沙箱 shell 中不存在 Rust 工具链(全盘
+搜索无 cargo/rustc 二进制,`target/debug` 有历史构建产物),请由有
+工具链的一方(或主会话)执行验证后落 commit;代码改动为纯机械套用
+现有先例,新增测试与既有 pager 测试同构。改动文件:`src/model.rs`、
+`src/app/render.rs`、`src/app/transcript_build.rs`、
+`tests/pager_visual_continuity_contract.rs`。
+
+> 外环(2026-08-23):代 peer 完成验证并落 commit——`--all-targets`
+> 全绿(唯一失败为 pre-existing #562)、新场景通过、pager 契约 12/12、
+> clippy 0、fmt 干净。R2 诚实声明 + 外环代验的分工按协议完成。第 8 条闭。
 
 ### 10. 挂起/恢复与 paste 状态的终端韧性(2026-08-23 追加,operator 实测复现)
 
@@ -130,7 +158,7 @@ ACK:
 3. 契约测试:模拟 CONT 后首帧全量重绘;模拟无结束序列的 paste 流,
    断言超时后 Enter 恢复提交语义。
 
-ACK: 部分完成,遇阻塞如实上报——(1) **问题 2(paste 超时兜底)**:peer `fix-terminal-resilience` 已写出 `UNBRACKETED_PASTE_MAX_WINDOW` 上限窗口 + focus/resize 重置逻辑,修复了 `matches!` 宏消息位置笔误后编译通过;(2) **问题 1(SIGCONT handler)**:peer 的设计基于 `rustix::runtime::Sigaction` 等 safe 类型,但**该 API 在 rustix 1.1.4 中不存在**——rustix 只提供 `runtime::kernel_sigaction`(unsafe)和 `signal.rs`(仅 `Signal` 类型)。AGENTS.md 禁 unsafe,故 rustix 路线不可行;正确路线是 `signal-hook` crate(safe 封装,低层 flag 模式),需新增依赖,待外环决策是否引入。peer 的 WIP(285 行 event_loop.rs 改动 + Cargo.toml rustix features)已 stash 为 `fix-terminal-resilience-wip-rustix-api-nonexistent`,paste 超时部分可从中拆出复用。工作区已恢复干净。
+ACK: 已完成(peer `implement-terminal-resilience-v2`)——(1) **问题 2(paste 超时兜底)**:从 stash 拆出复用,落地 `UNBRACKETED_PASTE_MAX_WINDOW`(200ms 上限窗口)+ `unbracketed_paste_started` 字段 + `reset_paste_state()`,focus/resize/suspend/resume 各接缝均重置 paste 状态;契约测试 `paste_timeout_restores_enter_submit_semantics` 与 `focus_and_resize_reset_stuck_paste_state` 已加入(`matches!` 消息参数笔误已修正)。(2) **问题 1(SIGTSTP/SIGCONT)**:按批复改用 **signal-hook flag 模式**——`SuspendFlags` 经 `signal_hook::flag::register` 注册 SIGTSTP/SIGCONT 原子 flag(handler 仅原子写,满足 async-signal-safe);主循环轮询:TSTP → `restore_terminal_for_suspend()`(禁 raw、禁 bracketed paste/focus/mouse、显示光标,主线程执行故无 async-signal-safe 约束)→ `low_level::unregister` 恢复默认处置 + `rustix::process::kill_process` 自举真正挂起 → 恢复后重新注册 flag handler;CONT → `resume_after_sigcont()`(re-enable raw mode + bracketed paste + focus + 按 `wants_mouse_capture` 策略重放 mouse capture + `invalidate_viewport()` + `terminal.clear()` 全量重绘 + 几何重排)。**Cargo.toml**:`signal-hook = "0.3.18"`(lock 现值 pin,零树增量),rustix 加 `process` feature(自举 SIGTSTP;`termios` 一并列入以备 handler 路径评估,均 safe)。**验证状态:已验证(master 侧)**——`cargo fmt` 干净;`cargo test --all-targets` 2035 通过 / 1 失败(唯一失败是预存的 `onboarding_saved_provider_contract::saved_provider_without_key_keeps_draft_guidance`,onboarding #562,与本次改动无关);`cargo clippy --all-targets -- -D warnings` 干净。期间 master 代修两处笔误:`rustix::process::pid` → `getpid()`(E0432);测试里 `seam` move-后借用 → `seam.clone()`(E0382);并修正 paste 超时语义——上限窗口判定须优先于 `next_event_waiting` 且超窗后重置 burst(`should_insert_unbracketed_paste_newline`),否则 `next_event_waiting=true` 会短路超时检查。stash@{0} 保留未 pop(rustix 路线 hunks 已丢弃重写)。
 
 > 外环批复(2026-08-23):**准许引入 `signal-hook`**——尽调确认它已是
 > Cargo.lock 中的传递依赖(0.3.18,经 crossterm/signal-hook-mio),提升
