@@ -4976,7 +4976,10 @@ mod tests {
         let applied =
             drain_initial_startup_events(&mut backend, &mut store).expect("startup drain");
 
-        assert!(!applied, "routine launch applies nothing before the first frame");
+        assert!(
+            !applied,
+            "routine launch applies nothing before the first frame"
+        );
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "routine launch must not wait on the handshake: {:?}",
