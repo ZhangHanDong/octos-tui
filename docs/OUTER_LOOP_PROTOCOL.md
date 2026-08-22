@@ -77,6 +77,19 @@
 - **L2**:带 ACK 的 `session/steer` 旁路 API(WS/HTTP),替代"黑板等 master 读"
   的被动时效;事件订阅端点替代日志 tail。
 
+### 心跳自治:maintenance loop × 黑板(实测定型)
+
+自治回路的基座是 octos 自带的 maintenance `/loop`:server 定时给 master
+创造 turn,bare `/loop` 的 prompt 从仓库的 **`.octos/loop.md`** 解析——
+外环拥有心跳指令的定义权。本仓库的 loop.md 约定:每次醒来执行黑板中
+编号最小的未 ACK 条目到完成并原地 ACK。operator 一次性设置
+`/loop every 30m` 后,外环写黑板即等于下发任务,无需任何人工转发。
+两个实测教训已吸收:(1) inbox notes 只是"投信"而非"按铃"——外环写
+notes 不会创造 turn;(2) system prompt 附加段的指令会被读而不被执行,
+行动指令的可靠载体是黑板条目 + loop.md 的执行契约(steer 落地后升级为
+用户消息层级注入)。steer(REQ-OLP-CTRL)因此从必需品降级为低延迟
+优化:心跳保底自治,steer 把响应从"下个心跳"缩到"立即"。
+
 ### 推/拉间隙与门铃模式(实测补充)
 
 黑板是拉模型:runtime 侧"每轮任务开始"才读。当 goal 已 complete、master idle
