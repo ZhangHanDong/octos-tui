@@ -24,6 +24,7 @@
 | 任务级指导 | `docs/OUTER_LOOP_REVIEW.md`(带日期条目 + `ACK:` 行) | master 每轮读 | 审查意见、整改要求 |
 | 既成事实 | 原子 git commit | 立即 | 代修、基建修复 |
 | 事件提示 / **门铃** | inbox `<session-hash>.notes` | 下一 turn,阅后即焚 | 仅事件通知与**黑板指针**("第 N 条已更新,去读并执行");不承载指令内容本身 |
+| **TUI 注入** | `herdr agent prompt <pane> '<text>'`(需 herdr ≥ Ti-Agent-OS fork `fc414dd8`,含 octoscode manifest)或 tmux `send-keys` | ~8s 内开 turn | 唯一实证"读**且执行**"的即时下行通道——文本落在 composer 即用户消息层级,等价 operator 亲手输入;steer API(L2)落地前的事实标准 |
 
 ### 上行:runtime → outer
 
@@ -65,9 +66,22 @@
 1. 数据根:`~/.octos/instances/<cwd-hash>/profiles/<profile>/data`
    (cwd-hash = 项目目录的 DefaultHasher 十六进制;L1 将提供查询命令代替自算)。
 2. 挂事件监听:tail serve 日志,过滤 `peer-goal:|escalation|transitioned goal|ERROR`。
+   实测三个坑:(a) 管道每级都要行缓冲,且用**绝对路径** `/usr/bin/grep
+   --line-buffered`——shell alias(如 ugrep)会让 `--line-buffered` 静默失效,
+   事件卡在缓冲区里,监控"活着但瞎了";(b) 日志按进程启动日期滚动,跨天要
+   同时 tail 两个日期文件;(c) 观测分三层——**投递**(notes 文件被清空)≠
+   **消费**(turn prompt 读到)≠ **执行**(交付/ACK 落地),只看一层必误判,
+   turn 心跳以日志里 `^` 锚定的时间戳行判定,勿取续行。
 3. 读本文件 + `docs/OUTER_LOOP_REVIEW.md` 了解当前指导上下文。
 4. 审查交付:`peers/*/result.md` → git diff → 独立复验(R2)。
 5. 写指导:黑板追加条目;紧急基建问题直接原子 commit(R4)。
+6. (可选,推荐)驾驶舱注入通道:herdr 里跑 octoscode 后,
+   `herdr agent list` 应显示 `octoscode | <pane> | idle`,
+   `herdr agent prompt <pane> '<text>'` 即用户消息层级下发。herdr 的注入
+   有双重门:named-agent 名单 + pane 前台进程名匹配,二者缺一注入被静默丢弃
+   ——所以需要 fork 补丁把 octoscode 编入 Agent 枚举与 manifest,本地
+   index.toml 覆盖**不能**新增 agent。降级方案:tmux `send-keys`(注意
+   首字符为 `-` 的文本会被当 flag 吃掉,用 `--` 分隔)。
 
 ## 路线
 
@@ -97,6 +111,26 @@ notes 不会创造 turn;(2) system prompt 附加段的指令会被读而不被�
 outer 往 inbox notes 写一条只含指针的通知(内容留在黑板),再由 operator 说
 任意一句话触发下一个 turn——门铃随 prompt 注入,master 循指针读黑板执行。
 L2 的 steer API 将消除"需要 operator 说一句话"这最后一步。
+
+## v0 验证记录(2026-08-23 闭环实验终局)
+
+一次完整的双环协作实验(外环 Claude Code/Fable 5,内环 octoscode + 苦力模型,
+黑板十条评审项)于 2026-08-23 全部闭环。协议各条款的实证样本:
+
+| 条款/机制 | 实证样本 |
+|---|---|
+| AGENTS.md 注入 + R6 版本 | olp/v0 金丝雀握手:新 session 首轮即复述协议头 |
+| R1 ACK 义务 | 十条评审项全部带 ACK 闭环,含整改与拒绝两类 |
+| 异议路径(ACK: wontdo) | #9:内环以证据拒绝重派指令,外环复核后接受——内环是对的 |
+| R2 诚实验证 + 分工 | #8:peer 声明沙箱无工具链(unverified),外环代跑全量测试后落 commit |
+| R3 升级分级 | #10:新依赖(signal-hook)由内环升级请求 → 外环 3 分钟批准(树内已有传递依赖,零增量),全程零人工 |
+| 心跳自治 | maintenance `/loop` 30m + loop.md 执行契约,黑板新条目无人工转发即被执行 |
+| 门铃模式 | inbox 指针 + 黑板内容分离,两次实测"读而不执行"事故后定型 |
+| TUI 注入 | herdr fork 补丁 e2e:`agent prompt` → ~8s 内 turn 启动 |
+
+结论:v0 的信道矩阵与 R 系列规则在真实长程任务(渲染修复、启动优化、终端
+韧性)上自洽可用;主要摩擦点(观测靠 tail 日志、寻址靠自算 hash、steer 靠
+TUI 注入)即 L1/L2 路线的动机,对应 REQ-OLP-{OBS,CTRL,HEADLESS}。
 
 ## 已知局限(v0)
 
