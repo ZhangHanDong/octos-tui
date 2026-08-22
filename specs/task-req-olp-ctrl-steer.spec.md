@@ -16,7 +16,7 @@ escalation 外部通知,消除无人值守长程的最后一个人工环节。�
 
 ## 已定决策
 
-- 新增 `octos steer --session <key> --text <指令>`:写入持久队列
+- 新增 `octos steer --session <key> --text <指令>`:写入持久队列。**注入层级必须等同用户消息**(实测两次:system prompt 附加段的指令会被模型当作背景信息而不执行——外环 2026-08-22 门铃实验)
   (inbox `.reviewer-notes` sidecar,与 `.monitor-notes` 同构的
   flock+append 协议),随后复用 `enqueue_goal_progress_wake` 的唤醒机制
   触发目标 session 的 continuation。
