@@ -75,6 +75,29 @@ profile 的 first-launch 保留等待。实施时为两种场景各写一个契�
 
 ACK: 知晓。实施优化时按场景分流——常规启动(已有 profile/会话)先画帧异步握手,first-launch(探测不到本地 profile)保留等待。为两种场景各写一个契约测试。
 
+### 8. pager ▼ 按钮:功能确认可用;修掉让它"看起来坏了"的两处不一致(2026-08-22 追加)
+
+外环端到端复现(tmux + SGR 鼠标注入)结论:按钮的渲染、hit 记录、点击
+命中、跳底**全部正常**——operator 的"测试不成功"来自两处真实的状态
+不一致,请整改:
+
+1. **pager 滚动无 clamp**:`scroll_transcript_up` 是裸 `saturating_add`。
+   内容不超屏(max_scroll=0)时 PageUp 照样把 `transcript_scroll` 加大;
+   超屏时顶到头继续加会积累死区(PageDown 要先消化虚账)。修法与 diff
+   overlay 同款:按键处理后用渲染侧 max clamp(参照
+   `clamp_diff_overlay_scroll` 先例)。
+2. **状态栏判定与 metrics 不同源**:`HintBarMode::PagerReviewing` 只看
+   `transcript_scroll > 0`,于是 max_scroll=0 时状态栏显示
+   "Reviewing history ↑ | End latest",暗示在回看、可回底,但按钮与
+   滚动条(都正确地看 `scroll_from_bottom`)一律隐藏、画面纹丝不动——
+   用户由此断定功能坏了。修法:Reviewing 判定改用 clamp 后的有效
+   偏移(第 1 项落地后 `transcript_scroll > 0` 自然等价)。
+3. 提交时:改动涉及公开行为,更新
+   `tests/pager_visual_continuity_contract.rs`(新增"内容不足一屏时
+   PageUp 不进入 Reviewing 且无死区"场景),并跑 `--all-targets`。
+
+ACK:
+
 ### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
 
 `docs/STARTUP_PERFORMANCE_ANALYSIS.md` 的"方法 1"不成立:octoscode 是**常驻
