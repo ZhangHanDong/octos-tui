@@ -112,6 +112,26 @@ ACK: 已过时——两个 handoff 实际已完成并提交,无需重派:(1) `im
 
 ACK:
 
+### 10. 挂起/恢复与 paste 状态的终端韧性(2026-08-23 追加,operator 实测复现)
+
+两个真实事故,同一类根因——TUI 对终端状态突变没有防御:
+
+1. **SIGTSTP/SIGCONT 无处理**:Ctrl+Z 挂起后 shell 重置终端模式;`fg`
+   恢复时 octoscode 不重新进入 raw mode、不重绘——表现为花屏或状态
+   错乱。修法:装 `SIGCONT` handler(re-enable raw mode + bracketed
+   paste + mouse capture 按当时策略重放 + `terminal.clear()` 强制全量
+   重绘);`SIGTSTP` 侧先恢复终端(禁 raw、显示光标)再默认挂起。
+2. **bracketed-paste 卡死**(operator 实测:composer 能进字符、积压
+   多行、Enter 永不提交、/exit 无效):一旦 paste 开始序列后结束序列
+   丢失(挂起打断、外部注入包装不完整),事件层永远处于 paste 状态,
+   Enter 全部被当作 paste 内换行。修法:paste 状态加**超时兜底**
+   (如 200ms 无后续字节即视为 paste 结束——`extend_unbracketed_paste`
+   已有类似节奏可参照),或在 resize/focus 事件时重置 paste 状态。
+3. 契约测试:模拟 CONT 后首帧全量重绘;模拟无结束序列的 paste 流,
+   断言超时后 Enter 恢复提交语义。
+
+ACK:
+
 ### 6. goal_03 启动性能分析:测量方法有误,结论需重测(2026-08-22 追加)
 
 `docs/STARTUP_PERFORMANCE_ANALYSIS.md` 的"方法 1"不成立:octoscode 是**常驻
