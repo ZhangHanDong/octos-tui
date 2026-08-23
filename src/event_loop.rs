@@ -334,6 +334,7 @@ where
         guard.sync_mouse_capture(terminal, app::wants_mouse_capture(&store.state))?;
         let size = terminal.size()?;
         store.state.last_terminal_width = size.width;
+        store.state.last_terminal_height = size.height;
         let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
         let resized = size != terminal.last_known_screen_size || terminal.viewport_area != area;
         if resized {
@@ -5178,6 +5179,59 @@ mod tests {
     }
 
     #[test]
+    fn diff_overlay_resize_updates_the_scroll_geometry_height() {
+        let mut store = store_with_expanded_diff_overlay();
+        let mut terminal =
+            InlineTerminal::new(RecordingBackend::new(100, 30)).expect("recording terminal");
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+            live_inline_viewport: None,
+        };
+        let mut scrollback = ScrollbackTracker::new();
+
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("initial overlay draw");
+        let tall_max = app::diff_preview_overlay_max_scroll(
+            &store.state,
+            Palette::for_theme(store.state.theme),
+        );
+        assert_eq!(store.state.last_terminal_height, 30);
+
+        terminal.backend_mut().size = Size::new(100, 18);
+        draw(
+            &mut terminal,
+            &mut guard,
+            &mut store,
+            &mut scrollback,
+            false,
+        )
+        .expect("resized overlay draw");
+        let short_max = app::diff_preview_overlay_max_scroll(
+            &store.state,
+            Palette::for_theme(store.state.theme),
+        );
+
+        assert_eq!(
+            store.state.last_terminal_height, 18,
+            "the overlay draw must cache the same live height it renders"
+        );
+        assert!(
+            short_max > tall_max,
+            "shrinking the overlay must increase its scroll ceiling"
+        );
+    }
+
+    #[test]
     fn composer_accepts_reserved_text_keys() {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Composer;
@@ -7563,7 +7617,7 @@ mod tests {
     }
 
     #[test]
-    fn v_toggles_diff_view_round_trip_preserving_scroll_position() {
+    fn v_toggles_diff_view_round_trip_and_clamps_scroll_to_each_layout() {
         let mut store = store_with_sessions(1);
         store.state.focus = FocusPane::Transcript;
         let session_id = store.state.sessions[0].id.clone();
@@ -7579,9 +7633,14 @@ mod tests {
             KeyAction::Continue
         ));
         assert!(store.state.diff_preview.side_by_side);
+        let side_by_side_max = app::diff_preview_overlay_max_scroll(
+            &store.state,
+            Palette::for_theme(store.state.theme),
+        );
         assert_eq!(
-            store.state.diff_preview.scroll, 7,
-            "toggle must preserve scroll position"
+            store.state.diff_preview.scroll,
+            7.min(side_by_side_max),
+            "toggle preserves a reachable position and clamps stale overscroll"
         );
         assert_eq!(
             store.state.diff_preview.selected_hunk, 1,
@@ -7596,7 +7655,14 @@ mod tests {
             !store.state.diff_preview.side_by_side,
             "second press round-trips back to unified"
         );
-        assert_eq!(store.state.diff_preview.scroll, 7);
+        let unified_max = app::diff_preview_overlay_max_scroll(
+            &store.state,
+            Palette::for_theme(store.state.theme),
+        );
+        assert_eq!(
+            store.state.diff_preview.scroll,
+            7.min(side_by_side_max).min(unified_max)
+        );
         assert_eq!(store.state.diff_preview.selected_hunk, 1);
     }
 

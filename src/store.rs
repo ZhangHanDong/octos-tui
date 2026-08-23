@@ -7648,6 +7648,14 @@ impl Store {
             return;
         }
         self.state.diff_preview.toggle_view_mode();
+        // Unified and side-by-side layouts can have different physical line
+        // counts. Keep the current from-bottom position when it is still
+        // reachable, but never retain an offset above the new layout's top.
+        let max_scroll = crate::app::diff_preview_overlay_max_scroll(
+            &self.state,
+            crate::theme::Palette::for_theme(self.state.theme),
+        );
+        self.state.diff_preview.scroll = self.state.diff_preview.scroll.min(max_scroll);
         self.state.status = if self.state.diff_preview.side_by_side {
             t!("status.diff_view_side_by_side").into_owned()
         } else {
@@ -10139,6 +10147,12 @@ impl Store {
         );
         let mut picker = UserQuestionPickerState::from_event(event);
         picker.visible = self.state.user_question_auto_open;
+        if picker.visible {
+            // A visible question owns the keyboard before the expanded diff
+            // overlay, but renders below it. Collapse the overlay so hydrate
+            // cannot leave the user answering an invisible dialog.
+            self.state.diff_preview.expanded = false;
+        }
         self.state.user_question = Some(picker);
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title);
@@ -32646,6 +32660,44 @@ now analyzing the bus module"
         assert!(!entry.multi_select);
         // Picker pauses the turn like an open approval.
         assert_eq!(store.state.run_state.label(), "blocked");
+    }
+
+    #[test]
+    fn hydrated_visible_question_collapses_the_expanded_diff_overlay() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.diff_preview.open_loading(PreviewId::new());
+        store.state.diff_preview.expanded = true;
+        assert!(store.state.diff_preview.overlay_active());
+
+        store.apply_hydrated_pending_questions(
+            &session_id,
+            vec![UserQuestionRequestedEvent::new(
+                session_id.clone(),
+                QuestionId::new(),
+                TurnId::new(),
+                "Pick a framework",
+                "The reconnect still has a pending decision.",
+                vec![single_select(
+                    "Framework",
+                    "Which framework?",
+                    vec![option("axum", "tokio-native")],
+                )],
+            )],
+        );
+
+        assert!(
+            store
+                .state
+                .user_question
+                .as_ref()
+                .is_some_and(|picker| picker.visible),
+            "hydrate must restore the active question visibly"
+        );
+        assert!(
+            !store.state.diff_preview.expanded,
+            "the visible question must not remain hidden below the diff overlay"
+        );
     }
 
     #[test]
