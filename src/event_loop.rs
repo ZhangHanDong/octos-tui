@@ -1,4 +1,8 @@
 use std::io;
+#[cfg(all(unix, not(test)))]
+use std::sync::Arc;
+#[cfg(all(unix, not(test)))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(not(test))]
@@ -63,6 +67,128 @@ enum RenderMode {
     AltScreen,
 }
 
+/// Whether a SIGTSTP/SIGCONT cycle ran since the event loop last serviced one.
+/// Set by async-signal-safe flag handlers registered via `signal_hook::flag`
+/// (atomic store only — no allocation, no locks, per the POSIX signal-handler
+/// contract) and polled by the main loop, which performs the real teardown /
+/// recovery on the loop thread where terminal I/O is safe.
+///
+/// Pure state, kept out of `run()` so unit tests can drive the same
+/// flag-and-reset flow without a real terminal or real signals.
+#[cfg(all(unix, not(test)))]
+struct SuspendFlags {
+    tstp: Arc<AtomicBool>,
+    cont: Arc<AtomicBool>,
+}
+
+#[cfg(all(unix, not(test)))]
+impl SuspendFlags {
+    /// Register the SIGTSTP + SIGCONT flag handlers via `signal_hook::flag`.
+    /// The handlers only flip atomics; everything else (terminal teardown,
+    /// mode replay, repaint) happens on the event-loop thread.
+    fn install() -> Result<Self> {
+        let tstp = Arc::new(AtomicBool::new(false));
+        let cont = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(signal_hook::consts::signal::SIGTSTP, Arc::clone(&tstp))?;
+        signal_hook::flag::register(signal_hook::consts::signal::SIGCONT, Arc::clone(&cont))?;
+        Ok(Self { tstp, cont })
+    }
+
+    /// Returns true exactly once per observed SIGTSTP.
+    fn take_tstp(&self) -> bool {
+        self.tstp.swap(false, Ordering::SeqCst)
+    }
+
+    /// Returns true exactly once per observed SIGCONT.
+    fn take_cont(&self) -> bool {
+        self.cont.swap(false, Ordering::SeqCst)
+    }
+}
+
+/// Bring the terminal back to a sane interactive state WITHOUT unwinding, so
+/// the shell is usable while we are stopped by SIGTSTP (OUTER_LOOP_REVIEW
+/// #10.1). This is the teardown half of `TerminalGuard::drop`, minus the
+/// viewport clearing (a suspend must not erase the live screen — the resume
+/// path repaints it) and minus raw-mode handling (the caller drives that).
+///
+/// Must run on the event-loop thread: it allocates and locks (crossterm
+/// `execute!` on a `BufWriter`-adjacent stdout), so it is NOT
+/// async-signal-safe and can never live in a signal handler.
+#[cfg(all(unix, not(test)))]
+fn restore_terminal_for_suspend(guard: &mut TerminalGuard) {
+    let mut stdout = io::stdout();
+    if guard.mouse_captured {
+        let _ = execute!(stdout, DisableMouseCapture);
+        guard.mouse_captured = false;
+    }
+    if guard.mode == RenderMode::AltScreen {
+        let _ = execute!(stdout, LeaveAlternateScreen);
+        guard.mode = RenderMode::Inline;
+        // The alt-screen overlay owned the whole screen; the inline viewport
+        // we return to needs a full relayout after resume.
+        guard.saved_inline_viewport = None;
+        guard.saved_visible_history_extent = None;
+        guard.saved_inline_screen_size = None;
+    }
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout, DisableBracketedPaste, DisableFocusChange, Show);
+    let _ = io::Write::flush(&mut stdout);
+}
+
+/// Apply the platform default stop action for SIGTSTP so the process genuinely
+/// suspends (OUTER_LOOP_REVIEW #10.1). A plain raise would only run our flag
+/// handler again. Unregistering that handler is also incorrect: signal-hook
+/// deliberately leaves the installed OS handler in place after the last action
+/// is removed, effectively ignoring later SIGTSTP signals. Its documented TUI
+/// pattern is `emulate_default_handler`, which maps a stop-class signal to an
+/// uncatchable SIGSTOP while leaving our flag registration intact for every
+/// later Ctrl+Z cycle.
+///
+/// All steps run on the event-loop thread between frames — no
+/// async-signal-safety constraints apply.
+#[cfg(all(unix, not(test)))]
+fn self_suspend() -> Result<()> {
+    // Returns only after `fg` delivers SIGCONT. signal-hook uses SIGSTOP for a
+    // stop-class default action, so the registered SIGTSTP callback needs no
+    // unregister/re-register dance and remains valid for subsequent cycles.
+    signal_hook::low_level::emulate_default_handler(signal_hook::consts::signal::SIGTSTP)?;
+    Ok(())
+}
+
+/// Re-enter the TUI's terminal state after `fg` (OUTER_LOOP_REVIEW #10.1):
+/// the shell reset the terminal modes while we were stopped, so re-enable raw
+/// mode, replay the startup modes, restore mouse capture per the CURRENT
+/// policy (`app::wants_mouse_capture`, consulted by the next `draw`), and
+/// force a full repaint so no stale/half-drawn frame survives.
+#[cfg(all(unix, not(test)))]
+fn resume_after_sigcont<B>(
+    guard: &mut TerminalGuard,
+    terminal: &mut InlineTerminal<B>,
+    store: &Store,
+) -> Result<()>
+where
+    B: Backend + io::Write,
+{
+    let mut stdout = io::stdout();
+    enable_raw_mode()?;
+    execute!(stdout, EnableBracketedPaste, EnableFocusChange)?;
+    if app::wants_mouse_capture(&store.state) {
+        execute!(stdout, EnableMouseCapture)?;
+        guard.mouse_captured = true;
+    }
+    // Relayout the viewport against whatever geometry the emulator has NOW —
+    // the user may have resized the window while we were stopped.
+    let size = terminal.size()?;
+    if guard.mode == RenderMode::Inline {
+        terminal.last_known_screen_size = size;
+        // Force the next `draw` down the full-relayout path.
+        terminal.viewport_area.width = 0;
+    }
+    terminal.invalidate_viewport();
+    terminal.clear()?;
+    Ok(())
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     enable_raw_mode()?;
     // Warm the one-shot terminal background probe HERE — after raw mode is on
@@ -106,6 +232,15 @@ pub fn run(cli: Cli) -> Result<()> {
     // recall works from the first keystroke; preserved across snapshot replays
     // by `Store::apply_event`.
     store.state.composer_history = crate::history::ComposerHistory::load_from_default_path();
+    // Suspend/resume resilience (OUTER_LOOP_REVIEW #10.1): Ctrl+Z delivers
+    // SIGTSTP; the flag handler defers the real work to the main loop, which
+    // restores the terminal, re-raises SIGTSTP under the default disposition
+    // to genuinely stop, and — after `fg` (SIGCONT sets the other flag) —
+    // re-enters raw mode, replays the terminal modes, and forces a full
+    // repaint. Without this the shell resets the terminal modes while we are
+    // stopped and we resume into a garbled screen.
+    #[cfg(all(unix, not(test)))]
+    let suspend_flags = SuspendFlags::install().ok();
     // Seed the runtime palette from the launch theme (`--theme`/config). The
     // `/theme` menu mutates this field, so the palette below is recomputed each
     // frame from `store.state.theme` rather than captured once at startup.
@@ -175,6 +310,31 @@ pub fn run(cli: Cli) -> Result<()> {
     let mut last_animation = Instant::now();
 
     loop {
+        // SIGTSTP/SIGCONT recovery (OUTER_LOOP_REVIEW #10.1). Order matters:
+        // a SIGCONT flag left over from a resume that already ran (or a
+        // spurious one) is serviced first so the terminal is TUI-owned before
+        // we consider tearing it down for a new suspend.
+        #[cfg(all(unix, not(test)))]
+        if let Some(ref flags) = suspend_flags {
+            if flags.take_cont() {
+                resume_after_sigcont(&mut guard, &mut terminal, &store)?;
+                input_state.reset_paste_state();
+                dirty = true;
+            }
+            if flags.take_tstp() {
+                restore_terminal_for_suspend(&mut guard);
+                input_state.reset_paste_state();
+                if let Err(err) = self_suspend() {
+                    // Could not stop (e.g. SIGTSTP blocked): re-enter the TUI
+                    // state so we don't sit here with a half-restored tty.
+                    store.apply_event(AppUiEvent::error("suspend_failed", format!("{err:#}")));
+                    let _ = resume_after_sigcont(&mut guard, &mut terminal, &store);
+                }
+                // If the stop succeeded, SIGCONT already ran the flag-handler;
+                // the next loop iteration's `take_cont` drives the repaint.
+                dirty = true;
+            }
+        }
         if drain_backend_events(backend.as_mut(), &mut store)? {
             dirty = true;
         }
@@ -859,6 +1019,14 @@ where
 /// false positives while still catching every paste.
 const PASTE_RAPID_TEXT_WINDOW: Duration = Duration::from_millis(50);
 
+/// Hard ceiling for an unbracketed paste burst. The per-event 80ms extension
+/// below assumes bytes keep arriving; a pathological stream (or a terminal that
+/// stopped sending the bracketed-paste END sequence, OUTER_LOOP_REVIEW #10.2)
+/// would otherwise keep Enter swallowed as "paste newline" forever. Past this
+/// window from the FIRST paste byte, the burst is declared over and Enter
+/// recovers its submit semantics regardless of `next_event_waiting`.
+const UNBRACKETED_PASTE_MAX_WINDOW: Duration = Duration::from_millis(200);
+
 #[derive(Default)]
 struct TerminalInputState {
     unbracketed_paste_until: Option<Instant>,
@@ -868,6 +1036,10 @@ struct TerminalInputState {
     /// Enter on Windows, where next_event_waiting is always true because a
     /// key-release event is queued right after every press.
     last_text_key_at: Option<Instant>,
+    /// When the current paste burst STARTED — bounds the total burst length so
+    /// a lost bracketed-paste END (or a terminal stuck mid-paste after a
+    /// suspend) cannot swallow Enter forever (OUTER_LOOP_REVIEW #10.2).
+    unbracketed_paste_started: Option<Instant>,
 }
 
 impl TerminalInputState {
@@ -876,6 +1048,15 @@ impl TerminalInputState {
         now: Instant,
         next_event_waiting: bool,
     ) -> bool {
+        // The max-window ceiling takes priority over everything below: a
+        // burst older than UNBRACKETED_PASTE_MAX_WINDOW means the END
+        // sequence was lost — Enter must recover its submit semantics even
+        // while bytes keep arriving (OUTER_LOOP_REVIEW #10.2). Reset the
+        // burst so subsequent keys start fresh instead of staying stuck.
+        if self.paste_burst_exceeded_max_window(now) {
+            self.reset_paste_state();
+            return false;
+        }
         // Already inside a paste burst: every Enter (and text key) keeps the
         // window alive so multi-line pastes round-trip correctly.
         if self.unbracketed_paste_active(now) {
@@ -895,6 +1076,14 @@ impl TerminalInputState {
         false
     }
 
+    /// True when the current paste burst started longer than
+    /// [`UNBRACKETED_PASTE_MAX_WINDOW`] ago — the bracketed-paste END was lost
+    /// and the burst must be declared over regardless of incoming bytes.
+    fn paste_burst_exceeded_max_window(&self, now: Instant) -> bool {
+        self.unbracketed_paste_started
+            .is_some_and(|started| now.duration_since(started) > UNBRACKETED_PASTE_MAX_WINDOW)
+    }
+
     fn note_text_key(&mut self, now: Instant) {
         // Always record the timestamp so the paste-detection gate can see
         // rapid char delivery. Extending the active paste window is kept
@@ -911,12 +1100,34 @@ impl TerminalInputState {
     }
 
     fn unbracketed_paste_active(&self, now: Instant) -> bool {
-        self.unbracketed_paste_until
-            .is_some_and(|deadline| now <= deadline)
+        // Timeout fallback (#10.2): even if the 80ms deadline hasn't elapsed,
+        // a burst older than the max window is over — the END sequence was
+        // lost and we must not keep treating Enter as a paste newline.
+        let within_max_window = self
+            .unbracketed_paste_started
+            .is_some_and(|started| now.duration_since(started) <= UNBRACKETED_PASTE_MAX_WINDOW);
+        within_max_window
+            && self
+                .unbracketed_paste_until
+                .is_some_and(|deadline| now <= deadline)
     }
 
     fn extend_unbracketed_paste(&mut self, now: Instant) {
+        if self.unbracketed_paste_started.is_none() {
+            self.unbracketed_paste_started = Some(now);
+        }
         self.unbracketed_paste_until = Some(now + Duration::from_millis(80));
+    }
+
+    /// Forget any in-flight paste burst. Called on focus change / resize and
+    /// on the suspend/resume path: those are the observable seams where a
+    /// suspend (Ctrl+Z) or a terminal reset can silently drop the
+    /// bracketed-paste END sequence — without the reset the very next Enter
+    /// would still be misread as a paste newline (OUTER_LOOP_REVIEW #10.2).
+    fn reset_paste_state(&mut self) {
+        self.unbracketed_paste_until = None;
+        self.unbracketed_paste_started = None;
+        self.last_text_key_at = None;
     }
 }
 
@@ -967,6 +1178,17 @@ fn handle_terminal_event_with_input_state(
             input_state.note_text_key(now);
         }
         return action;
+    }
+
+    // Focus change / resize are the observable seams where a suspend or a
+    // terminal reset can silently drop a bracketed-paste END sequence. Reset
+    // the paste heuristic so the next Enter recovers its submit semantics
+    // instead of being swallowed as a paste newline (OUTER_LOOP_REVIEW #10.2).
+    if matches!(
+        event,
+        Event::FocusGained | Event::FocusLost | Event::Resize(_, _)
+    ) {
+        input_state.reset_paste_state();
     }
 
     handle_terminal_event(store, event)
@@ -6185,6 +6407,112 @@ mod tests {
             matches!(action, KeyAction::Continue),
             "Enter should be handled by the menu and return Continue"
         );
+    }
+
+    /// OUTER_LOOP_REVIEW #10.2 contract: a paste burst whose END sequence is
+    /// lost (suspend, terminal reset) must NOT keep Enter swallowed as a paste
+    /// newline forever. Past the hard timeout window from the FIRST pasted
+    /// byte, Enter recovers its submit semantics even though paste bytes were
+    /// arriving continuously.
+    #[test]
+    fn paste_timeout_restores_enter_submit_semantics() {
+        let mut store = store_with_sessions(1);
+        store.state.focus = FocusPane::Composer;
+        let mut input_state = TerminalInputState::default();
+        let start = Instant::now();
+
+        // Simulate an unbracketed paste stream: text keys + an Enter that the
+        // heuristic correctly turns into a newline while the burst is young.
+        for ch in ['h', 'e', 'l', 'l', 'o'] {
+            handle_terminal_event_with_input_state(
+                &mut store,
+                Event::Key(key(KeyCode::Char(ch))),
+                &mut input_state,
+                true,
+                start,
+            );
+        }
+        handle_terminal_event_with_input_state(
+            &mut store,
+            Event::Key(key(KeyCode::Enter)),
+            &mut input_state,
+            true,
+            start,
+        );
+        assert_eq!(store.state.composer, "hello\n");
+
+        // The END sequence never arrives; the "stream" keeps delivering bytes
+        // past the max window (e.g. user keeps typing after a lost-END paste,
+        // each keystroke extending the 80ms deadline). At start+250ms — past
+        // UNBRACKETED_PASTE_MAX_WINDOW — Enter must submit, not newline.
+        let later = start + UNBRACKETED_PASTE_MAX_WINDOW + Duration::from_millis(50);
+        handle_terminal_event_with_input_state(
+            &mut store,
+            Event::Key(key(KeyCode::Char('x'))),
+            &mut input_state,
+            true,
+            later,
+        );
+        assert_eq!(store.state.composer, "hello\nx");
+        assert!(
+            matches!(
+                handle_terminal_event_with_input_state(
+                    &mut store,
+                    Event::Key(key(KeyCode::Enter)),
+                    &mut input_state,
+                    true,
+                    later,
+                ),
+                KeyAction::Send(_)
+            ),
+            "Enter must submit once the paste burst exceeded the max window"
+        );
+    }
+
+    /// OUTER_LOOP_REVIEW #10.2 contract: a focus change or resize (the seams
+    /// where a suspend/reset drops the bracketed-paste END) resets the paste
+    /// heuristic, so the Enter right after the seam recovers its submit
+    /// semantics instead of being swallowed as a paste newline.
+    #[test]
+    fn focus_and_resize_reset_stuck_paste_state() {
+        for seam in [Event::FocusLost, Event::FocusGained, Event::Resize(100, 40)] {
+            let mut store = store_with_sessions(1);
+            store.state.focus = FocusPane::Composer;
+            store.state.composer = "draft".into();
+            let mut input_state = TerminalInputState::default();
+            let now = Instant::now();
+
+            // Enter a paste burst.
+            handle_terminal_event_with_input_state(
+                &mut store,
+                Event::Key(key(KeyCode::Char('a'))),
+                &mut input_state,
+                true,
+                now,
+            );
+            // The seam event arrives (suspend happened here): paste state resets.
+            handle_terminal_event_with_input_state(
+                &mut store,
+                seam.clone(),
+                &mut input_state,
+                false,
+                now,
+            );
+            // Enter immediately after — within the old 80ms window — must submit.
+            assert!(
+                matches!(
+                    handle_terminal_event_with_input_state(
+                        &mut store,
+                        Event::Key(key(KeyCode::Enter)),
+                        &mut input_state,
+                        false,
+                        now + Duration::from_millis(10),
+                    ),
+                    KeyAction::Send(_)
+                ),
+                "Enter must submit after {seam:?} reset the paste state"
+            );
+        }
     }
 
     #[test]
