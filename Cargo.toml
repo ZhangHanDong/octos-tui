@@ -61,6 +61,10 @@ zip = { version = "7.2.0", default-features = false, features = ["deflate"] }
 sha2 = "0.11.0"
 tempfile = "3.27.0"
 rustix = "1.1.4"
+# Keep the parent alive while an attached `!` child receives terminal-generated
+# Ctrl+C/Ctrl+\\. The child resets caught handlers on exec and retains normal
+# shell cancellation semantics.
+signal-hook = "0.3"
 
 [features]
 default = ["update"]

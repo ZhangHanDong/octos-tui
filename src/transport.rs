@@ -237,12 +237,6 @@ pub struct ProtocolAppUiBackend {
     refresh_capabilities_on_reconnect: bool,
     queue: VecDeque<ClientEvent>,
     protocol: ProtocolExchange,
-    /// Completion channel for `!`-bang client-local shell commands. The
-    /// command runs as a detached tokio task on `runtime` and sends its
-    /// result here; `next_event` drains it (try_recv) into the `queue` so the
-    /// synchronous render loop never blocks on a running command.
-    local_shell_tx: mpsc::UnboundedSender<LocalShellResultEvent>,
-    local_shell_rx: mpsc::UnboundedReceiver<LocalShellResultEvent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1457,8 +1451,6 @@ impl ProtocolAppUiBackend {
             Err(err) => (None, Some(err.to_string())),
         };
 
-        let (local_shell_tx, local_shell_rx) = mpsc::unbounded_channel();
-
         Self {
             launch,
             runtime,
@@ -1472,8 +1464,6 @@ impl ProtocolAppUiBackend {
             refresh_capabilities_on_reconnect: false,
             queue: VecDeque::new(),
             protocol: ProtocolExchange::default(),
-            local_shell_tx,
-            local_shell_rx,
         }
     }
 
@@ -1483,47 +1473,6 @@ impl ProtocolAppUiBackend {
             .as_ref()
             .map(|endpoint| endpoint.label().to_string())
             .ok_or_else(|| eyre!("--mode protocol requires --endpoint <ws://...|wss://...> or --stdio-command <CMD>"))
-    }
-
-    /// Spawn a `!`-bang client-local shell command on the tokio runtime and
-    /// arrange for its result to flow back through `local_shell_tx`.
-    ///
-    /// This intentionally bypasses every server-side guard (no SafePolicy /
-    /// blocklist, no sandbox, no `BLOCKED_ENV_VARS` scrub) — that is the
-    /// Claude Code `!` model: the command runs on the machine octoscode runs
-    /// on, with the TUI launch dir as cwd and the inherited environment. The
-    /// activity card labels it as a local shell command (the mitigation).
-    ///
-    /// Non-blocking: the synchronous render loop returns immediately; the
-    /// detached task drives the child, enforces the 30 s timeout (killing the
-    /// child on expiry), captures stdout+stderr, and truncates the combined
-    /// output at the 10 KB cap before emitting the result.
-    fn spawn_local_shell(&mut self, cmd: String, local_id: String) {
-        let tx = self.local_shell_tx.clone();
-        let cwd = std::env::current_dir().ok();
-
-        let Some(runtime) = self.runtime.as_ref() else {
-            // No tokio runtime: report a synthetic failure so the chip still
-            // completes rather than spinning forever on "running".
-            let _ = tx.send(LocalShellResultEvent {
-                local_id,
-                cmdline: cmd,
-                cwd: cwd.as_ref().map(|path| path.display().to_string()),
-                stdout: String::new(),
-                stderr: runtime_unavailable(self.runtime_error.as_deref()).to_string(),
-                exit_code: None,
-                duration_ms: 0,
-                truncated: false,
-            });
-            return;
-        };
-
-        runtime.spawn(async move {
-            let event = run_local_shell_command(cmd, cwd, local_id).await;
-            // Receiver lives as long as the backend; a send error only means
-            // the TUI is shutting down, so there is nothing to recover.
-            let _ = tx.send(event);
-        });
     }
 
     fn ensure_driver(&mut self) -> Result<()> {
@@ -2172,10 +2121,27 @@ impl AppUiBackend for ProtocolAppUiBackend {
     fn send(&mut self, command: AppUiCommand) -> Result<()> {
         // `!`-bang local exec is a client-local action, not a backend turn:
         // intercept it before the readonly gate and before any JSON-RPC
-        // encoding. It runs the command on the tokio runtime and reports back
-        // via the local-shell channel that `next_event` drains.
+        // encoding. The real event loop consumes it first because only that
+        // layer can safely hand the controlling terminal to the child.
         if let AppUiCommand::LocalShellExec { cmd, local_id } = command {
-            self.spawn_local_shell(cmd, local_id);
+            // The event loop normally consumes this variant before it can
+            // reach the transport because only that layer owns the TUI's
+            // raw-mode and alternate-screen state. Fail closed if a future
+            // call site bypasses the handoff instead of silently recreating
+            // the detached-stdin hang this mode exists to prevent.
+            self.queue
+                .push_back(ClientEvent::LocalShellResult(LocalShellResultEvent {
+                    local_id,
+                    cmdline: cmd,
+                    cwd: std::env::current_dir()
+                        .ok()
+                        .map(|path| path.display().to_string()),
+                    stdout: String::new(),
+                    stderr: t!("status.bang_terminal_handoff_missed").into_owned(),
+                    exit_code: None,
+                    duration_ms: 0,
+                    truncated: false,
+                }));
             return Ok(());
         }
 
@@ -2249,13 +2215,6 @@ impl AppUiBackend for ProtocolAppUiBackend {
     }
 
     fn next_event(&mut self) -> Result<Option<ClientEvent>> {
-        // Drain any completed `!`-bang local shell results first so a finished
-        // command surfaces promptly even while the transport is quiet. These
-        // are pushed into `queue` so the existing pop-first ordering holds.
-        while let Ok(result) = self.local_shell_rx.try_recv() {
-            self.queue.push_back(ClientEvent::LocalShellResult(result));
-        }
-
         if let Some(event) = self.queue.pop_front() {
             return Ok(Some(event));
         }
@@ -2282,20 +2241,6 @@ fn runtime_unavailable(error: Option<&str>) -> eyre::Report {
     )
 }
 
-/// Wall-clock budget for a `!`-bang local shell command. On expiry the child
-/// is killed (SIGTERM → SIGKILL on unix, `taskkill /F` on windows).
-const LOCAL_SHELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Combined stdout+stderr cap for `!`-bang output. Output past this is dropped
-/// and a `[truncated: N bytes]` marker is appended (see [`truncate_local_shell_output`]).
-const LOCAL_SHELL_MAX_OUTPUT_BYTES: usize = 10 * 1024;
-
-/// Hard per-stream READ cap so a chatty command can't balloon memory before the
-/// 10 KB display truncation. We stop reading each pipe at this many bytes; a
-/// command that exceeds it then blocks on the full pipe and is reaped by the
-/// timeout. Larger than the display cap so the captured slice is honest.
-const LOCAL_SHELL_READ_CAP: u64 = 256 * 1024;
-
 /// Build the cross-platform `(program, args)` for running `cmd` through the
 /// system shell, mirroring octos conventions: `sh -c <cmd>` on unix,
 /// `cmd /C <cmd>` on windows. The command string is passed as a single
@@ -2308,42 +2253,59 @@ fn local_shell_command_args(cmd: &str) -> (&'static str, Vec<String>) {
     }
 }
 
-/// Truncate `output` to at most [`LOCAL_SHELL_MAX_OUTPUT_BYTES`], on a UTF-8
-/// boundary, appending a `[truncated: N bytes]` marker recording how many
-/// bytes were dropped. Returns `(text, truncated)`.
-fn truncate_local_shell_output(output: &str) -> (String, bool) {
-    if output.len() <= LOCAL_SHELL_MAX_OUTPUT_BYTES {
-        return (output.to_string(), false);
+/// Install a process-lifetime parent signal shield for terminal-generated
+/// cancellation while a `!` child is in the foreground process group. In TUI
+/// raw mode Ctrl+C is delivered as a key event, so keeping this handler for the
+/// rest of the process does not change the normal double-Ctrl+C / Ctrl+Q UX.
+/// A spawned shell resets caught signals to their defaults on exec and still
+/// terminates normally. `signal-hook` provides the equivalent SIGINT handling
+/// on Windows consoles; SIGQUIT only exists on Unix.
+pub(crate) fn install_local_shell_parent_signal_shield() -> std::io::Result<()> {
+    use std::sync::{Arc, OnceLock, atomic::AtomicBool};
+
+    static INSTALL_ERROR: OnceLock<Option<String>> = OnceLock::new();
+    let error = INSTALL_ERROR.get_or_init(|| {
+        let intercepted = Arc::new(AtomicBool::new(false));
+        signal_hook::flag::register(
+            signal_hook::consts::signal::SIGINT,
+            Arc::clone(&intercepted),
+        )
+        .err()
+        .map(|err| format!("failed to shield parent from SIGINT: {err}"))
+        .or_else(|| {
+            #[cfg(not(windows))]
+            {
+                signal_hook::flag::register(signal_hook::consts::signal::SIGQUIT, intercepted)
+                    .err()
+                    .map(|err| format!("failed to shield parent from SIGQUIT: {err}"))
+            }
+            #[cfg(windows)]
+            {
+                None
+            }
+        })
+    });
+
+    match error {
+        Some(error) => Err(std::io::Error::other(error.clone())),
+        None => Ok(()),
     }
-    // Find the largest char boundary at or below the cap so we never split a
-    // multi-byte codepoint.
-    let mut cut = LOCAL_SHELL_MAX_OUTPUT_BYTES;
-    while cut > 0 && !output.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let dropped = output.len() - cut;
-    let mut text = output[..cut].to_string();
-    text.push_str(&format!("\n[truncated: {dropped} bytes]"));
-    (text, true)
 }
 
-/// Run a `!`-bang client-local shell command to completion (or timeout) and
-/// build its [`LocalShellResultEvent`]. Captures stdout and stderr separately,
-/// truncating each against the shared 10 KB combined cap. On timeout the child
-/// is killed (tokio's `Child::kill` sends SIGKILL on unix; on windows tokio
-/// maps `kill` to `TerminateProcess`, the same effect as `taskkill /F`).
-///
-/// Interactive commands (vim, ssh, …) get no TTY and so are unsupported; they
-/// will typically read EOF on stdin and exit, or hit the timeout.
-async fn run_local_shell_command(
+/// Run a terminal-attached `!` command synchronously with all three standard
+/// streams inherited from octoscode. The event loop disables raw mode and
+/// clears/reserves its inline viewport around this call, so prompts,
+/// device-login selectors, editors, and password input see a real controlling
+/// terminal while child output remains in normal-screen scrollback.
+/// There is intentionally no timeout: once the terminal is handed to the child,
+/// cancellation belongs to that child (normally Ctrl+C) just as it does in a
+/// regular shell.
+pub(crate) fn run_attached_local_shell_command(
     cmd: String,
     cwd: Option<std::path::PathBuf>,
     local_id: String,
 ) -> LocalShellResultEvent {
     let started = std::time::Instant::now();
-    // Display form of the directory the command runs in, for the transcript
-    // card's cwd label. An explicit `cwd` wins; otherwise the child inherits
-    // this process's working directory, so resolve that for the label.
     let cwd_display = cwd
         .as_ref()
         .map(|path| path.display().to_string())
@@ -2353,138 +2315,54 @@ async fn run_local_shell_command(
                 .map(|path| path.display().to_string())
         });
     let (program, args) = local_shell_command_args(&cmd);
-
-    let mut builder = Command::new(program);
+    let mut builder = std::process::Command::new(program);
     builder
         .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        // Reap the child if the task/future is dropped (e.g. on timeout):
-        // tokio does NOT kill child processes on drop unless this is set.
-        .kill_on_drop(true);
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     if let Some(cwd) = cwd {
         builder.current_dir(cwd);
     }
-    // Environment is inherited (no BLOCKED_ENV_VARS scrub — that is a
-    // server-side concern; this is a client-local action by design).
 
-    let child = match builder.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            return LocalShellResultEvent {
-                local_id,
-                cmdline: cmd,
-                cwd: cwd_display,
-                stdout: String::new(),
-                stderr: format!("failed to spawn local shell command: {err}"),
-                exit_code: None,
-                duration_ms: started.elapsed().as_millis() as u64,
-                truncated: false,
-            };
-        }
-    };
-
-    let mut child = child;
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-
-    // Read stdout+stderr concurrently, each BOUNDED at LOCAL_SHELL_READ_CAP so a
-    // runaway command can't balloon memory before the 10 KB display truncation;
-    // then wait for exit. The whole thing runs under the timeout. (If output
-    // exceeds the cap, reading stops, the child blocks on the full pipe, and the
-    // timeout reaps it via kill_on_drop.)
-    let collect = async {
-        use tokio::io::AsyncReadExt;
-        let mut so = Vec::new();
-        let mut se = Vec::new();
-        let read_out = async {
-            if let Some(p) = stdout_pipe.as_mut() {
-                let _ = p.take(LOCAL_SHELL_READ_CAP).read_to_end(&mut so).await;
-            }
+    if let Err(err) = install_local_shell_parent_signal_shield() {
+        return LocalShellResultEvent {
+            local_id,
+            cmdline: cmd,
+            cwd: cwd_display,
+            stdout: String::new(),
+            stderr: t!("status.bang_terminal_prepare_failed", error = err).into_owned(),
+            exit_code: None,
+            duration_ms: started.elapsed().as_millis() as u64,
+            truncated: false,
         };
-        let read_err = async {
-            if let Some(p) = stderr_pipe.as_mut() {
-                let _ = p.take(LOCAL_SHELL_READ_CAP).read_to_end(&mut se).await;
-            }
-        };
-        tokio::join!(read_out, read_err);
-        let status = child.wait().await;
-        (so, se, status)
-    };
+    }
 
-    let timed_out;
-    let captured = match tokio::time::timeout(LOCAL_SHELL_TIMEOUT, collect).await {
-        Ok((so, se, Ok(status))) => {
-            timed_out = false;
-            Some((so, se, status.code()))
-        }
-        Ok((_so, _se, Err(err))) => {
-            return LocalShellResultEvent {
-                local_id,
-                cmdline: cmd,
-                cwd: cwd_display,
-                stdout: String::new(),
-                stderr: format!("local shell command failed: {err}"),
-                exit_code: None,
-                duration_ms: started.elapsed().as_millis() as u64,
-                truncated: false,
-            };
-        }
-        Err(_elapsed) => {
-            // The `collect` future (and its borrow of `child`) is now dropped;
-            // kill + reap the still-running process promptly. `kill_on_drop`
-            // is the backstop; this makes the kill immediate + awaited.
-            let _ = child.kill().await;
-            timed_out = true;
-            None
-        }
-    };
-
-    let duration_ms = started.elapsed().as_millis() as u64;
-    let (raw_stdout, raw_stderr, exit_code) = match captured {
-        Some((so, se, code)) => (
-            String::from_utf8_lossy(&so).into_owned(),
-            String::from_utf8_lossy(&se).into_owned(),
-            code,
-        ),
-        None => (
-            String::new(),
-            format!(
-                "local shell command timed out after {}s and was killed",
-                LOCAL_SHELL_TIMEOUT.as_secs()
-            ),
-            None,
-        ),
-    };
-
-    // Truncate against the combined cap: budget stdout first, then give the
-    // remainder to stderr, so a chatty stdout cannot starve stderr entirely
-    // while the total still honours the 10 KB limit.
-    let (stdout, stdout_trunc) = truncate_local_shell_output(&raw_stdout);
-    let remaining = LOCAL_SHELL_MAX_OUTPUT_BYTES.saturating_sub(stdout.len());
-    let (stderr, stderr_trunc) = if raw_stderr.len() <= remaining {
-        (raw_stderr, false)
-    } else {
-        let mut cut = remaining;
-        while cut > 0 && !raw_stderr.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        let dropped = raw_stderr.len() - cut;
-        let mut text = raw_stderr[..cut].to_string();
-        text.push_str(&format!("\n[truncated: {dropped} bytes]"));
-        (text, true)
-    };
-
-    LocalShellResultEvent {
-        local_id,
-        cmdline: cmd,
-        cwd: cwd_display,
-        stdout,
-        stderr,
-        exit_code,
-        duration_ms,
-        truncated: timed_out || stdout_trunc || stderr_trunc,
+    match builder.status() {
+        Ok(status) => LocalShellResultEvent {
+            local_id,
+            cmdline: cmd,
+            cwd: cwd_display,
+            stdout: String::new(),
+            stderr: if status.code().is_none() {
+                t!("status.bang_terminal_signalled").into_owned()
+            } else {
+                String::new()
+            },
+            exit_code: status.code(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            truncated: false,
+        },
+        Err(err) => LocalShellResultEvent {
+            local_id,
+            cmdline: cmd,
+            cwd: cwd_display,
+            stdout: String::new(),
+            stderr: t!("status.bang_terminal_spawn_failed", error = err).into_owned(),
+            exit_code: None,
+            duration_ms: started.elapsed().as_millis() as u64,
+            truncated: false,
+        },
     }
 }
 
@@ -5286,6 +5164,18 @@ fn mock_profile_llm_catalog() -> ProfileLlmCatalogResult {
             }]
         }),
     );
+    // Keyless local-server family (empty env) so --mock runs can exercise the
+    // keyless onboarding path at all (red-team pass, octoscode#562).
+    families.insert(
+        "local".into(),
+        serde_json::json!({
+            "env": "",
+            "models": [{
+                "id": "local-default",
+                "endpoints": [{"id": "official", "label": "Official API (local)"}]
+            }]
+        }),
+    );
     families.insert(
         "minimax".into(),
         serde_json::json!({
@@ -5862,63 +5752,46 @@ mod tests {
     }
 
     #[test]
-    fn local_shell_output_short_is_not_truncated() {
-        let (text, truncated) = truncate_local_shell_output("hello world");
-        assert_eq!(text, "hello world");
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn local_shell_output_over_cap_is_truncated_with_marker() {
-        let big = "x".repeat(LOCAL_SHELL_MAX_OUTPUT_BYTES + 500);
-        let (text, truncated) = truncate_local_shell_output(&big);
-        assert!(truncated);
-        // Kept bytes are at or below the cap (plus the appended marker).
-        assert!(text.contains("[truncated: 500 bytes]"));
-        assert!(text.starts_with(&"x".repeat(LOCAL_SHELL_MAX_OUTPUT_BYTES)));
-    }
-
-    #[test]
-    fn local_shell_truncation_respects_utf8_boundary() {
-        // Fill with a 3-byte codepoint so the cap lands mid-character; the
-        // helper must back off to a boundary and never panic.
-        let snowman = "\u{2603}"; // 3 bytes
-        let big = snowman.repeat(LOCAL_SHELL_MAX_OUTPUT_BYTES); // ~30 KB
-        let (text, truncated) = truncate_local_shell_output(&big);
-        assert!(truncated);
-        // The kept prefix must still be valid UTF-8 (no split codepoint).
-        assert!(text.contains("[truncated:"));
-    }
-
-    #[tokio::test]
-    async fn run_local_shell_echo_completes_with_output() {
-        // Deterministic cross-platform: `echo hi` via the shell wrapper.
-        let event = run_local_shell_command("echo hi".into(), None, "local-shell:t1".into()).await;
-        assert_eq!(event.local_id, "local-shell:t1");
-        assert_eq!(event.exit_code, Some(0));
-        assert!(event.stdout.contains("hi"));
-        assert!(!event.truncated);
-        // With no explicit cwd the child inherits the process cwd — the event
-        // labels that so the transcript card can show WHERE the command ran.
-        assert_eq!(
-            event.cwd,
-            std::env::current_dir()
-                .ok()
-                .map(|path| path.display().to_string())
-        );
-    }
-
-    #[tokio::test]
-    async fn run_local_shell_labels_explicit_cwd() {
+    fn attached_local_shell_reports_exit_status_and_explicit_cwd() {
         let dir = std::env::temp_dir();
-        let event =
-            run_local_shell_command("echo hi".into(), Some(dir.clone()), "local-shell:t2".into())
-                .await;
+        let event = run_attached_local_shell_command(
+            "exit 0".into(),
+            Some(dir.clone()),
+            "local-shell:t2".into(),
+        );
         assert_eq!(event.exit_code, Some(0));
+        assert!(event.stdout.is_empty());
+        assert!(event.stderr.is_empty());
         assert_eq!(
             event.cwd.as_deref(),
             Some(dir.display().to_string().as_str())
         );
+    }
+
+    #[test]
+    fn attached_local_shell_preserves_nonzero_exit_status() {
+        let event =
+            run_attached_local_shell_command("exit 7".into(), None, "local-shell:failed".into());
+        assert_eq!(event.exit_code, Some(7));
+        assert!(event.stderr.is_empty());
+    }
+
+    #[test]
+    fn protocol_backend_never_recreates_a_detached_local_shell() {
+        let mut backend = ProtocolAppUiBackend::new(AppUiLaunch::default());
+        backend
+            .send(AppUiCommand::LocalShellExec {
+                cmd: "read value".into(),
+                local_id: "local-shell:missed-handoff".into(),
+            })
+            .unwrap();
+
+        let event = backend.next_event().unwrap().expect("synthetic result");
+        let ClientEvent::LocalShellResult(result) = event else {
+            panic!("expected local shell result");
+        };
+        assert_eq!(result.exit_code, None);
+        assert!(result.stderr.contains("missed the terminal handoff"));
     }
 
     struct ProtocolCaptureServer {
@@ -8988,6 +8861,7 @@ mod tests {
 
     // --- stdio driver end-to-end: exit race + stderr tail + oversized skip ---
 
+    #[cfg(unix)]
     fn drive_stdio_until_disconnect(
         command: &str,
     ) -> (Vec<String>, Vec<(String, String, bool)>, String) {

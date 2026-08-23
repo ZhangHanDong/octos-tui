@@ -197,14 +197,22 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         if dirty {
             let menu_reserved_now = app::menu_surface_active(&store.state);
-            let menu_just_closed = menu_reserved_last_frame && !menu_reserved_now;
+            // A menu toggle (open OR close) changes the reserved viewport row
+            // block. On close the incremental shrink strands a blank band
+            // (handled below); on open the incremental grow relies on a DECSTBM
+            // scroll-region + partial-clear path that some Windows terminals
+            // (conhost, older Windows Terminal) do not render correctly, leaving
+            // the newly-opened sessions/slash menu invisible. Force a full
+            // visible-screen clear + scrollback re-flush on BOTH edges so the
+            // menu is always painted on a clean surface.
+            let menu_just_toggled = menu_reserved_last_frame != menu_reserved_now;
             menu_reserved_last_frame = menu_reserved_now;
             draw(
                 &mut terminal,
                 &mut guard,
                 &mut store,
                 &mut scrollback,
-                menu_just_closed,
+                menu_just_toggled,
             )?;
             dirty = false;
         }
@@ -238,7 +246,20 @@ pub fn run(cli: Cli) -> Result<()> {
                         break;
                     }
                     KeyAction::Send(command) => {
-                        send_command(backend.as_mut(), &mut store, *command)
+                        if dispatch_input_command(
+                            backend.as_mut(),
+                            &mut terminal,
+                            &mut guard,
+                            &mut store,
+                            *command,
+                        )? {
+                            // The child owned stdin while crossterm polling was
+                            // paused. Drop any paste timing state and stop this
+                            // pre-handoff input batch; queued focus/resize input
+                            // belongs to the freshly restored TUI.
+                            input_state = TerminalInputState::default();
+                            break;
+                        }
                     }
                 }
                 // A resize invalidates the inline viewport layout; force a repaint.
@@ -321,7 +342,7 @@ fn draw<B>(
     guard: &mut TerminalGuard,
     store: &mut Store,
     scrollback: &mut ScrollbackTracker,
-    menu_just_closed: bool,
+    menu_just_toggled: bool,
 ) -> Result<()>
 where
     B: Backend + io::Write,
@@ -379,11 +400,17 @@ where
     // band gaping between it and the composer (a plain committed re-flush alone
     // can't fix it: `insert_history_lines` would append the fresh copy right
     // below the stranded one, duplicating it). So do exactly what a resize does
-    // for a clean re-render: wipe the visible screen and re-flush the whole
-    // committed transcript flush against the now-shrunk viewport. One frame,
-    // and it only fires on the open→closed edge (see the event loop), so
+    // A menu toggle (open OR close) changes the reserved viewport row block.
+    // On close the incremental shrink strands a blank band between the
+    // transcript and the composer. On open the incremental grow relies on a
+    // DECSTBM scroll-region + partial-clear path that some Windows terminals
+    // (conhost, older Windows Terminal) do not render correctly, leaving the
+    // newly-opened sessions/slash menu invisible. On either edge, do exactly
+    // what a resize does for a clean re-render: wipe the visible screen and
+    // re-flush the whole committed transcript against the new viewport. One
+    // frame, and it only fires on the toggle edge (see the event loop), so
     // repeated menu cycles never accumulate blank bands.
-    if menu_just_closed {
+    if menu_just_toggled {
         terminal.clear_visible_screen()?;
         scrollback.mark_flushed_stale();
     }
@@ -620,10 +647,205 @@ fn send_command(backend: &mut dyn AppUiBackend, store: &mut Store, command: AppU
     }
 }
 
+/// Dispatch a composer command, intercepting local shell escapes before the
+/// backend. Returns `true` when the real terminal was handed to a child, which
+/// tells the input loop to end its pre-handoff crossterm batch.
+fn dispatch_input_command<B>(
+    backend: &mut dyn AppUiBackend,
+    terminal: &mut InlineTerminal<B>,
+    guard: &mut TerminalGuard,
+    store: &mut Store,
+    command: AppUiCommand,
+) -> Result<bool>
+where
+    B: Backend + io::Write,
+{
+    let AppUiCommand::LocalShellExec { cmd, local_id } = command else {
+        send_command(backend, store, command);
+        return Ok(false);
+    };
+
+    let outcome = run_local_shell_with_terminal(terminal, guard, cmd, local_id)?;
+    apply_client_event_and_send_followup(backend, store, outcome.event);
+    if let Some(error) = outcome.restore_error {
+        return Err(error);
+    }
+    Ok(true)
+}
+
+struct LocalShellHandoffOutcome {
+    event: ClientEvent,
+    /// The child result must still be applied before a post-child terminal
+    /// restoration error is surfaced, so its running report never wedges.
+    restore_error: Option<eyre::Report>,
+}
+
+/// Suspend crossterm's TUI modes, run a `!` command with inherited stdio, and
+/// restore the inline TUI afterwards. The handoff stays on the normal screen:
+/// child output remains in native scrollback after return instead of flashing
+/// briefly in an alternate screen and disappearing.
+fn run_local_shell_with_terminal<B>(
+    terminal: &mut InlineTerminal<B>,
+    guard: &mut TerminalGuard,
+    cmd: String,
+    local_id: String,
+) -> Result<LocalShellHandoffOutcome>
+where
+    B: Backend + io::Write,
+{
+    // Install the parent shield before cooked mode makes terminal-generated
+    // signals possible, closing the gap between disabling raw mode and spawn.
+    crate::transport::install_local_shell_parent_signal_shield()?;
+    let prior_mode = guard.mode;
+    let mouse_was_captured = guard.mouse_captured;
+    guard.sync_mouse_capture(terminal, false)?;
+    guard.leave_alt_screen(terminal)?;
+    let reserved_rows = terminal.viewport_area.height.max(1);
+    // Remove the live composer/status rows before placing the child at their
+    // top. Finalized transcript above the viewport is left untouched.
+    terminal.clear()?;
+
+    #[cfg(not(test))]
+    {
+        disable_raw_mode()?;
+        if let Err(error) = execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableFocusChange,
+            Show
+        ) {
+            // Raw mode may already be off and the execute may have applied a
+            // prefix of its commands. Roll every mode forward before
+            // returning instead of leaving a half-suspended TUI.
+            let _ = enable_raw_mode();
+            let _ = execute!(
+                terminal.backend_mut(),
+                EnableBracketedPaste,
+                EnableFocusChange
+            );
+            return Err(error.into());
+        }
+    }
+
+    let mut event = crate::transport::run_attached_local_shell_command(
+        cmd,
+        std::env::current_dir().ok(),
+        local_id,
+    );
+
+    // Restore every mode before the next crossterm poll. Keep the terminal
+    // round-trip independent of the child's exit status: a failed command is
+    // still a normal result, not a reason to strand the parent in cooked mode.
+    // Every cleanup step is attempted; the first error is returned only AFTER
+    // the result event settles the running activity report.
+    let mut restore_error: Option<eyre::Report> = None;
+    #[cfg(not(test))]
+    {
+        if let Err(error) = enable_raw_mode() {
+            restore_error = Some(error.into());
+        }
+        if let Err(error) = execute!(
+            terminal.backend_mut(),
+            EnableBracketedPaste,
+            EnableFocusChange
+        ) && restore_error.is_none()
+        {
+            restore_error = Some(error.into());
+        }
+    }
+
+    let screen_size = match terminal.size() {
+        Ok(size) => size,
+        Err(error) => {
+            if restore_error.is_none() {
+                restore_error = Some(error.into());
+            }
+            terminal.last_known_screen_size
+        }
+    };
+    let fallback_cursor = ratatui::layout::Position {
+        x: 0,
+        y: screen_size.height.saturating_sub(1),
+    };
+    let (cursor, cursor_known) = match terminal.backend_mut().get_cursor_position() {
+        Ok(cursor) => (cursor, true),
+        Err(_) => (fallback_cursor, false),
+    };
+    let rows_below_cursor = screen_size
+        .height
+        .saturating_sub(1)
+        .saturating_sub(cursor.y);
+    let rows_to_reserve = if cursor_known {
+        reserved_rows.max(rows_below_cursor)
+    } else {
+        // Without CPR evidence, walk a full screen: wherever the child left
+        // the cursor, this reaches the bottom and scrolls at least the old
+        // viewport height clear. Output may move farther into scrollback, but
+        // it cannot be overwritten by the restored composer.
+        screen_size.height.max(reserved_rows)
+    };
+
+    // Reserve fresh rows for the TUI before repainting it. Because the child
+    // started at the old viewport top, these line feeds push its last output
+    // above the bottom-pinned composer (and into native scrollback when needed)
+    // instead of letting the first restored frame overwrite it. On a failed
+    // cursor query the bottom-row fallback still guarantees the old viewport's
+    // full-screen fallback still guarantees the old viewport is reserved.
+    let reserve_result: io::Result<()> = (|| {
+        for _ in 0..rows_to_reserve {
+            terminal.backend_mut().write_all(b"\r\n")?;
+        }
+        io::Write::flush(terminal.backend_mut())
+    })();
+    if let Err(error) = reserve_result
+        && restore_error.is_none()
+    {
+        restore_error = Some(error.into());
+    }
+    terminal.last_known_cursor_pos = fallback_cursor;
+    terminal.set_visible_history_extent(terminal.viewport_area.top(), terminal.viewport_area.top());
+    terminal.invalidate_viewport();
+
+    if prior_mode == RenderMode::AltScreen
+        && let Err(error) = guard.enter_alt_screen(terminal)
+        && restore_error.is_none()
+    {
+        restore_error = Some(error);
+    }
+    if let Err(error) = guard.sync_mouse_capture(terminal, mouse_was_captured)
+        && restore_error.is_none()
+    {
+        restore_error = Some(error);
+    }
+
+    if event.stdout.is_empty() && event.stderr.is_empty() {
+        event.stdout = t!("status.bang_terminal_complete").into_owned();
+    }
+    Ok(LocalShellHandoffOutcome {
+        event: ClientEvent::LocalShellResult(event),
+        restore_error,
+    })
+}
+
+/// Window in which a preceding text key counts as evidence that a paste
+/// burst (rapid char delivery) is in progress, used to gate the initial
+/// activation of the unbracketed-paste newline heuristic. A real paste
+/// delivers all characters within microseconds; manual typing has gaps of
+/// 50ms+ even for fast typists. 50ms is conservative enough to avoid
+/// false positives while still catching every paste.
+const PASTE_RAPID_TEXT_WINDOW: Duration = Duration::from_millis(50);
+
 #[derive(Default)]
 struct TerminalInputState {
     unbracketed_paste_until: Option<Instant>,
+    /// Timestamp of the most recent plain-text key (Char with no/ctrl-only
+    /// modifiers) while the composer was focused. Used to distinguish a real
+    /// unbracketed paste (rapid chars followed by Enter) from a lone manual
+    /// Enter on Windows, where next_event_waiting is always true because a
+    /// key-release event is queued right after every press.
+    last_text_key_at: Option<Instant>,
 }
+
 
 impl TerminalInputState {
     fn should_insert_unbracketed_paste_newline(
@@ -631,18 +853,38 @@ impl TerminalInputState {
         now: Instant,
         next_event_waiting: bool,
     ) -> bool {
-        if next_event_waiting || self.unbracketed_paste_active(now) {
+        // Already inside a paste burst: every Enter (and text key) keeps the
+        // window alive so multi-line pastes round-trip correctly.
+        if self.unbracketed_paste_active(now) {
             self.extend_unbracketed_paste(now);
-            true
-        } else {
-            false
+            return true;
         }
+        // Initial activation. next_event_waiting alone is insufficient: on
+        // Windows a manual Enter press queues a key-release event, making
+        // next_event_waiting true for every keypress — which used to turn
+        // every manual Enter into a composer newline. Require a recently
+        // typed text key as evidence that a paste burst (rapid char delivery)
+        // is in progress, not just a lone manual Enter.
+        if next_event_waiting && self.recent_text_key_indicates_paste(now) {
+            self.extend_unbracketed_paste(now);
+            return true;
+        }
+        false
     }
 
     fn note_text_key(&mut self, now: Instant) {
+        // Always record the timestamp so the paste-detection gate can see
+        // rapid char delivery. Extending the active paste window is kept
+        // separate so a lone manual char does not by itself start paste mode.
+        self.last_text_key_at = Some(now);
         if self.unbracketed_paste_active(now) {
             self.extend_unbracketed_paste(now);
         }
+    }
+
+    fn recent_text_key_indicates_paste(&self, now: Instant) -> bool {
+        self.last_text_key_at
+            .is_some_and(|at| now <= at + PASTE_RAPID_TEXT_WINDOW)
     }
 
     fn unbracketed_paste_active(&self, now: Instant) -> bool {
@@ -677,13 +919,17 @@ fn handle_terminal_event_with_input_state(
     now: Instant,
 ) -> KeyAction {
     if let Event::Key(key) = event {
-        // Skip the unbracketed-paste newline heuristic while a modal or a peek
-        // owns the keyboard — both force Composer focus, so without this an
-        // Enter (or pasted newline) lands in the hidden draft and never reaches
-        // the modal's / peek's Enter handler. Those surfaces handle Enter
-        // themselves downstream.
+        // Skip the unbracketed-paste newline heuristic while a modal, a peek,
+        // or a menu owns the keyboard — all three can leave Composer focus in
+        // place (menus are overlays that do not switch focus), so without this
+        // an Enter (or pasted newline) lands in the draft behind the overlay
+        // and never reaches the overlay's own Enter handler. On Windows terminals
+        // a manual Enter press often has next_event_waiting=true (key-release
+        // event queued), which made the heuristic fire for a real Enter and
+        // insert a composer newline instead of selecting the onboarding item.
         if !modal_owns_keyboard(store)
             && !app::agent_view_active(&store.state)
+            && !store.state.menu_stack.is_active()
             && is_plain_composer_enter(store, &key)
             && input_state.should_insert_unbracketed_paste_newline(now, next_event_waiting)
         {
@@ -5775,6 +6021,65 @@ mod tests {
         ));
     }
 
+    /// Regression: on Windows, a manual Enter press often arrives with
+    /// `next_event_waiting=true` (a key-release event is queued right after
+    /// the press). The unbracketed-paste newline heuristic used to fire on
+    /// that signal even while a menu (e.g. the onboarding wizard) was open,
+    /// inserting a newline into the composer behind the overlay instead of
+    /// letting the menu's Enter handler select the highlighted item. The
+    /// heuristic must be skipped whenever any menu owns the keyboard.
+    #[test]
+    fn enter_during_paste_burst_reaches_menu_when_menu_active() {
+        let mut store = Store {
+            state: AppState::new(
+                vec![],
+                0,
+                "ready".into(),
+                Some("stdio:octos serve --stdio".into()),
+                false,
+            ),
+        };
+        store.state.set_capabilities(UiProtocolCapabilities::new(
+            &[crate::model::APPUI_METHOD_PROFILE_LOCAL_CREATE],
+            &[],
+        ));
+        store.open_menu(crate::menu::MenuId::from(
+            crate::menu::registry::MENU_ONBOARD,
+        ));
+        // Menus are overlays: they do not move focus off the composer, and
+        // the composer may carry prior draft text — exactly the state that
+        // made the heuristic misfire on Windows.
+        store.state.focus = FocusPane::Composer;
+        store.state.composer = "draft".into();
+
+        let mut input_state = TerminalInputState::default();
+        let now = Instant::now();
+
+        // next_event_waiting=true is the Windows manual-Enter signature: a
+        // key-release event sits in the queue right after the press.
+        let action = handle_terminal_event_with_input_state(
+            &mut store,
+            Event::Key(key(KeyCode::Enter)),
+            &mut input_state,
+            true, // next_event_waiting
+            now,
+        );
+
+        // The heuristic must NOT have inserted a newline into the composer.
+        assert!(
+            !store.state.composer.contains('\n'),
+            "Enter must not insert a composer newline while a menu is active; got {:?}",
+            store.state.composer
+        );
+        // The key must have reached the menu layer (not been swallowed by the
+        // paste heuristic). Accepting an onboarding item returns Continue
+        // (it advances the wizard / closes the menu) rather than Send.
+        assert!(
+            matches!(action, KeyAction::Continue),
+            "Enter should be handled by the menu and return Continue"
+        );
+    }
+
     #[test]
     fn terminal_focus_resize_and_mouse_events_are_stable_noops() {
         let mut store = store_with_sessions(1);
@@ -6971,6 +7276,78 @@ mod tests {
         };
         assert_eq!(cmd, "echo hi");
         assert!(store.state.composer.is_empty(), "draft cleared on dispatch");
+    }
+
+    #[test]
+    fn every_bang_command_is_run_through_the_terminal_handoff() {
+        let mut store = store_with_sessions(1);
+        store.state.set_composer_text("!exit 0");
+        let command = store.compose_command().expect("bang dispatches");
+        let mut backend = FakeBackend::new(Vec::new());
+        let mut terminal = InlineTerminal::new(RecordingBackend::new(80, 24)).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 16, 80, 8));
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+            live_inline_viewport: Some(terminal.viewport_area),
+        };
+
+        let handed_off =
+            dispatch_input_command(&mut backend, &mut terminal, &mut guard, &mut store, command)
+                .unwrap();
+
+        assert!(handed_off);
+        assert!(
+            backend.sent.is_empty(),
+            "local shell never reaches the RPC backend"
+        );
+        assert_eq!(guard.mode, RenderMode::Inline, "normal screen is restored");
+        assert_eq!(
+            terminal.backend().buf,
+            b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+            "reserve exactly the old live viewport beneath child output"
+        );
+        let report = store.state.activity.last().expect("settled bang report");
+        assert_eq!(report.success, Some(true));
+        assert_eq!(report.status, "complete");
+        assert!(
+            report
+                .output_preview
+                .as_deref()
+                .is_some_and(|output| !output.is_empty()),
+            "the restored TUI explains that output was shown in the terminal"
+        );
+    }
+
+    #[test]
+    fn terminal_handoff_restores_prior_alt_screen_and_mouse_capture() {
+        let mut terminal = InlineTerminal::new(RecordingBackend::new(80, 24)).unwrap();
+        terminal.set_viewport_area(Rect::new(0, 16, 80, 8));
+        let mut guard = TerminalGuard {
+            mode: RenderMode::Inline,
+            saved_inline_viewport: None,
+            saved_visible_history_extent: None,
+            saved_inline_screen_size: None,
+            mouse_captured: false,
+            live_inline_viewport: Some(terminal.viewport_area),
+        };
+        guard.enter_alt_screen(&mut terminal).unwrap();
+        guard.sync_mouse_capture(&mut terminal, true).unwrap();
+
+        let outcome = run_local_shell_with_terminal(
+            &mut terminal,
+            &mut guard,
+            "exit 0".into(),
+            "local-shell:restore-state".into(),
+        )
+        .unwrap();
+
+        assert!(outcome.restore_error.is_none());
+        assert_eq!(guard.mode, RenderMode::AltScreen);
+        assert!(guard.mouse_captured);
     }
 
     /// Enter with a `!` draft DURING a live steer-capable turn must still
