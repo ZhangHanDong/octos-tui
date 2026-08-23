@@ -7273,6 +7273,11 @@ impl Store {
             approval.title.clone()
         };
 
+        // The approval prompt renders in the transcript, UNDER the detail
+        // overlays, yet takes key priority over all of them — an expanded
+        // diff overlay left up would cover the very dialog now receiving
+        // approve/deny keys. Collapse it (keep the preview open inline).
+        self.state.diff_preview.expanded = false;
         self.state.approval_auto_open = true;
         self.state.focus = FocusPane::Composer;
         self.state.status = t!("status.approval_shown", title = title).into_owned();
@@ -7459,6 +7464,10 @@ impl Store {
             picker.title.clone()
         };
 
+        // Same as `show_pending_approval`: the picker takes key priority over
+        // the expanded diff overlay but renders beneath it — collapse the
+        // overlay so the user answers a dialog they can actually see.
+        self.state.diff_preview.expanded = false;
         self.state.user_question_auto_open = true;
         self.state.focus = FocusPane::Composer;
         self.state.status = t!("status.question_shown", title = title).into_owned();
@@ -7714,6 +7723,14 @@ impl Store {
             return;
         }
         self.state.diff_preview.toggle_view_mode();
+        // Unified and side-by-side layouts can have different physical line
+        // counts. Keep the current from-bottom position when it is still
+        // reachable, but never retain an offset above the new layout's top.
+        let max_scroll = crate::app::diff_preview_overlay_max_scroll(
+            &self.state,
+            crate::theme::Palette::for_theme(self.state.theme),
+        );
+        self.state.diff_preview.scroll = self.state.diff_preview.scroll.min(max_scroll);
         self.state.status = if self.state.diff_preview.side_by_side {
             t!("status.diff_view_side_by_side").into_owned()
         } else {
@@ -10149,6 +10166,12 @@ impl Store {
         );
         let mut approval = ApprovalModalState::from_event(event);
         approval.visible = self.state.approval_auto_open;
+        if approval.visible {
+            // A visible approval takes key priority over the expanded diff
+            // overlay but renders beneath it — collapse the overlay so the
+            // dialog receiving approve/deny keys is on screen.
+            self.state.diff_preview.expanded = false;
+        }
         self.state.approval = Some(approval);
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title);
@@ -10204,6 +10227,12 @@ impl Store {
         );
         let mut picker = UserQuestionPickerState::from_event(event);
         picker.visible = self.state.user_question_auto_open;
+        if picker.visible {
+            // A visible question owns the keyboard before the expanded diff
+            // overlay, but renders below it. Collapse the overlay so hydrate
+            // cannot leave the user answering an invisible dialog.
+            self.state.diff_preview.expanded = false;
+        }
         self.state.user_question = Some(picker);
         self.state.focus = FocusPane::Composer;
         self.state.set_run_state_blocked(title);
@@ -11332,6 +11361,12 @@ impl Store {
                 }
                 let mut approval = ApprovalModalState::from_event(event);
                 approval.visible = self.state.approval_auto_open;
+                if approval.visible {
+                    // A visible approval takes key priority over the expanded
+                    // diff overlay but renders beneath it — collapse the
+                    // overlay so approve/deny keys act on a visible dialog.
+                    self.state.diff_preview.expanded = false;
+                }
                 let diff_preview_id = approval.diff_preview_id();
                 let diff_preview_turn_id = approval.turn_id.clone();
                 self.state.approval = Some(approval);
@@ -12857,6 +12892,10 @@ impl Store {
         // and their answers never reached the model. Force it visible and mark
         // auto-open so the peek yields to it.
         picker.visible = true;
+        // The picker takes key priority over the expanded diff overlay but
+        // renders beneath it — collapse the overlay so the question is
+        // answered on a visible dialog.
+        self.state.diff_preview.expanded = false;
         self.state.user_question_auto_open = true;
         self.state.user_question = Some(picker);
         // Salience (spec task-approval-ux-salience): a live decision arrival
@@ -32901,6 +32940,44 @@ now analyzing the bus module"
         assert!(!entry.multi_select);
         // Picker pauses the turn like an open approval.
         assert_eq!(store.state.run_state.label(), "blocked");
+    }
+
+    #[test]
+    fn hydrated_visible_question_collapses_the_expanded_diff_overlay() {
+        let mut store = store_with_empty_session();
+        let session_id = store.state.sessions[0].id.clone();
+        store.state.diff_preview.open_loading(PreviewId::new());
+        store.state.diff_preview.expanded = true;
+        assert!(store.state.diff_preview.overlay_active());
+
+        store.apply_hydrated_pending_questions(
+            &session_id,
+            vec![UserQuestionRequestedEvent::new(
+                session_id.clone(),
+                QuestionId::new(),
+                TurnId::new(),
+                "Pick a framework",
+                "The reconnect still has a pending decision.",
+                vec![single_select(
+                    "Framework",
+                    "Which framework?",
+                    vec![option("axum", "tokio-native")],
+                )],
+            )],
+        );
+
+        assert!(
+            store
+                .state
+                .user_question
+                .as_ref()
+                .is_some_and(|picker| picker.visible),
+            "hydrate must restore the active question visibly"
+        );
+        assert!(
+            !store.state.diff_preview.expanded,
+            "the visible question must not remain hidden below the diff overlay"
+        );
     }
 
     #[test]
