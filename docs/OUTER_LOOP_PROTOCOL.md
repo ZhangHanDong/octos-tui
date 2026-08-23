@@ -21,7 +21,7 @@
 | 信道 | 载体 | 时效 | 用途 |
 |---|---|---|---|
 | 会话常驻约束 | `AGENTS.md`(octos prompt_layer 自动注入每个 session) | session boot | 纪律、协议本身的引导 |
-| 任务级指导 | `docs/OUTER_LOOP_REVIEW.md`(带日期条目 + `ACK:` 行) | master 每轮读 | 审查意见、整改要求 |
+| 任务级指导 | `docs/OUTER_LOOP_REVIEW.md` 的 `Active` 区(带日期条目 + `ACK:` 行) | master 每轮读 | 审查意见、整改要求;历史区不可执行 |
 | 既成事实 | 原子 git commit | 立即 | 代修、基建修复 |
 | 事件提示 / **门铃** | inbox `<session-hash>.notes` | 下一 turn,阅后即焚 | 仅事件通知与**黑板指针**("第 N 条已更新,去读并执行");不承载指令内容本身 |
 | **TUI 注入** | `herdr agent prompt <pane> '<text>'`(需 herdr ≥ Ti-Agent-OS fork `fc414dd8`,含 octoscode manifest)或 tmux `send-keys` | ~8s 内开 turn | 唯一实证"读**且执行**"的即时下行通道——文本落在 composer 即用户消息层级,等价 operator 亲手输入;steer API(L2)落地前的事实标准 |
@@ -38,7 +38,7 @@
 
 ## 协议语义(核心规则)
 
-- **R1 — ACK 义务**:`docs/OUTER_LOOP_REVIEW.md` 中的每条意见,runtime 侧执行后
+- **R1 — ACK 义务**:`docs/OUTER_LOOP_REVIEW.md` 的 `Active` 区中每条意见,runtime 侧执行后
   必须在条目下补 `ACK: <做了什么 / 为何不做>`。无 ACK 视为未读,outer 有权打回交付。
 - **R2 — 诚实验证声明**:runtime 侧每个交付必须声明验证级别之一:
   `verified`(跑过 `cargo test --all-targets` + clippy + fmt)/
@@ -49,9 +49,9 @@
   outer 不得代替 operator 按下审批;operator 缺席时 escalation 保持 park。
 - **R4 — 工作区共存**:同一工作区多写者(master/peers/outer)各自只
   `git add` 自己改的文件,禁止 `git add -A`;改动即原子 commit,不留长时间
-  未提交状态。
-- **R5 — 指导幂等**:outer 的意见带日期与编号,内容自包含可重放;同一意见
-  重复投递不产生重复执行(以 ACK 为去重依据)。
+  未提交状态。来源不明的 dirty 文件必须保留并报告,不得自动清理或提交。
+- **R5 — 指导幂等**:outer 的意见带日期与唯一编号,只在 `Active` 区可执行;
+  ACK 后移入历史区且永不重放。重复投递以 ACK 为去重依据。
 - **R6 — 版本协商**:本文件头部 `protocol: olp/vN`;`AGENTS.md` 引用同版本。
   信道语义变更必须升版本。
 
@@ -72,7 +72,8 @@
    同时 tail 两个日期文件;(c) 观测分三层——**投递**(notes 文件被清空)≠
    **消费**(turn prompt 读到)≠ **执行**(交付/ACK 落地),只看一层必误判,
    turn 心跳以日志里 `^` 锚定的时间戳行判定,勿取续行。
-3. 读本文件 + `docs/OUTER_LOOP_REVIEW.md` 了解当前指导上下文。
+3. 读本文件 + `docs/OUTER_LOOP_REVIEW.md` 的 `Active` 区了解当前指导;
+   `Historical record` 仅用于审计。
 4. 审查交付:`peers/*/result.md` → git diff → 独立复验(R2)。
 5. 写指导:黑板追加条目;紧急基建问题直接原子 commit(R4)。
 6. (可选,推荐)驾驶舱注入通道:herdr 里跑 octoscode 后,
@@ -95,8 +96,9 @@
 
 自治回路的基座是 octos 自带的 maintenance `/loop`:server 定时给 master
 创造 turn,bare `/loop` 的 prompt 从仓库的 **`.octos/loop.md`** 解析——
-外环拥有心跳指令的定义权。本仓库的 loop.md 约定:每次醒来执行黑板中
-编号最小的未 ACK 条目到完成并原地 ACK。operator 一次性设置
+外环拥有心跳指令的定义权。本仓库的 loop.md 约定:每次醒来只执行黑板
+`Active` 区中编号最小的未 ACK 条目并原地 ACK;没有 active 工作时不得
+清理或提交来源不明的工作区内容。operator 一次性设置
 `/loop every 30m` 后,外环写黑板即等于下发任务,无需任何人工转发。
 两个实测教训已吸收:(1) inbox notes 只是"投信"而非"按铃"——外环写
 notes 不会创造 turn;(2) system prompt 附加段的指令会被读而不被执行,
@@ -112,25 +114,27 @@ outer 往 inbox notes 写一条只含指针的通知(内容留在黑板),再由 
 任意一句话触发下一个 turn——门铃随 prompt 注入,master 循指针读黑板执行。
 L2 的 steer API 将消除"需要 operator 说一句话"这最后一步。
 
-## v0 验证记录(2026-08-23 闭环实验终局)
+## v0 实验记录(2026-08-23,非持续认证)
 
-一次完整的双环协作实验(外环 Claude Code/Fable 5,内环 octoscode + 苦力模型,
-黑板十条评审项)于 2026-08-23 全部闭环。协议各条款的实证样本:
+一次双环协作实验(外环 Claude Code/Fable 5,内环 octoscode + 苦力模型,
+黑板十条评审项)于 2026-08-23 完成记录。下表是当时的信道/流程样本,
+不是对未合并 PR、当前 main 或具体 runtime 实现的持续认证:
 
 | 条款/机制 | 实证样本 |
 |---|---|
 | AGENTS.md 注入 + R6 版本 | olp/v0 金丝雀握手:新 session 首轮即复述协议头 |
 | R1 ACK 义务 | 十条评审项全部带 ACK 闭环,含整改与拒绝两类 |
 | 异议路径(ACK: wontdo) | #9:内环以证据拒绝重派指令,外环复核后接受——内环是对的 |
-| R2 诚实验证 + 分工 | #8:peer 声明沙箱无工具链(unverified),外环代跑全量测试后落 commit |
-| R3 升级分级 | #10:新依赖(signal-hook)由内环升级请求 → 外环 3 分钟批准(树内已有传递依赖,零增量),全程零人工 |
+| R2 诚实验证 + 分工 | #8:peer 声明沙箱无工具链(unverified),外环曾代跑测试;后续实现缺陷见 review 的更正记录 |
+| R3 升级分级 | #10:新依赖(signal-hook)曾走升级请求;旧 suspend 实现后来被审查判错,见 review 的更正记录 |
 | 心跳自治 | maintenance `/loop` 30m + loop.md 执行契约,黑板新条目无人工转发即被执行 |
 | 门铃模式 | inbox 指针 + 黑板内容分离,两次实测"读而不执行"事故后定型 |
 | TUI 注入 | herdr fork 补丁 e2e:`agent prompt` → ~8s 内 turn 启动 |
 
-结论:v0 的信道矩阵与 R 系列规则在真实长程任务(渲染修复、启动优化、终端
-韧性)上自洽可用;主要摩擦点(观测靠 tail 日志、寻址靠自算 hash、steer 靠
-TUI 注入)即 L1/L2 路线的动机,对应 REQ-OLP-{OBS,CTRL,HEADLESS}。
+结论:v0 实验说明黑板、ACK 和注入信道可以协作;它不证明当时各运行时改动
+正确。具体行为只能由 main 上的代码、绑定 commit 的测试和独立复验确认。
+主要摩擦点(观测靠 tail 日志、寻址靠自算 hash、steer 靠 TUI 注入)仍是
+L1/L2 路线的动机,对应 REQ-OLP-{OBS,CTRL,HEADLESS}。
 
 ## 已知局限(v0)
 

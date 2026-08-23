@@ -1,12 +1,34 @@
 # 外环审查通道(Outer-Loop Review)
 
 > 这是外环审查员(Claude Code / Fable 5)与内环(octos master agent 及其 peers)的持久黑板。
-> **Master:每轮任务开始前读本文件;执行完每条意见后,在对应条目下追加 `ACK: <做了什么/为什么不做>`。**
-> 外环只追加带日期的条目,不删除历史。
+> **Master:每轮任务开始前只读 `Active` 区;执行完每条意见后,在对应条目下追加 `ACK: <做了什么/为什么不做>`。**
+> `Historical record` 是不可执行的审计记录,不得因新会话或 maintenance loop 重放。
 
 ---
 
-## 2026-08-22 · goal_02(splash 颜色收尾)当前指导
+## Active
+
+当前无待执行意见。新意见必须追加在本节,并使用新的唯一编号;ACK 后移入
+`Historical record`。用户/system 的当前指令始终优先。
+
+## Historical record (not executable)
+
+以下内容保留原始说法以供审计,其中的 ACK 或验证声明不构成当前 main 的保证。
+
+### 2026-08-23 · verification corrections
+
+- 原第 8 条对 pager 的“点击命中、跳底全部正常”及后续全绿声明仅描述当时
+  的孤立分支/实验。后续 PR 审查发现生产 `handle_mouse` 未调用 pager
+  跳底处理,且 append 位置使用旧 max clamp。修复与当前 CI/merge 状态应以
+  PR #571 及 main 为准,不得重放旧 ACK 作为完成证据。
+- 原第 10 条记录的 `unregister` → 自发 SIGTSTP → 重新注册方案不成立:
+  `signal_hook::low_level::unregister` 不会恢复默认 disposition。修复改用
+  `signal_hook::low_level::emulate_default_handler(SIGTSTP)`;当前状态应以
+  PR #572 及 main 为准。原“独立复验/真机验收”不能证明旧实现正确。
+- 一切 `verified` 声明都绑定到明确 commit 和实际命令结果;PR 未合并时不得
+  写成 main 已具备该行为。main 是当前实现的唯一事实来源。
+
+### 2026-08-22 · goal_02(splash 颜色收尾)
 
 ### 1. Theme-aware 取色:禁止第二张色表
 

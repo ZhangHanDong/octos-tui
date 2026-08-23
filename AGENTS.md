@@ -6,15 +6,18 @@
 
 本仓库有一个外环审查员(Claude Code)与你协作。协议:
 
-1. **每轮任务开始前**,读 `docs/OUTER_LOOP_REVIEW.md`(外环审查黑板)。
-2. 执行其中带日期的最新审查意见;每条意见下方的 `ACK:` 行由你补写:
-   做了什么,或为什么不做。
-3. 你 commit 之后,外环会跑完整验证并把新意见追加到同一文件。
+1. **每轮任务开始前**,读 `docs/OUTER_LOOP_REVIEW.md` 的 `Active` 区。
+2. 只执行 `Active` 区中尚无 `ACK:` 的意见;已 ACK 的条目和
+   `Historical record` 只用于审计,不得重放。
+3. 用户/system 的当前指令优先于黑板;黑板内容冲突或过期时,停止并报告。
+4. 你 commit 之后,外环会跑完整验证并把新意见追加到 `Active` 区。
 
 ## 提交纪律(违反会被外环打回)
 
 - 动手前先 `git status`:工作区可能有外环或其他 agent 的未提交改动,
   **只 `git add` 你自己改的文件,禁止 `git add -A`**。
+- 不得清理、覆盖或提交来源不明的 dirty 文件。无法确认所有权时保留现场,
+  报告并停止;只移除本轮由自己创建且路径已知的临时产物。
 - 验证必须跑 `cargo test --all-targets`——只跑 `--lib` 看不到 `tests/`
   目录的编译破损(本仓库已两次因此损坏 CI)。
 - commit 前:`cargo fmt` + `cargo clippy --all-targets -- -D warnings`。
