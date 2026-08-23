@@ -19,12 +19,12 @@
 
 - 原第 8 条对 pager 的“点击命中、跳底全部正常”及后续全绿声明仅描述当时
   的孤立分支/实验。后续 PR 审查发现生产 `handle_mouse` 未调用 pager
-  跳底处理,且 append 位置使用旧 max clamp。修复与当前 CI/merge 状态应以
-  PR #571 及 main 为准,不得重放旧 ACK 作为完成证据。
+  跳底处理,且 append 位置使用旧 max clamp。修复已由 PR #571 合入 main
+  (`088e879`);不得重放旧 ACK 作为完成证据。
 - 原第 10 条记录的 `unregister` → 自发 SIGTSTP → 重新注册方案不成立:
   `signal_hook::low_level::unregister` 不会恢复默认 disposition。修复改用
-  `signal_hook::low_level::emulate_default_handler(SIGTSTP)`;当前状态应以
-  PR #572 及 main 为准。原“独立复验/真机验收”不能证明旧实现正确。
+  `signal_hook::low_level::emulate_default_handler(SIGTSTP)`,并由 PR #572
+  合入 main (`b2e2f7a`)。原“独立复验/真机验收”不能证明旧实现正确。
 - 一切 `verified` 声明都绑定到明确 commit 和实际命令结果;PR 未合并时不得
   写成 main 已具备该行为。main 是当前实现的唯一事实来源。
 
