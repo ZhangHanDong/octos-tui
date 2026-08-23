@@ -10,7 +10,8 @@ use crossterm::{
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture,
-        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     },
     execute,
     terminal::{
@@ -972,6 +973,19 @@ fn handle_mouse(store: &mut Store, mouse: MouseEvent) -> KeyAction {
     match mouse.kind {
         MouseEventKind::ScrollUp => scroll_current_surface_up(store, lines),
         MouseEventKind::ScrollDown => scroll_current_surface_down(store, lines),
+        MouseEventKind::Down(MouseButton::Left)
+            if store.state.transcript_pager_active
+                && store
+                    .state
+                    .scroll_to_bottom_button
+                    .get()
+                    .is_some_and(|hit| hit.contains(mouse.column, mouse.row)) =>
+        {
+            // Mouse counterpart of End: stay in the pager but return to its
+            // live tail. The pager gate prevents a stale hit rect from eating
+            // clicks after close while pinned mode keeps capture enabled.
+            store.state.scroll_transcript_to_latest();
+        }
         _ => {}
     }
     KeyAction::Continue

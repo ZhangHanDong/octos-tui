@@ -9404,15 +9404,16 @@ impl AppState {
 
     pub fn preserve_transcript_position_after_append(&mut self, estimated_rows: usize) {
         if self.transcript_scroll > 0 && estimated_rows > 0 {
-            // Clamped against the last-rendered max like `scroll_transcript_up`
-            // (the bound only tightens if content was *removed* — a stale
-            // clamp here can't push the offset past the new top once the next
-            // frame re-records it, and `scroll_transcript_down` snaps any
-            // transient over-shoot before subtracting).
+            // Normalize any pre-existing stale overshoot against the OLD
+            // rendered ceiling, then add the new rows. Clamping the final sum
+            // to that old ceiling would discard the append delta and make a
+            // scrolled-up viewport drift toward the tail as output arrives.
+            // The next render records the new ceiling; scroll-down also snaps
+            // an estimated overshoot before subtracting.
             self.transcript_scroll = self
                 .transcript_scroll
-                .saturating_add(estimated_rows)
-                .min(self.transcript_scroll_max.get());
+                .min(self.transcript_scroll_max.get())
+                .saturating_add(estimated_rows);
         }
     }
 
@@ -11449,6 +11450,26 @@ mod tests {
 
         git.scroll_up(99);
         assert_eq!(git.scroll, 0);
+    }
+
+    #[test]
+    fn transcript_append_preserves_scrolled_view_beyond_the_old_ceiling() {
+        let mut state = AppState::new(Vec::new(), 0, "ready".into(), None, false);
+        state.transcript_scroll = 5;
+        state.record_transcript_scroll_max(5);
+
+        state.preserve_transcript_position_after_append(3);
+
+        assert_eq!(
+            state.transcript_scroll, 8,
+            "new rows increase the from-bottom offset instead of being cut off by the old max"
+        );
+
+        // A stale pre-append overshoot is normalized first, then the same
+        // preservation delta is applied.
+        state.transcript_scroll = 99;
+        state.preserve_transcript_position_after_append(3);
+        assert_eq!(state.transcript_scroll, 8);
     }
 
     /// `completed_turns` grows on EVERY terminal for the life of the session;
