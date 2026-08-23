@@ -637,7 +637,7 @@ fn have(program: &str) -> bool {
 /// v2.0.3-rc.1 while this stayed on v2.0.2, so a fresh install auto-provisioned
 /// a server whose protocol predated the client's. [`REQUIRED_OCTOS_CORE_REV`]
 /// and the test beside it now make the pair checkable instead of a comment.
-pub(crate) const REQUIRED_OCTOS_RELEASE: &str = "v2.0.3-rc.8";
+pub(crate) const REQUIRED_OCTOS_RELEASE: &str = "v2.0.3-rc.9";
 
 /// The `octos-core` rev that [`REQUIRED_OCTOS_RELEASE`] resolves to — i.e. the
 /// commit the release tag points at, and the rev Cargo.toml must pin.
@@ -650,16 +650,8 @@ pub(crate) const REQUIRED_OCTOS_RELEASE: &str = "v2.0.3-rc.8";
 ///
 /// Test-only: its whole job is to be compared against Cargo.toml, so it would
 /// be dead weight in a real build.
-///
-/// task-consume-turn-steer-dropped: this rev (octos `1ff2e3d8`, branch
-/// `fix/return-unconsumed-steer-inputs`) is AHEAD of [`REQUIRED_OCTOS_RELEASE`]
-/// on purpose — no octos release contains it yet. The protocol delta is
-/// additive only (the server-emitted `turn/steer_dropped` notification): a
-/// v2.0.3-rc.2 server simply never sends it and the client falls back to its
-/// terminal re-stage (task-steer-retained-until-echo). Bump
-/// `REQUIRED_OCTOS_RELEASE` to the first release tag containing this rev.
 #[cfg(test)]
-pub(crate) const REQUIRED_OCTOS_CORE_REV: &str = "e87f1c0615e76e18483d9d7ae8f5296477fee743";
+pub(crate) const REQUIRED_OCTOS_CORE_REV: &str = "5ea987813de4fd2afdd1d78f2106ad2868f0d923";
 /// Env var overriding the octos release tag to install (fork / pinned build).
 const OCTOS_RELEASE_ENV: &str = "OCTOSCODE_OCTOS_RELEASE";
 /// The octos server-bundle asset name for THIS build's target platform, or
