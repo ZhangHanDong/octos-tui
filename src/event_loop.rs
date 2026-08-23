@@ -78,10 +78,6 @@ enum RenderMode {
 struct SuspendFlags {
     tstp: Arc<AtomicBool>,
     cont: Arc<AtomicBool>,
-    /// Registration id of the SIGTSTP flag handler, so the suspend path can
-    /// restore the default disposition (via `low_level::unregister`) before
-    /// re-raising the signal to genuinely stop.
-    tstp_id: signal_hook::SigId,
 }
 
 #[cfg(all(unix, not(test)))]
@@ -92,14 +88,9 @@ impl SuspendFlags {
     fn install() -> Result<Self> {
         let tstp = Arc::new(AtomicBool::new(false));
         let cont = Arc::new(AtomicBool::new(false));
-        let tstp_id =
-            signal_hook::flag::register(signal_hook::consts::signal::SIGTSTP, Arc::clone(&tstp))?;
+        signal_hook::flag::register(signal_hook::consts::signal::SIGTSTP, Arc::clone(&tstp))?;
         signal_hook::flag::register(signal_hook::consts::signal::SIGCONT, Arc::clone(&cont))?;
-        Ok(Self {
-            tstp,
-            cont,
-            tstp_id,
-        })
+        Ok(Self { tstp, cont })
     }
 
     /// Returns true exactly once per observed SIGTSTP.
@@ -143,26 +134,23 @@ fn restore_terminal_for_suspend(guard: &mut TerminalGuard) {
     let _ = io::Write::flush(&mut stdout);
 }
 
-/// Raise SIGTSTP against ourselves under its DEFAULT disposition so the
-/// process genuinely stops (OUTER_LOOP_REVIEW #10.1). The signal-hook flag
-/// handler is still installed for SIGTSTP, so a plain `raise` would only set
-/// the flag again; instead reset the disposition to default first, raise, and
-/// re-register the flag handler for the next suspend cycle.
+/// Apply the platform default stop action for SIGTSTP so the process genuinely
+/// suspends (OUTER_LOOP_REVIEW #10.1). A plain raise would only run our flag
+/// handler again. Unregistering that handler is also incorrect: signal-hook
+/// deliberately leaves the installed OS handler in place after the last action
+/// is removed, effectively ignoring later SIGTSTP signals. Its documented TUI
+/// pattern is `emulate_default_handler`, which maps a stop-class signal to an
+/// uncatchable SIGSTOP while leaving our flag registration intact for every
+/// later Ctrl+Z cycle.
 ///
 /// All steps run on the event-loop thread between frames — no
 /// async-signal-safety constraints apply.
 #[cfg(all(unix, not(test)))]
-fn self_suspend(tstp_id: signal_hook::SigId, tstp_flag: &Arc<AtomicBool>) -> Result<()> {
-    use rustix::process::{Signal, getpid, kill_process};
-
-    // Restore the default disposition (SIGTSTP stops the process) — this also
-    // unregisters the flag action from signal-hook's registry.
-    signal_hook::low_level::unregister(tstp_id);
-    // Stop. The next line runs after `fg` delivers SIGCONT.
-    kill_process(getpid(), Signal::TSTP)?;
-    // Resumed — reinstall the flag handler so the NEXT Ctrl+Z round-trips
-    // through the same path.
-    signal_hook::flag::register(signal_hook::consts::signal::SIGTSTP, Arc::clone(tstp_flag))?;
+fn self_suspend() -> Result<()> {
+    // Returns only after `fg` delivers SIGCONT. signal-hook uses SIGSTOP for a
+    // stop-class default action, so the registered SIGTSTP callback needs no
+    // unregister/re-register dance and remains valid for subsequent cycles.
+    signal_hook::low_level::emulate_default_handler(signal_hook::consts::signal::SIGTSTP)?;
     Ok(())
 }
 
@@ -335,7 +323,7 @@ pub fn run(cli: Cli) -> Result<()> {
             if flags.take_tstp() {
                 restore_terminal_for_suspend(&mut guard);
                 input_state.reset_paste_state();
-                if let Err(err) = self_suspend(flags.tstp_id, &flags.tstp) {
+                if let Err(err) = self_suspend() {
                     // Could not stop (e.g. SIGTSTP blocked): re-enter the TUI
                     // state so we don't sit here with a half-restored tty.
                     store.apply_event(AppUiEvent::error("suspend_failed", format!("{err:#}")));
