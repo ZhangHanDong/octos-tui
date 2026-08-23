@@ -846,7 +846,6 @@ struct TerminalInputState {
     last_text_key_at: Option<Instant>,
 }
 
-
 impl TerminalInputState {
     fn should_insert_unbracketed_paste_newline(
         &mut self,
