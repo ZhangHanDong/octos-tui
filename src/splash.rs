@@ -46,10 +46,7 @@ pub const SPLASH_EFFECTS: [&[&str]; 9] = [
 
 /// The animated input: logo plus a version footer line.
 pub fn splash_text() -> String {
-    format!(
-        "{LOGO}\n\n         octoscode v{}",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("{LOGO}\n\noctoscode v{}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Widest line / line count of the splash text, for the gate and printer.
@@ -245,8 +242,12 @@ impl SplashSession {
         // (theme-aware) so the splash → banner handoff is color-smooth.
         if result.is_ok() {
             let text = self.text.clone();
-            let colored = format!("{}{}\x1b[0m", self.final_color, text);
-            self.paint(out, &colored)?;
+            if self.final_color.is_empty() {
+                self.paint(out, &text)?;
+            } else {
+                let colored = format!("{}{}\x1b[0m", self.final_color, text);
+                self.paint(out, &colored)?;
+            }
         }
         // Move the cursor back UP to the canvas top row (paint left it at the
         // bottom row) instead of parking below the canvas. octoscode's TUI is
@@ -337,6 +338,22 @@ fn play_inner(theme: &crate::cli::ThemeName) -> Result<()> {
         .ok()
         .and_then(|name| effect_args_for(name.trim()))
         .unwrap_or_else(|| pick_effect_args(seed));
+
+    // Raw mode must be active before a Terminal-theme palette lookup: that
+    // lookup warms the cached OSC 10/11 `/dev/tty` probe, whose response has
+    // no newline and would otherwise be held or echoed by canonical mode.
+    // Keeping the guard alive across all later fallible setup also guarantees
+    // that a palette/session error restores the terminal.
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        }
+    }
+    crossterm::terminal::enable_raw_mode().wrap_err("splash: raw mode")?;
+    let _guard = RawGuard;
+
     let (term_cols, _) = crossterm::terminal::size().unwrap_or((80, 24));
     // Theme-aware final color: match the launch banner's accent color.
     // Honor NO_COLOR: if set, the final paint is plain (no color).
@@ -358,18 +375,6 @@ fn play_inner(theme: &crate::cli::ThemeName) -> Result<()> {
         final_color,
     )?;
 
-    // Raw mode for echo-free any-key skip; the guard restores it on every
-    // exit path (the panic hook in main.rs also disables raw mode, so a
-    // double-disable is harmless).
-    struct RawGuard;
-    impl Drop for RawGuard {
-        fn drop(&mut self) {
-            let _ = crossterm::terminal::disable_raw_mode();
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-        }
-    }
-    crossterm::terminal::enable_raw_mode().wrap_err("splash: raw mode")?;
-    let _guard = RawGuard;
     let mut stdout = std::io::stdout().lock();
     crossterm::execute!(stdout, crossterm::cursor::Hide).ok();
 
@@ -559,6 +564,10 @@ mod tests {
         assert!(
             !output.ends_with("\r\n"),
             "cursor must NOT be parked below the canvas"
+        );
+        assert!(
+            !output.contains("\x1b[0m"),
+            "an uncolored final paint must not emit a stray SGR reset"
         );
     }
 }

@@ -97,6 +97,11 @@ fn splash_text_carries_logo_and_version() {
     let text = splash_text();
     assert!(text.contains(env!("CARGO_PKG_VERSION")));
     assert!(text.lines().count() >= 6, "logo should be multi-line");
+    assert_eq!(
+        text.lines().last(),
+        Some(format!("octoscode v{}", env!("CARGO_PKG_VERSION")).as_str()),
+        "the shared block-centering path owns footer alignment"
+    );
 }
 
 use octoscode::splash::{SessionOpts, SplashSession};
