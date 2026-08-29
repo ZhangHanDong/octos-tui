@@ -141,7 +141,7 @@ skill 卡的模式 inner 要求按任务形态选内环形态;三档各有定位
 - **`model`**:车道参数,值是 sub_provider key(如 `zai`/`kimi`),
   让不同 peer 跑不同模型车道。**未配置的 key 回退主道并出 model_note
   警告**——看到警告先查 `~/.octos/profiles/<id>.json` 的
-  sub_providers(配法见 §5)。车道解析语义细节见机制篇(下)。
+  sub_providers(配法见 §6)。车道解析语义细节见机制篇(下)。
 - **worktree 围栏**:多 goal 并行时各 peer 在独立 worktree 干活,
   防止两个目标在同一棵树撞分支——这是 R4b 的自动落地(见机制篇)。
 
@@ -253,7 +253,7 @@ OctoLoop 把一个长程任务拆给两圈 agent 加一个人,三者模型档位
 |---|---|---|---|
 | 1 | 事件流 | serve 日志 `peer-goal:*` / escalation / `transitioned goal` 行 | 外环 tail+filter,事件驱动零轮询 |
 | 2 | 交付物 | `peers/<slug>/result.md`(frontmatter schema) | 每轮交付的权威回执,单写者契约 |
-| 3 | 权威账本 | `goal-ledgers/<goal_id>` | durable,重启幸存,goal 状态的唯一事实源 |
+| 3 | 权威账本 | `goal-ledgers/<goal_id>` | durable 审计与读面,重启幸存(状态裁定拓扑见机制篇 §3.5) |
 | 4 | 求助 | escalation(park 于 approval/question) | 分级升级,见 R3 |
 | 5 | **主动问询(MCP)** | `octoscode olp-mcp-serve` 子命令 | 内环 turn 内**同步**问外环,见下(绰号"第五信道"沿用历史序数:上行前四信道+MCP=五;"代码"信道系后加入,现排第 6 行) |
 | 6 | 代码 | git log / diff | 审查对象,原子 commit 即既成事实 |
@@ -263,7 +263,9 @@ OctoLoop 把一个长程任务拆给两圈 agent 加一个人,三者模型档位
 
 - **挂载方式**:profile 的 `config.mcp_servers` 指向 octoscode 可执行
   文件,`args` 为 `["olp-mcp-serve"]`;挂载后内环模型 turn 内可原生
-  调用两个 MCP 工具(接线细节见指南篇(上))。
+  调用两个 MCP 工具(接线步骤见 OUTER_LOOP_PROTOCOL.md 接入清单第 7 项;
+  就地两行:profile `config.mcp_servers` 里 `"command"` 指向 octoscode
+  可执行文件、`"args": ["olp-mcp-serve"]`,新会话生效)。
 - **`ask_outer(question, context, tried)`**:turn 内同步发问。信箱目录
   `~/.octos/outer/mcp/` 下 `questions/` → `answers/` → `consumed/`(取答
   后归档)。**90s 超时降级**:超时返回降级指引而非卡死 turn。
@@ -360,7 +362,7 @@ R4 管"同树多写者",R4b 管"多 goal 撞同一棵树",是系统默认机制�
 ### R6 — 版本协商
 
 协议文档头部声明 `protocol: olp/vN`,`AGENTS.md` 引用同版本;**信道
-语义变更必须升版本**。新 session 首轮复述协议头即完成握手(金丝雀),
+语义变更必须升版本**。新 session 首轮复述协议头(金丝雀;系 v0 实验期的可选诊断手段,非 v1 规范义务),
 版本不符立即可见,不会静默按旧语义协作。
 
 ## 3. goal 状态机与 peer 生命周期
@@ -377,9 +379,13 @@ goal 有五个状态,语义各别:
 |---|---|
 | `active` | 活 goal:goal keeper 正在跨 turn 推进,ledger 持续记账 |
 | `blocked` | 被阻塞:通常是 escalation 按 R3 分级 park 待裁决(外环或 operator 缺席时保持此态,不强行推进) |
+| `paused` | 暂停:operator 显式挂起,账本与现场保留 |
 | `complete` | 目标达成并收口,账本保留 |
-| `archived` | 归档:从在途视野移出,账本仍在、可 reopen 回 active(离线在档操作的可靠性坑见 §X.5) |
-| `budget_exhausted` | 预算耗尽的**独立中间态**——不是失败,是"有名字的、可恢复的现场"(由机制④转入,见下) |
+| `budget_limited` | 预算受限的**独立中间态**——不是失败,是"有名字的、可恢复的现场"(由机制④转入,见下) |
+
+`archived` 是 operator-only 终态(不在上述可设置枚举内,#25 设计):
+归档把 goal 移出在途视野,账本仍在、可 reopen 回 active——离线归档
+的可靠性坑见 §3.5。
 
 状态转移由 goal keeper 驱动:它是 master 侧跨 turn 的推进者——每个
 turn 结束时记账、判断进展、决定下一步,与单个 turn 的生命周期解耦。
@@ -388,30 +394,36 @@ keeper 的节拍由两处引擎机制托底,本节只指路不展开:
 - turn 之间**零延迟自动续拍**由 turn-continuation 钩子完成
   (见 §4 五项机制⑤)——keeper 不等外环心跳即可推进;
 - 预算耗尽时的现场钉存(wip commit + 阶段版 result)与
-  `budget_exhausted` 转态由预算 checkpoint 机制完成
-  (见 §4 五项机制④)——`blocked` 与 `budget_exhausted`
+  `budget_limited` 转态由预算 checkpoint 机制完成
+  (见 §4 五项机制④)——`blocked` 与 `budget_limited`
   刻意分立:前者等裁决,后者等续算,处置路径不同。
 
 ### 3.2 peer 生命周期
 
-peer 是 master 经 `peer_handoff` 派出的并行执行单元,生命周期:
+peer 的"状态"分**三层**,先分层再谈映射,勿混用:
 
-```
-staged → working → landed
-                    ↘ failed
-                    ↘ parked(仅 serve 重启孤儿,可恢复)
-```
+1. **handoff 阶段**:`staged` = 派工单落档(brief、车道、围栏决策随单
+   持久化)——这是**入库动作**的完成,不是运行态。
+2. **后台任务状态机**(引擎侧,运行态真相):
+   `running | completed | failed | interrupted | parked`。
+   `parked` = serve 重启造成的 peer_handoff 孤儿转入的可恢复态,工作
+   现场保留、可续跑(语义与判别标准见 §4 五项机制②,不复述)。
+3. **`octos peer list` 目录视图**(CLI 侧展示层):
+   `running | done | closed`。
 
-- **staged**:handoff 落档——brief、车道(见 §X.3)、围栏决策
-  (R4b)随派工单持久化,peer 待开工。
-- **working**:peer 在跑,事件流持续产出,可经 TUI agents 栏与
-  `octos peer list` 观察(操作见指南篇(上))。
-- **landed**:交付被 master 采认、并入主线——peer 的产出只有经
-  采认才算落地。
-- **failed**:真失败(与"重启导致的绑定丢失"刻意区分)。
-- **parked**:serve 重启造成的 `peer_handoff` 孤儿转入的可恢复态,
-  工作现场保留、可续跑。语义与判别标准见 §4 五项机制②
-  (孤儿 peer 恢复态),本节不重复。
+"landed"不是状态,是**动作**:交付被 master 采认、并入主线——peer 的
+产出只有经采认才算落地。
+
+| 引擎状态 | CLI 视图 | 含义 |
+|---|---|---|
+| staged(落档) | running | 待开工(即刻转 running) |
+| running | running | 在跑,事件流持续产出 |
+| completed | done | 本轮交付完成 |
+| failed / interrupted | closed | 真失败/被中断(与重启孤儿刻意区分) |
+| parked | closed | 重启孤儿,可恢复续跑 |
+
+观察入口(操作见指南篇(上)):TUI agents 栏、`octos peer list`、
+事件流。
 
 ### 3.3 peer_handoff 的 model 车道解析语义
 
@@ -469,7 +481,9 @@ goal 状态有三个面,各自的权威角色不同,混淆它们是排障迷路�
 ## 4. 五项引擎机制
 
 以下五项是 serve/引擎侧的自治能力(语义与 `docs/OCTOLOOP_FEATURES.md`
-32-r1 核准版一致),全部默认开,无需配置即可受益。
+32-r1 核准版逐条一致),缺省逐项:**①fallback 需配置 `llm.fallbacks` 才
+逐道切换——未配即单道,断供即停(配法见指南篇 §6);②③④⑤ 无需配置、
+默认生效**。
 
 ### ① 断供自动降级(fallback 车道)
 
@@ -500,7 +514,7 @@ restart` 而非一片 `failed`——工作现场保留,可恢复续跑,不会因
 单 turn 迭代预算(50 轮)耗尽**且工作树脏**时,引擎自动做两件事:
 `wip` commit 把现场钉进 git,再写一份阶段版 result——有 `.result-owner`
 在场时写 `result.checkpoint.md`,**不覆盖 peer 终稿**;goal 转入独立的
-`budget_exhausted` 状态(不是 failed)。体感:超时任务的工作不再全丢,
+`budget_limited` 状态(不是 failed)。体感:超时任务的工作不再全丢,
 可从 checkpoint 续——预算耗尽从"静默烂在工作区"变成"有名字的、可
 恢复的中间态"。
 
