@@ -32,7 +32,7 @@
 | Node **或** Homebrew **或** shell installer | 三选一 | 只为装二进制,**不需要 Rust**(源码构建才需 Rust 1.85+) |
 | 内环模型 API key | 是 | 便宜档,例:Moonshot(kimi)。onboarding 向导里粘贴 |
 | 外环 agent CLI | 是 | Claude Code / Codex 任一,用你已有的订阅 |
-| herdr(终端工作区管理器) | 否,推荐 | 外环用 `herdr agent prompt` 程序化驱动内环窗格;不装可用 tmux send-keys 降级 |
+| herdr(终端工作区管理器) | 否,推荐 | 外环用 `herdr agent prompt` 程序化驱动内环窗格;不装可用 tmux send-keys 降级。**来源**:<https://github.com/hagency-org/herdr>,octoscode 窗格识别(`--kind octoscode`)当前在 `feat/octoscode-agent` 分支——从该分支构建;合入 master 后跟 master |
 | bwrap(bubblewrap) | Linux 自带居多 | 权限档 1-4 的文件系统沙箱;见下文 0b 语义 |
 
 ## 2. 一键路径
