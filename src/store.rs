@@ -47,6 +47,10 @@ use crate::{
         ToolConfigUpsertParams, UserQuestionPickerState, V2AssistantSegment,
         complete_plan_steps_in_text, task_state_label, terminal_task_state_from_agent_status,
     },
+    transport::{
+        message_is_frame_too_large_for_method, message_is_invalid_result_for_method,
+        message_is_pending_cap_for_method, message_is_transport_send_for_method,
+    },
 };
 
 const TASK_OUTPUT_TAIL_BYTES: usize = 600;
@@ -7816,13 +7820,20 @@ impl Store {
                 // main turn.
                 let is_btw_error = error.message.starts_with("session/btw ")
                     || (error.code == "too_many_pending_requests"
-                        && error.message.ends_with("enqueue session/btw request"))
+                        && message_is_pending_cap_for_method(
+                            &error.message,
+                            octos_core::ui_protocol::methods::SESSION_BTW,
+                        ))
                     || (error.code == "invalid_result"
-                        && error
-                            .message
-                            .starts_with("failed to decode UI protocol result for session/btw"))
+                        && message_is_invalid_result_for_method(
+                            &error.message,
+                            octos_core::ui_protocol::methods::SESSION_BTW,
+                        ))
                     || (error.code == "frame_too_large"
-                        && error.message.starts_with("encoded session/btw request"));
+                        && message_is_frame_too_large_for_method(
+                            &error.message,
+                            octos_core::ui_protocol::methods::SESSION_BTW,
+                        ));
                 if is_btw_error && self.state.fail_btw_answering(&error.message) > 0 {
                     self.state.status = t!("status.btw_failed").into_owned();
                     return None;
@@ -7843,17 +7854,25 @@ impl Store {
                 // server's own echo keep the transcript truthful).
                 let is_steer_error = error.message.starts_with("turn/steer ")
                     || (error.code == "too_many_pending_requests"
-                        && error.message.ends_with("enqueue turn/steer request"))
+                        && message_is_pending_cap_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ))
                     || (error.code == "frame_too_large"
-                        && error.message.starts_with("encoded turn/steer request"))
+                        && message_is_frame_too_large_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ))
                     || (error.code == "transport_send"
-                        && error
-                            .message
-                            .starts_with("failed to send turn/steer request"))
+                        && message_is_transport_send_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ))
                     || (error.code == "invalid_result"
-                        && error
-                            .message
-                            .starts_with("failed to decode UI protocol result for turn/steer"));
+                        && message_is_invalid_result_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ));
                 if is_steer_error {
                     if let Some(pending) = self.state.pending_turn_steers.pop_front() {
                         if error.code != "invalid_result" {
@@ -9277,18 +9296,29 @@ impl Store {
                 // path outside the five transport synthesis points — none is
                 // known today): a spurious clear merely re-permits a cheap
                 // probe, the safe direction.
+                // #28a: the wording contract lives in transport.rs — match
+                // via the shared discriminators so a wording drift on the
+                // producer side cannot silently desync this arm.
                 let is_hydrate_error = error.message.starts_with("session/hydrate ")
                     || (error.code == "too_many_pending_requests"
-                        && error.message.ends_with("enqueue session/hydrate request"))
+                        && message_is_pending_cap_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                        ))
                     || (error.code == "frame_too_large"
-                        && error.message.starts_with("encoded session/hydrate request"))
+                        && message_is_frame_too_large_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                        ))
                     || (error.code == "transport_send"
-                        && error
-                            .message
-                            .starts_with("failed to send session/hydrate request"))
+                        && message_is_transport_send_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                        ))
                     || (error.code == "invalid_result"
-                        && error.message.starts_with(
-                            "failed to decode UI protocol result for session/hydrate",
+                        && message_is_invalid_result_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_SESSION_HYDRATE,
                         ));
                 if is_hydrate_error {
                     self.state.hydrate_in_flight.clear();
@@ -9312,13 +9342,20 @@ impl Store {
                 // main turn.
                 let is_btw_error = error.message.starts_with("session/btw ")
                     || (error.code == "too_many_pending_requests"
-                        && error.message.ends_with("enqueue session/btw request"))
+                        && message_is_pending_cap_for_method(
+                            &error.message,
+                            octos_core::ui_protocol::methods::SESSION_BTW,
+                        ))
                     || (error.code == "invalid_result"
-                        && error
-                            .message
-                            .starts_with("failed to decode UI protocol result for session/btw"))
+                        && message_is_invalid_result_for_method(
+                            &error.message,
+                            octos_core::ui_protocol::methods::SESSION_BTW,
+                        ))
                     || (error.code == "frame_too_large"
-                        && error.message.starts_with("encoded session/btw request"));
+                        && message_is_frame_too_large_for_method(
+                            &error.message,
+                            octos_core::ui_protocol::methods::SESSION_BTW,
+                        ));
                 if is_btw_error && self.state.fail_btw_answering(&error.message) > 0 {
                     self.state.status = t!("status.btw_failed").into_owned();
                     return None;
@@ -9339,17 +9376,25 @@ impl Store {
                 // server's own echo keep the transcript truthful).
                 let is_steer_error = error.message.starts_with("turn/steer ")
                     || (error.code == "too_many_pending_requests"
-                        && error.message.ends_with("enqueue turn/steer request"))
+                        && message_is_pending_cap_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ))
                     || (error.code == "frame_too_large"
-                        && error.message.starts_with("encoded turn/steer request"))
+                        && message_is_frame_too_large_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ))
                     || (error.code == "transport_send"
-                        && error
-                            .message
-                            .starts_with("failed to send turn/steer request"))
+                        && message_is_transport_send_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ))
                     || (error.code == "invalid_result"
-                        && error
-                            .message
-                            .starts_with("failed to decode UI protocol result for turn/steer"));
+                        && message_is_invalid_result_for_method(
+                            &error.message,
+                            crate::model::APPUI_METHOD_TURN_STEER,
+                        ));
                 if is_steer_error {
                     if let Some(pending) = self.state.pending_turn_steers.pop_front() {
                         if error.code != "invalid_result" {
@@ -10455,7 +10500,37 @@ impl Store {
         if self.state.capabilities.as_ref().is_some_and(|caps| {
             caps.supports_method(crate::model::APPUI_METHOD_SESSION_STATUS_READ)
         }) {
-            self.state.enqueue_session_status_probe(session_id);
+            self.state.enqueue_session_status_probe(session_id.clone());
+        }
+        // OUTER_LOOP_REVIEW #30: the session bootstrap + hydrate is complete
+        // — if a startup prompt is armed (and not yet dispatched), emit its
+        // single turn/start now. The arm survives reconnects (the #27
+        // replay drives a fresh hydrate, which lands here again) until
+        // dispatch; once emitted the arm clears and `startup_prompt_dispatched`
+        // latches, so a post-dispatch reconnect's re-hydrate never re-sends.
+        if self.state.startup_prompt_pending.is_some()
+            && !self.state.startup_prompt_dispatched
+            && !self.state.readonly
+        {
+            let text = self
+                .state
+                .startup_prompt_pending
+                .take()
+                .expect("checked is_some");
+            self.state.startup_prompt_dispatched = true;
+            let turn_id = TurnId::new();
+            let prompt_command = AppUiCommand::SubmitPrompt(TurnStartParams {
+                tool_context: None,
+                session_id: session_id.clone(),
+                turn_id,
+                input: vec![InputItem::Text { text }],
+                media: Vec::new(),
+                topic: None,
+                rewrite_for: None,
+                reasoning_effort: None,
+                live_video: false,
+            });
+            drain = drain.or(Some(prompt_command));
         }
         drain
     }
@@ -42114,6 +42189,87 @@ now analyzing the bus module"
         );
     }
 
+    // ---- OUTER_LOOP_REVIEW #30: startup prompt exactly-once state machine ----
+
+    fn minimal_hydrate_result(session_id: &SessionKey) -> SessionHydrateResult {
+        serde_json::from_value(serde_json::json!({
+            "session_id": session_id.0,
+            "cursor": {"stream": "session", "seq": 1},
+        }))
+        .expect("minimal hydrate result decodes")
+    }
+
+    /// Hydrate completion with an armed startup prompt emits exactly ONE
+    /// turn/start and latches; a second hydrate (e.g. after a post-dispatch
+    /// reconnect) never re-sends.
+    #[test]
+    fn startup_prompt_dispatches_once_after_hydrate() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.startup_prompt_pending = Some("fix the flaky test".into());
+
+        let follow_up = store.apply_client_event(ClientEvent::SessionHydrate(
+            minimal_hydrate_result(&session_id),
+        ));
+        let Some(AppUiCommand::SubmitPrompt(params)) = follow_up else {
+            panic!("armed startup prompt must emit a turn/start after hydrate");
+        };
+        assert_eq!(params.session_id, session_id);
+        assert!(
+            matches!(&params.input[0], InputItem::Text { text } if text == "fix the flaky test")
+        );
+        assert!(store.state.startup_prompt_pending.is_none());
+        assert!(store.state.startup_prompt_dispatched);
+
+        // Post-dispatch reconnect re-hydrate: no re-send.
+        let again = store.apply_client_event(ClientEvent::SessionHydrate(minimal_hydrate_result(
+            &session_id,
+        )));
+        assert!(
+            !matches!(again, Some(AppUiCommand::SubmitPrompt(_))),
+            "post-dispatch re-hydrate must not re-send the startup prompt"
+        );
+    }
+
+    /// The arm SURVIVES a hydrate that never dispatched (pre-dispatch
+    /// connection death → #27 replay → fresh hydrate): a re-hydrate with the
+    /// arm still set dispatches (at-least-once until dispatched).
+    #[test]
+    fn startup_prompt_arm_survives_until_dispatch() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.startup_prompt_pending = Some("ping".into());
+        // Simulate "previous hydrate completed but the dispatch never reached
+        // the wire": clear the latch, keep the arm (the #27 replay re-arms
+        // nothing — the arm was never consumed because the emit is what
+        // consumes it; this test pins that an unconsumed arm dispatches on
+        // the NEXT hydrate).
+        store.state.startup_prompt_dispatched = false;
+
+        let follow_up = store.apply_client_event(ClientEvent::SessionHydrate(
+            minimal_hydrate_result(&session_id),
+        ));
+        assert!(matches!(follow_up, Some(AppUiCommand::SubmitPrompt(_))));
+    }
+
+    /// Readonly state must never emit the startup prompt turn.
+    #[test]
+    fn startup_prompt_never_fires_when_readonly() {
+        let mut store = protocol_store_with_autonomy();
+        let session_id = SessionKey("local:test".into());
+        store.state.readonly = true;
+        store.state.startup_prompt_pending = Some("should not send".into());
+        let follow_up = store.apply_client_event(ClientEvent::SessionHydrate(
+            minimal_hydrate_result(&session_id),
+        ));
+        assert!(
+            !matches!(follow_up, Some(AppUiCommand::SubmitPrompt(_))),
+            "readonly must not dispatch the startup prompt"
+        );
+        // The arm stays (defensive); the CLI conflict gate is the primary bar.
+        assert!(store.state.startup_prompt_pending.is_some());
+    }
+
     // ---- OUTER_LOOP_REVIEW #20 (ymote P1): latch-free in-flight markers ----
 
     /// Queue eviction must release the evicted hydrate's marker: the bounded
@@ -42158,22 +42314,41 @@ now analyzing the bus module"
     /// result-decode for parity with the /btw and turn/steer arms.
     #[test]
     fn pre_send_rejections_release_hydrate_marker() {
+        // #28a: fixtures come from the SAME constructors the transport
+        // produces with — a wording drift moves both sides together and this
+        // test stays truthful instead of pinning a stale literal.
+        let decode_err = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        let send_err = eyre::eyre!("broken pipe");
         for (code, message) in [
             (
                 "too_many_pending_requests",
-                "UI protocol has 16 pending request(s); refusing to enqueue session/hydrate request".to_string(),
+                crate::transport::pre_send_pending_cap_message(
+                    crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                    16,
+                ),
             ),
             (
                 "transport_send",
-                "failed to send session/hydrate request tui-5: broken pipe".to_string(),
+                crate::transport::transport_send_message(
+                    crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                    "tui-5",
+                    &send_err,
+                ),
             ),
             (
                 "frame_too_large",
-                "encoded session/hydrate request tui-5 is 999999 bytes; max is 262144".to_string(),
+                crate::transport::frame_too_large_message(
+                    crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                    "tui-5",
+                    999999,
+                ),
             ),
             (
                 "invalid_result",
-                "failed to decode UI protocol result for session/hydrate: missing field".to_string(),
+                crate::transport::invalid_result_message(
+                    crate::model::APPUI_METHOD_SESSION_HYDRATE,
+                    &decode_err,
+                ),
             ),
         ] {
             let (mut store, session_id) = phantom_in_progress_store();
