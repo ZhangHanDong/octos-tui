@@ -194,10 +194,10 @@ OctoLoop 把一个长程任务拆给两圈 agent 加一个人,三者模型档位
 | 2 | 交付物 | `peers/<slug>/result.md`(frontmatter schema) | 每轮交付的权威回执,单写者契约 |
 | 3 | 权威账本 | `goal-ledgers/<goal_id>` | durable,重启幸存,goal 状态的唯一事实源 |
 | 4 | 求助 | escalation(park 于 approval/question) | 分级升级,见 R3 |
-| 5 | 代码 | git log / diff | 审查对象,原子 commit 即既成事实 |
-| 6 | **主动问询(MCP 第五信道)** | `octoscode olp-mcp-serve` 子命令 | 内环 turn 内**同步**问外环,见下 |
+| 5 | **主动问询(MCP)** | `octoscode olp-mcp-serve` 子命令 | 内环 turn 内**同步**问外环,见下(绰号"第五信道"沿用历史序数:上行前四信道+MCP=五;"代码"信道系后加入,现排第 6 行) |
+| 6 | 代码 | git log / diff | 审查对象,原子 commit 即既成事实 |
 
-前五条是"外环拉取"模型:内环留下痕迹,外环循事件来读。第六信道
+前四条与第 6 行代码信道是"外环拉取"模型:内环留下痕迹,外环循事件来读。第 5 行的主动问询信道(绰号"第五信道")
 (#31 落地,纯 Rust 实现,无 Python 依赖)方向相反——**内环主动推**:
 
 - **挂载方式**:profile 的 `config.mcp_servers` 指向 octoscode 可执行
