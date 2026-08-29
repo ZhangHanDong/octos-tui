@@ -113,7 +113,68 @@ skill 卡的模式 inner 要求按任务形态选内环形态;三档各有定位
 任何形态都要遵守:黑板 ACK 定式、工作区共存与树主权、诚实验证声明
 (verified/partially/unverified)——规则见机制篇(下)。
 
-## 5. 多模型 lane 配置
+## 5. goal 模式与 peer 并行上手
+
+内环三形态(§4)解决"单个 agent 怎么跑",本节解决"一个目标怎么拆给
+多个 peer 并行跑"——goal 是跨回合的目标外壳,peer 是受派干活的车道
+工人。状态机与生命周期原理见机制篇(下)。
+
+### 5.1 开一个 goal
+
+两条入口,效果一致:
+
+- **TUI 会话内**:`/goal <目标描述>`——goal 绑定当前会话,goal keeper
+  跨回合推进,直到完成或中止。
+- **master 侧脚本**:`goal_create`,建立 goal 对象(objective 必填,
+  可选 token 预算;状态从 active 起)。
+
+经验:goal 数值保持**每会话一个在途**——历史会话残留的未收口 goal
+会以 blocked 之姿拦截新 goal_create(见 §7 坑位),开新目标前先收旧。
+
+### 5.2 派 peer:peer_handoff 与 model 车道
+
+`peer_handoff` 把一份自包含任务书交给一个 peer,关键字段:
+
+- **`name`**:peer 名,必须唯一(同名会踩车)。
+- **`brief`(任务书)**:**自包含**——peer 看不到你的会话上下文,
+  仓库路径、分支、验收标准、素材权威源都要写进任务书本身。
+- **`model`**:车道参数,值是 sub_provider key(如 `zai`/`kimi`),
+  让不同 peer 跑不同模型车道。**未配置的 key 回退主道并出 model_note
+  警告**——看到警告先查 `~/.octos/profiles/<id>.json` 的
+  sub_providers(配法见 §5)。车道解析语义细节见机制篇(下)。
+- **worktree 围栏**:多 goal 并行时各 peer 在独立 worktree 干活,
+  防止两个目标在同一棵树撞分支——这是 R4b 的自动落地(见机制篇)。
+
+### 5.3 观察:三只眼睛
+
+- **TUI agents 栏**:`Alt+P` 打开,`Ctrl+L` peek——实时看各 peer
+  状态与车道。
+- **CLI**:`octos peer list` 列 peer(含 model 车道);`octos goal
+  status --goal <id>` 看 goal 状态与 token 消耗。
+- **事件流**:`tail -f .../data/events.jsonl` 可见 peer_staged
+  (含 model_lane)与 goal_transition 事件(见 QUICKSTART)。
+
+### 5.4 收口正解与坑位
+
+goal 达成后**必须显式收口**,否则变僵尸拦截后续 goal:
+
+- **会话内 `/goal stop`**——一步到位的正解(goal 转 complete)。
+- **离线 CLI** `octos goal archive/reopen`:**仅在 serve 不在跑时
+  可靠**。坑位:serve 存活时,其 live cache 稍后持久化会把离线归档
+  **反盖**回去(账本时间线实证:archived 被 blocked 覆盖)——此时
+  一律走会话内 /goal stop 或在线 RPC,别用离线命令。
+
+### 5.5 实战:本书自己就是样例
+
+- **#33 双车道成书**:master 恰派两 peer,`model=zai`(guide-part1-zai)
+  与 `model=kimi`(guide-part2-kimi)各写一篇,汇稿成
+  docs/OCTOLOOP_GUIDE.md——peer_handoff 显式车道参数的端到端实证。
+- **#34 goal_07 端到端**:goal_create 建立 goal_07 → 单 commit 完成
+  修订 → 收口 complete,token 消耗与零残留可查——goal 通道从建立到
+  收口的全链样例。
+
+
+## 6. 多模型 lane 配置
 
 主对话车道配在 `~/.octos/profiles/<id>.json` 的 `config.llm`(发现:
 `ls ~/.octos/profiles/`),逐字段:
@@ -141,7 +202,7 @@ skill 卡的模式 inner 要求按任务形态选内环形态;三档各有定位
 **断供降级体感**:断供发生时对话不停——状态栏闪一次降级提示,响应继续;
 恢复后主道自动回归,无需重启。
 
-## 6. 常见故障速查
+## 7. 常见故障速查
 
 从 QUICKSTART §6 扩充,按"看到什么 → 为什么 → 怎么办"排列:
 
@@ -302,7 +363,110 @@ R4 管"同树多写者",R4b 管"多 goal 撞同一棵树",是系统默认机制�
 语义变更必须升版本**。新 session 首轮复述协议头即完成握手(金丝雀),
 版本不符立即可见,不会静默按旧语义协作。
 
-## 3. 五项引擎机制
+## 3. goal 状态机与 peer 生命周期
+goal 与 peer 是内环长程执行的两个主对象:goal 是任务容器,peer 是被
+派出去干活的并行 worker。本节面向贡献者说清两者的状态机、派工时的
+车道解析、交付回执契约,以及 goal 状态的存储拓扑(运维排障必读)。
+上手操作面(开 goal、派 peer、观察、收口)见指南篇(上),本节不重复。
+
+### 3.1 goal 状态机
+
+goal 有五个状态,语义各别:
+
+| 状态 | 含义 |
+|---|---|
+| `active` | 活 goal:goal keeper 正在跨 turn 推进,ledger 持续记账 |
+| `blocked` | 被阻塞:通常是 escalation 按 R3 分级 park 待裁决(外环或 operator 缺席时保持此态,不强行推进) |
+| `complete` | 目标达成并收口,账本保留 |
+| `archived` | 归档:从在途视野移出,账本仍在、可 reopen 回 active(离线在档操作的可靠性坑见 §X.5) |
+| `budget_exhausted` | 预算耗尽的**独立中间态**——不是失败,是"有名字的、可恢复的现场"(由机制④转入,见下) |
+
+状态转移由 goal keeper 驱动:它是 master 侧跨 turn 的推进者——每个
+turn 结束时记账、判断进展、决定下一步,与单个 turn 的生命周期解耦。
+keeper 的节拍由两处引擎机制托底,本节只指路不展开:
+
+- turn 之间**零延迟自动续拍**由 turn-continuation 钩子完成
+  (见 §4 五项机制⑤)——keeper 不等外环心跳即可推进;
+- 预算耗尽时的现场钉存(wip commit + 阶段版 result)与
+  `budget_exhausted` 转态由预算 checkpoint 机制完成
+  (见 §4 五项机制④)——`blocked` 与 `budget_exhausted`
+  刻意分立:前者等裁决,后者等续算,处置路径不同。
+
+### 3.2 peer 生命周期
+
+peer 是 master 经 `peer_handoff` 派出的并行执行单元,生命周期:
+
+```
+staged → working → landed
+                    ↘ failed
+                    ↘ parked(仅 serve 重启孤儿,可恢复)
+```
+
+- **staged**:handoff 落档——brief、车道(见 §X.3)、围栏决策
+  (R4b)随派工单持久化,peer 待开工。
+- **working**:peer 在跑,事件流持续产出,可经 TUI agents 栏与
+  `octos peer list` 观察(操作见指南篇(上))。
+- **landed**:交付被 master 采认、并入主线——peer 的产出只有经
+  采认才算落地。
+- **failed**:真失败(与"重启导致的绑定丢失"刻意区分)。
+- **parked**:serve 重启造成的 `peer_handoff` 孤儿转入的可恢复态,
+  工作现场保留、可续跑。语义与判别标准见 §4 五项机制②
+  (孤儿 peer 恢复态),本节不重复。
+
+### 3.3 peer_handoff 的 model 车道解析语义
+
+`peer_handoff` 的 `model` 参数是 sub_providers 车道 key(模板与选道
+标准见协议附录 B),解析按三步:
+
+1. **key 校验**:查 profile 的 sub_providers,命中则按该车道挂载
+   模型;
+2. **落档**:命中的车道记录**随 brief 一起持久化**进派工单——
+   peer 重启恢复(parked 续跑)后仍在原车道,车道不是一次性提示;
+3. **未命中 key**:**回退主道**(primary)并记一条 `model_note`
+   警告——派发不被拒绝,但车道漂移在板面可见,便于事后审计
+   "实际跑在哪条道"。
+
+实战验证见黑板 #33:zai / kimi 双车道各一 peer 全程在线,事件流
+`model_lane` 字段可证。
+
+### 3.4 result.md 单写者契约与 frontmatter v1 六字段
+
+peer 的每轮交付只经 `peers/<slug>/result.md` 写回:**单写者契约**——
+该文件的权威写者只有 peer 本人,杜绝双写竞争,goal ledger 的
+findings 因此干净可审计。其 YAML frontmatter v1 恰为六字段:
+
+`slug` · `outcome` · `updated_unix` · `turn` · `verified` · `protocol`
+
+字段语义、类型与取值域以协议文档附录 A 为**唯一事实源**,本节只列
+名单、不复述——消费侧约定(未知字段必须忽略,forward compatibility)
+同见附录 A。
+
+### 3.5 goal 状态存储拓扑(运维视角)
+
+goal 状态有三个面,各自的权威角色不同,混淆它们是排障迷路的根源:
+
+| 面 | 角色 |
+|---|---|
+| supervisor 事件流 | **唯一重启恢复源**:serve 启动只从这里重放、水合内存态 |
+| 运行中 serve 内存 `state.goals` | **会落盘的 live cache**:运行期一切 goal 判断与推进直接读写它,并随 `persist_goal_state` 写回事件流 |
+| per-goal SQLite ledger(`goal-ledgers/<goal_id>`) | **读面**:`octos goal status` 等查询直接读它,不参与状态裁定 |
+
+**竞争坑(必读)**:serve 存活时,离线 CLI 的归档/重开
+(`octos goal archive/reopen`)只向 supervisor 事件流 append,**不能
+原子更新或失效存活进程的 live cache**——存活 serve 随后把内存旧态
+落盘,会以更新事件**反盖**离线归档(黑板 #34 外环(codex)对抗复审
+批注实证,账本行反盖行可见)。因此:
+
+- **离线归档/重开仅在 serve 不在跑时可靠**;
+- serve 存活时的收口正解是会话内操作(如 `/goal stop`),操作面见
+  指南篇(上)。
+
+> 注:此前"会话记录水合复活"的归因表述**已作废**——源码级结论
+> (黑板 #34 codex 批注,主审已采认)是"离线 operator transition 与
+> live writer 缺少串行化/同步",与本节拓扑表一致;上游修法方向为
+> "serve 存活走在线 RPC / epoch-CAS 防反盖"。
+
+## 4. 五项引擎机制
 
 以下五项是 serve/引擎侧的自治能力(语义与 `docs/OCTOLOOP_FEATURES.md`
 32-r1 核准版一致),全部默认开,无需配置即可受益。
@@ -348,7 +512,7 @@ goal 仍活着,下一个 turn 立刻接上,不等外环唤醒节拍。体感:goa
 开 + 空闲即注入续拍令,3 次无板面进展升级外环并自停),不是引擎机制
 ——引擎钩子落地后,哨兵降级为兜底。
 
-## 4. `startup --prompt`:恰一次语义
+## 5. `startup --prompt`:恰一次语义
 
 `octoscode --prompt "任务"` 让启动即开工(#30),其语义可以一句话说清:
 **引导(onboarding)完成后,恰好自动发一次 turn/start**。
