@@ -19,7 +19,8 @@ bash scripts/olp-init.sh          # 铺脚手架(黑板/信箱/监视器接线)
 
 脚本按需询问(不假设环境);完成后逐项核对
 `docs/OLP_QUICKSTART.md` §1 环境依赖清单(octos/octoscode 可执行、
-herdr 或 tmux、外环模型 CLI)。任何缺口按 §6 故障速查处理,再跑
+herdr 或 tmux、外环模型 CLI)。herdr 来源与分支钉在 §1 依赖表
+(hagency-org/herdr,octoscode 识别当前在 feat/octoscode-agent 分支)。任何缺口按 §6 故障速查处理,再跑
 §5 冒烟验证(两分钟)。**全部发现式:本卡零硬编码路径**,一切以
 QUICKSTART 的发现命令为准。
 
