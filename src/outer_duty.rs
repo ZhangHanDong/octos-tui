@@ -1,9 +1,12 @@
 //! `octoscode outer-duty` (OUTER_LOOP_REVIEW #38 / #38-r1): the kernel lock
 //! behind multi-outer primary-reviewer authority — a per-project,
-//! session-lifetime OS-exclusive lock. Unix-only by adjudication (#38-r1):
-//! single-machine `flock` semantics; NFS out of scope; Windows LockFileEx
-//! support is a separate follow-up entry. The module does not compile on
-//! non-Unix targets by design (honest shrink, per the countersign).
+//! session-lifetime OS-exclusive lock. Linux-only by adjudication
+//! (#38-r3/r4): single-machine `flock` + PR_SET_PDEATHSIG + /proc
+//! semantics; NFS out of scope; non-Linux builds route the subcommand to
+//! an explicit unsupported error (see `src/cmd/mod.rs`); Windows
+//! LockFileEx support is a separate follow-up entry. The module does not
+//! compile on non-Linux targets by design (honest shrink, per the
+//! countersign).
 //!
 //! Lifecycle binding (#38-r2 adjudicated: GUARDIAN death coupling): the
 //! wrapper is the sole fd holder (CLOEXEC stays set — the lock never leaks
@@ -111,7 +114,7 @@ fn open_lock_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
 /// Tighten permissions on a possibly pre-existing (e.g. 0644) file/dir so a
 /// permissive umask or an old artifact cannot leave wide-open state behind.
 /// Fail-closed: a failed tightening is an ERROR, not silently swallowed.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn tighten(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
@@ -340,7 +343,7 @@ pub fn spawn_holder_child(command: &[String]) -> Result<std::process::Child> {
 
 /// /proc/<pid>/stat field 22 (starttime in clock ticks since boot) — a
 /// PID-reuse-proof locator for operators; 0 when unreadable.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn process_starttime(pid: u32) -> u64 {
     let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => stat,
