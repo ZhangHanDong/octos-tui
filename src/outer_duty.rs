@@ -111,36 +111,46 @@ fn open_lock_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// The permission-tightening operation, as an injectable seam (#38-r7):
-/// production default is the real chmod (zero behavior change); tests may
-/// install a failing implementation to prove fail-closed propagation.
-pub type TightenResult = eyre::Result<()>;
-pub type TightenFn = fn(&Path, u32) -> TightenResult;
-
-#[cfg(target_os = "linux")]
-thread_local! {
-    /// Test-injectable override; `None` in production (real chmod runs).
-    pub static TIGHTEN_OVERRIDE: std::cell::RefCell<Option<TightenFn>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(target_os = "linux")]
-pub fn set_tighten_override(f: Option<TightenFn>) {
-    TIGHTEN_OVERRIDE.with(|slot| *slot.borrow_mut() = f);
-}
-
 /// Tighten permissions on a possibly pre-existing (e.g. 0644) file/dir so a
 /// permissive umask or an old artifact cannot leave wide-open state behind.
 /// Fail-closed: a failed tightening is an ERROR, not silently swallowed.
+/// #38-r8: the seam is PRIVATE — `tighten_with` takes the chmod operation
+/// as a parameter (production passes the real chmod; unit tests under
+/// cfg(test) pass a failing closure). No global/public hook remains.
 #[cfg(target_os = "linux")]
 fn tighten(path: &Path, mode: u32) -> Result<()> {
-    if let Some(injected) = TIGHTEN_OVERRIDE.with(|slot| *slot.borrow()) {
-        return injected(path, mode);
-    }
-    real_tighten(path, mode)
+    tighten_with(path, mode, real_tighten)
 }
 
-/// The production chmod (the injectable seam's default path).
+/// The parameterized boundary: apply `op` unless a `cfg(test)` injection
+/// replaces it (test-only thread-local, invisible in production builds).
+#[cfg(target_os = "linux")]
+fn tighten_with(path: &Path, mode: u32, op: fn(&Path, u32) -> Result<()>) -> Result<()> {
+    #[cfg(test)]
+    {
+        if let Some(injected) = TIGHTEN_TEST_OVERRIDE.with(|slot| *slot.borrow()) {
+            return injected(path, mode);
+        }
+    }
+    op(path, mode)
+}
+
+// Test-only injection point (cfg(test): absent from production builds).
+#[cfg(test)]
+type TightenOp = fn(&Path, u32) -> Result<()>;
+
+#[cfg(test)]
+thread_local! {
+    static TIGHTEN_TEST_OVERRIDE: std::cell::RefCell<Option<TightenOp>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_tighten_test_override(f: Option<TightenOp>) {
+    TIGHTEN_TEST_OVERRIDE.with(|slot| *slot.borrow_mut() = f);
+}
+
+/// The production chmod.
 #[cfg(target_os = "linux")]
 fn real_tighten(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -382,4 +392,85 @@ fn process_starttime(pid: u32) -> u64 {
         .nth(19)
         .and_then(|f| f.parse().ok())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tighten_boundary_tests {
+    use super::*;
+
+    /// #38-r8 ①: the boundary unit test lives WITH the seam (cfg(test)):
+    /// inject an always-EPERM closure and prove (a) execution
+    /// reachability, (b) error context carries the EXACT path and mode,
+    /// (c) the production default is the real chmod.
+    #[test]
+    fn tighten_with_injected_eperm_propagates_exact_path() {
+        use std::cell::Cell;
+        thread_local! {
+            static CALLS: Cell<u32> = const { Cell::new(0) };
+        }
+        fn injected(path: &Path, mode: u32) -> Result<()> {
+            CALLS.with(|c| c.set(c.get() + 1));
+            Err(eyre::eyre!(
+                "failed to tighten {} to {:o} (injected EPERM)",
+                path.display(),
+                mode
+            ))
+        }
+        set_tighten_test_override(Some(injected));
+        struct Guard;
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                set_tighten_test_override(None);
+            }
+        }
+        let _g = Guard;
+
+        let tmp = std::env::temp_dir().join(format!("tighten-b-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        // ② precision: the dir tightening pins EXACTLY 0700...
+        let err = match tighten_with(&tmp, 0o700, real_tighten) {
+            Err(report) => format!("{report:#}"),
+            Ok(()) => panic!("injected EPERM must fail"),
+        };
+        let calls = CALLS.with(|c| c.get());
+        assert!(calls > 0, "execution reachability: seam called {calls}x");
+        assert!(err.contains("failed to tighten"), "context: {err}");
+        assert!(
+            err.contains("to 700"),
+            "dir tightening pins exactly 0700: {err}"
+        );
+        assert!(
+            err.contains(tmp.to_str().unwrap()),
+            "error carries the exact path: {err}"
+        );
+
+        // ...and the lockfile tightening pins EXACTLY 0600.
+        let lock = tmp.join("probe.lock");
+        std::fs::write(&lock, b"x").unwrap();
+        let err = match tighten_with(&lock, 0o600, real_tighten) {
+            Err(report) => format!("{report:#}"),
+            Ok(()) => panic!("injected EPERM must fail"),
+        };
+        assert!(
+            err.contains("to 600"),
+            "lockfile tightening pins exactly 0600: {err}"
+        );
+        assert!(
+            err.contains(lock.to_str().unwrap()),
+            "error carries the exact lock path: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The production default path (no injection) performs the real chmod.
+    #[test]
+    fn tighten_default_is_real_chmod() {
+        let tmp = std::env::temp_dir().join(format!("tighten-d-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(tighten_with(&tmp, 0o700, real_tighten).is_ok());
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&tmp).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "real chmod ran (0700 exactly)");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
