@@ -188,9 +188,17 @@ fn duty_two_contenders_exactly_one_wins() {
         )
     };
     warmup();
+    // Capture both contenders' stderr to files (never /dev/null): the
+    // loser's diagnostics must be the CONTENTION message itself — some
+    // other failure (crash, usage error) must never masquerade as it.
+    let err_a = env.0.join("stderr-c1");
+    let err_b = env.0.join("stderr-c2");
+    let spin_with_err = |sig: &str, err: &std::path::Path| {
+        format!("{spin} 2>{err}", spin = spin(sig), err = err.display(),)
+    };
     let mut a = std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(spin("c1"))
+        .arg(spin_with_err("c1", &err_a))
         .env("HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -198,7 +206,7 @@ fn duty_two_contenders_exactly_one_wins() {
         .unwrap();
     let mut b = std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(spin("c2"))
+        .arg(spin_with_err("c2", &err_b))
         .env("HOME", env.home())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -215,11 +223,15 @@ fn duty_two_contenders_exactly_one_wins() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(hel, "a holder must be observed HELD");
-    let mut loser = false;
+    let mut loser: Option<char> = None;
     for _ in 0..1200 {
         match (a.try_wait().unwrap(), b.try_wait().unwrap()) {
-            (Some(_), None) | (None, Some(_)) => {
-                loser = true;
+            (Some(_), None) => {
+                loser = Some('a');
+                break;
+            }
+            (None, Some(_)) => {
+                loser = Some('b');
                 break;
             }
             (Some(_), Some(_)) => break,
@@ -228,7 +240,7 @@ fn duty_two_contenders_exactly_one_wins() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        loser,
+        loser.is_some(),
         "the contention loser must settle while the winner holds"
     );
     let _ = std::fs::remove_file(&stop);
@@ -237,6 +249,26 @@ fn duty_two_contenders_exactly_one_wins() {
     let codes = [a_out.code(), b_out.code()];
     let winners = codes.iter().filter(|c| **c == Some(0)).count();
     assert_eq!(winners, 1, "exactly one contender exits 0 (got {codes:?})");
+    // The LOSER's stderr must be the lock-contention diagnostic itself:
+    // non-zero exit + "HELD"/"contention" wording, never some other fault.
+    if let Some(who) = loser {
+        let (loser_code, loser_err) = if who == 'a' {
+            (
+                a_out.code(),
+                std::fs::read_to_string(&err_a).unwrap_or_default(),
+            )
+        } else {
+            (
+                b_out.code(),
+                std::fs::read_to_string(&err_b).unwrap_or_default(),
+            )
+        };
+        assert_ne!(loser_code, Some(0), "loser exited non-zero");
+        assert!(
+            loser_err.contains("HELD by another live holder") || loser_err.contains("contention"),
+            "loser stderr must be the contention diagnostic, got: {loser_err}"
+        );
+    }
     for _ in 0..600 {
         if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
             break;
@@ -264,6 +296,7 @@ fn duty_wrapper_death_kills_agent_and_releases() {
     wait_started(&env);
     let (pid, start) = read_sidecar_child(&env);
     assert!(pid > 0, "sidecar must record the real child pid");
+    assert!(start > 0, "sidecar must record a real child starttime (>0)");
     assert!(proc_alive_with_start(pid, start), "agent alive before kill");
     wrapper.kill().unwrap();
     let _ = wrapper.wait();
@@ -328,7 +361,7 @@ fn proc_alive_with_start(pid: u32, starttime: u64) -> bool {
         .nth(19)
         .and_then(|f| f.parse().ok())
         .unwrap_or(0);
-    starttime == 0 || start == starttime
+    start != 0 && start == starttime
 }
 
 /// 契约 2b(#38-r3/r4:grandchild 活性观测): the agent exits while a
@@ -673,40 +706,92 @@ fn release_via_sentinel(env: &TempHome) {
 /// root-bypassed chmod. Skipped gracefully when unshare is unavailable.
 #[test]
 fn duty_tighten_failure_propagates_as_error() {
-    // Probe: can we create an unshare-isolated EPERM scenario here?
+    // #38-r6: tighten-failure fail-closed with an EXPLICIT, reachable
+    // scenario + honest skip. Primary scenario (unwritable HOME): the
+    // duty dir cannot even be created — acquire must surface ERROR
+    // before any lock exists, with the octoscode-specific context.
+    let env = TempHome::new("tighten-fail");
+    let project = env.project();
+    let ro_home = env.0.join("ro-home");
+    std::fs::create_dir_all(&ro_home).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&ro_home, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let out = duty(&ro_home)
+        .args([
+            "hold",
+            "--project",
+            project.to_str().unwrap(),
+            "--signature",
+            "s",
+            "--duties",
+            "d",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "acquire under an unwritable HOME must fail (got success)"
+    );
+    assert!(
+        stdout.is_empty() || stdout == "ERROR",
+        "stdout stays single-state, got {stdout:?}"
+    );
+    assert!(
+        stderr.contains("duty lock dir") || stderr.contains("Permission denied"),
+        "the octoscode-specific create/tighten context is the cause: {stderr}"
+    );
+    std::fs::set_permissions(&ro_home, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Secondary scenario (foreign-owner chmod EPERM), attempted only when
+    // the host supports a multi-line uid_map delegation: EXPLICIT skip
+    // otherwise — never a silent pass.
     let probe = std::process::Command::new("unshare")
         .args(["--map-root-user", "-r", "--", "true"])
         .status();
-    match probe {
-        Ok(st) if st.success() => {}
-        _ => {
-            eprintln!("skipping: unshare user-namespace not available on this host");
-            return;
-        }
+    let ns_ok = matches!(probe, Ok(st) if st.success());
+    let multi_map = std::process::Command::new("unshare")
+        .args([
+            "--user",
+            "--",
+            "/bin/sh",
+            "-c",
+            "true; chown 1:1 /proc/self/uid_map 2>/dev/null; exit 0",
+        ])
+        .output();
+    let map_capable = multi_map
+        .map(|o| {
+            let e = String::from_utf8_lossy(&o.stderr);
+            // Direct probe: does an unprivileged userns allow writing a
+            // two-line uid_map? Only with newuidmap + /etc/subuid delegation.
+            std::path::Path::new("/usr/bin/newuidmap").exists()
+                && o.status.success()
+                && !e.contains("not found")
+        })
+        .unwrap_or(false);
+    if !(ns_ok && map_capable) {
+        eprintln!(
+            "SKIP (explicit): foreign-owner tighten scenario needs userns + newuidmap; \
+             host has ns={ns_ok} multi-map={map_capable}"
+        );
+        return;
     }
-    let env = TempHome::new("tighten-fail");
-    let project = env.project();
     let duty_dir = env.home().join(".octos").join("outer").join("duty");
     std::fs::create_dir_all(&duty_dir).unwrap();
     let lock = env.lock_path();
     std::fs::write(&lock, b"pre").unwrap();
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
-    // Real DAC denial WITHOUT root: inside `unshare --map-root-user` the
-    // mapped uid 0 maps to our outer uid, and a file whose owner is a
-    // DIFFERENT outer uid is untightenable there. Create the owner
-    // asymmetry INSIDE the namespace: setuid(1) drops to uid 1 (daemon),
-    // create the lock file as daemon, then run the duty binary — still
-    // inside the namespace — as our mapped uid, for which the file is
-    // foreign: chmod → EPERM, acquire must surface ERROR.
+    let reached = env.0.join("binary-reached");
     let script = format!(
-        "set -- {bin}; \"$1\" outer-duty check --project {p} >/dev/null 2>&1 || true; \
-         setpriv --reuid=1 --regid=1 --clear-groups touch {lock} && \
-         setpriv --reuid=1 --regid=1 --clear-groups chmod 0644 {lock} && \
-         \"$1\" outer-duty hold --project {p} --signature s --duties d -- true",
+        "chown 1:1 {lock}; chmod 0644 {lock}; \
+         {bin} outer-duty hold --project {p} --signature s --duties d -- true; \
+         rc=$?; echo reached >> {reached}; exit $rc",
         bin = bin().display(),
         p = project.display(),
         lock = lock.display(),
+        reached = reached.display(),
     );
     let out = std::process::Command::new("unshare")
         .args(["--map-root-user", "-r", "--", "/bin/sh", "-c", &script])
@@ -715,21 +800,29 @@ fn duty_tighten_failure_propagates_as_error() {
         .unwrap_or_else(|e| panic!("unshare run failed: {e}"));
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    let setpriv_missing = stderr.contains("setpriv: not found") || stderr.contains("No such file");
-    if setpriv_missing {
-        eprintln!("skipping: setpriv not available on this host");
+    // Setup integrity: if the chown-1:1 itself failed (single-line uid_map
+    // host cannot map uid 1), the foreign-owner scenario is UNREACHABLE —
+    // an explicit skip, never a silent pass nor a spurious failure.
+    if stderr.contains("chown:") {
+        eprintln!(
+            "SKIP (explicit): foreign-owner setup unreachable on this host (chown 1:1 in single-map userns): {stderr}"
+        );
         return;
     }
     assert!(
+        reached.exists(),
+        "scenario integrity: the duty binary must be reached (stderr={stderr:?})"
+    );
+    assert!(
         !out.status.success(),
-        "acquire on a foreign-owned (untightenable) lock must fail; stdout={stdout:?} stderr={stderr:?}"
+        "foreign-owned lock acquire must fail"
     );
     assert!(
         stdout.is_empty() || stdout == "ERROR",
         "stdout stays single-state, got {stdout:?}"
     );
     assert!(
-        stderr.to_lowercase().contains("tighten") || stderr.to_lowercase().contains("failed"),
-        "the tightening failure is the reported cause: {stderr}"
+        stderr.contains("failed to tighten"),
+        "the octoscode tighten error context must be the reported cause: {stderr}"
     );
 }
