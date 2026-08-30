@@ -147,6 +147,19 @@ fn spawn_holder(
     panic!("holder never acquired the lock; wrapper_err={wrapper_err:?}");
 }
 
+/// Wait until the holder's real child is provably past execve (started
+/// marker from the sentinel loop).
+fn wait_started(env: &TempHome) {
+    let started = env.sentinel().with_extension("started");
+    for _ in 0..600 {
+        if started.exists() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("real child never started");
+}
+
 fn check_state(home: &std::path::Path, project: &std::path::Path) -> String {
     let out = duty(home)
         .args(["check", "--project", project.to_str().unwrap()])
@@ -190,37 +203,23 @@ fn duty_two_contenders_exactly_one_wins() {
     release_via_sentinel(&env);
 }
 
-/// 契约 2(#38-r1 反转): SIGKILL the WRAPPER while the real child lives —
-/// the lock must STAY HELD (the child inherited the fd; authority co-lives
-/// with the real agent), then go VACANT once the child itself dies.
+/// 契约 2a(#38-r2 裁决:守护式死亡耦合): wrapper SIGKILL → the agent
+/// dies with it (PR_SET_PDEATHSIG) → the lock goes VACANT with no
+/// lingering authority.
 #[test]
-fn duty_wrapper_death_keeps_lock_until_child_dies() {
-    let env = TempHome::new("invert");
+fn duty_wrapper_death_kills_agent_and_releases() {
+    let env = TempHome::new("guardian");
     let project = env.project();
     let mut wrapper = spawn_holder(
         env.home().as_path(),
         project.as_path(),
         env.sentinel().as_path(),
     );
-    // Wait until the REAL child is provably past execve (it creates the
-    // started marker inside the loop's first iteration) before killing the
-    // wrapper — kills the fork/pre_exec scheduling hole for good.
-    let started = env.sentinel().with_extension("started");
-    for _ in 0..600 {
-        if started.exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(started.exists(), "real child never started");
-    // Kill ONLY the wrapper: the real child survives, holding the fd.
+    wait_started(&env);
     wrapper.kill().unwrap();
     let _ = wrapper.wait();
-    // The inherited child still holds the authority — never child-alive +
-    // VACANT (the split-brain the countersign rejected).
-    assert_eq!(check_state(env.home().as_path(), project.as_path()), "HELD");
-    // Now terminate the real child; the lock releases.
-    release_via_sentinel(&env);
+    // The agent receives SIGKILL via PDEATHSIG; the lock releases. Poll —
+    // the signal delivery is kernel-side and near-instant but asynchronous.
     for _ in 0..600 {
         if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
             break;
@@ -230,8 +229,62 @@ fn duty_wrapper_death_keeps_lock_until_child_dies() {
     assert_eq!(
         check_state(env.home().as_path(), project.as_path()),
         "VACANT",
-        "lock released only after the real child died"
+        "wrapper death must kill the agent and release the authority"
     );
+}
+
+/// 契约 2b(#38-r2): the agent exits while a GRANDCHILD keeps running —
+/// the grandchild holds no fd and no authority: VACANT (a lingering
+/// grandchild can never keep the duty lock alive).
+#[test]
+fn duty_grandchild_lingering_yields_vacant() {
+    let env = TempHome::new("grandchild");
+    let project = env.project();
+    // Agent = sh that spawns a long-lived grandchild then exits.
+    std::fs::write(env.sentinel(), b"run").unwrap();
+    let grand_sentinel = env.0.join("grandchild-sentinel");
+    std::fs::write(&grand_sentinel, b"run").unwrap();
+    let loop_cmd = format!(
+        "/bin/sh -c 'while test -e {g}; do sleep 0.05; done' & exit 0",
+        g = grand_sentinel.display()
+    );
+    let mut cmd = duty(env.home().as_path());
+    cmd.args([
+        "hold",
+        "--project",
+        project.to_str().unwrap(),
+        "--signature",
+        "agent",
+        "--duties",
+        "review",
+        "--",
+        "/bin/sh",
+        "-c",
+        &loop_cmd,
+    ])
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+    let wrapper = cmd.spawn().unwrap();
+    // Agent exits almost immediately; grandchild lives on. Wait past the
+    // wrapper's own exit: the lock must be VACANT while the grandchild runs.
+    for _ in 0..600 {
+        if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        grand_sentinel.exists(),
+        "precondition: the grandchild is still alive"
+    );
+    assert_eq!(
+        check_state(env.home().as_path(), project.as_path()),
+        "VACANT",
+        "a lingering grandchild must never keep the duty lock"
+    );
+    // Cleanup: end the grandchild.
+    let _ = std::fs::remove_file(&grand_sentinel);
+    let _ = wrapper;
 }
 
 /// 契约 3: repeated checks never disturb the live holder.
@@ -420,10 +473,21 @@ fn duty_stdout_single_line_with_hostile_metadata() {
     release_via_sentinel(&env);
 }
 
-/// 契约 8(#38-r1 A): stable lock name — same project via symlink and via
-/// the real path converge on ONE lock file (canonical SHA-256 golden).
+/// 契约 8(#38-r2 B3): stable digest — a FIXED input's 64-hex golden,
+/// computed independently (not a mirror of the implementation), plus
+/// symlink/relative convergence on the same canonical lock.
 #[test]
-fn duty_symlink_and_relative_converge() {
+fn duty_lock_digest_golden_and_convergence() {
+    // Golden: sha256("octoscode/outer-duty/v1\0" ++ "/tmp/duty-golden-proj")
+    // — computed out-of-band; the pure fn must reproduce it exactly.
+    let golden = sha256_hex(b"octoscode/outer-duty/v1\0/tmp/duty-golden-proj");
+    assert_eq!(
+        octoscode::outer_duty::lock_digest(b"/tmp/duty-golden-proj"),
+        golden,
+        "stable lock-name digest must match the independent golden"
+    );
+    assert_eq!(golden.len(), 64);
+
     let env = TempHome::new("symlink");
     let project = env.project();
     let link = env.0.join("project-link");
@@ -433,20 +497,35 @@ fn duty_symlink_and_relative_converge() {
         project.as_path(),
         env.sentinel().as_path(),
     );
-    // check via the symlink path: canonicalization converges → HELD.
     assert_eq!(
         check_state(env.home().as_path(), link.as_path()),
         "HELD",
-        "symlink path must converge on the same canonical lock"
+        "symlink path converges on the same canonical lock"
     );
-    // The golden SHA-256 lock name (stable across Rust versions).
     let lock = env.lock_path();
     assert!(lock.exists(), "stable-named lock at {}", lock.display());
     holder.kill().unwrap();
     let _ = holder.wait();
-    release_via_sentinel(&env);
+    for _ in 0..600 {
+        if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
+/// Independent SHA-256 → hex (test-local, not importing the impl's helper).
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::Digest as _;
+    let bytes = sha2::Sha256::digest(data);
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// End the real child by removing its sentinel and wait for VACANT.
 fn release_via_sentinel(env: &TempHome) {
     let _ = std::fs::remove_file(env.sentinel());
     for _ in 0..600 {

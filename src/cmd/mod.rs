@@ -46,6 +46,14 @@ where
         Some(Route::OlpMcpServe) => Ok(Some(olp_mcp::run())),
         #[cfg(unix)]
         Some(Route::OuterDuty(args)) => Ok(Some(outer_duty::run(args))),
+        Some(Route::UsageError) => Ok(Some(2)),
+        #[cfg(not(unix))]
+        Some(Route::OuterDuty(_)) => {
+            eprintln!(
+                "outer-duty: unsupported on this platform (Unix-only; see OUTER_LOOP_PROTOCOL R7)"
+            );
+            Ok(Some(2))
+        }
         None => Ok(None),
     }
 }
@@ -61,8 +69,11 @@ enum Route {
     /// outer-loop server (newline-delimited JSON-RPC over stdio).
     OlpMcpServe,
     /// `octoscode outer-duty` — OUTER_LOOP_REVIEW #38: the per-project
-    /// session-lifetime OS-exclusive duty lock (hold/check).
+    /// session-lifetime OS-exclusive duty lock (hold/check). Unix-only.
+    #[cfg(unix)]
     OuterDuty(OuterDutyArgs),
+    /// Argument parse failure already reported; exit 2 without running.
+    UsageError,
     Config(ConfigArgs),
 }
 
@@ -71,7 +82,10 @@ enum Route {
 /// clap's usage strings accurate (e.g. `octoscode doctor`); the subcommand
 /// token is dropped (`skip(2)`) so clap does not see it as a stray positional.
 /// `octoscode outer-duty` args (manual parse; `--` splits the child command).
+/// Strict: unknown flags / missing values / unknown actions are rejected
+/// with exit 2 (route negative golden).
 #[derive(Debug)]
+#[cfg(unix)]
 pub struct OuterDutyArgs {
     pub action: String, // "hold" | "check"
     pub project: String,
@@ -80,7 +94,8 @@ pub struct OuterDutyArgs {
     pub command: Vec<String>,
 }
 
-fn parse_outer_duty_args(rest: &[String]) -> OuterDutyArgs {
+#[cfg(unix)]
+fn parse_outer_duty_args(rest: &[String]) -> Result<OuterDutyArgs, String> {
     let mut action = String::new();
     let mut project = String::new();
     let mut signature = String::new();
@@ -88,35 +103,49 @@ fn parse_outer_duty_args(rest: &[String]) -> OuterDutyArgs {
     let mut command = Vec::new();
     let mut i = 0;
     while i < rest.len() {
-        match rest[i].as_str() {
-            "hold" | "check" if action.is_empty() => action = rest[i].clone(),
-            "--project" if i + 1 < rest.len() => {
-                project = rest[i + 1].clone();
-                i += 1;
-            }
-            "--signature" if i + 1 < rest.len() => {
-                signature = rest[i + 1].clone();
-                i += 1;
-            }
-            "--duties" if i + 1 < rest.len() => {
-                duties = rest[i + 1].clone();
-                i += 1;
-            }
+        let token = rest[i].as_str();
+        match token {
+            "hold" | "check" if action.is_empty() => action = token.to_string(),
             "--" => {
                 command = rest[i + 1..].to_vec();
                 break;
             }
-            _ => {}
+            _ if token.starts_with("--") => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| format!("outer-duty: {token} requires a value"))?;
+                match token {
+                    "--project" if project.is_empty() => project = value.clone(),
+                    "--signature" if signature.is_empty() => signature = value.clone(),
+                    "--duties" if duties.is_empty() => duties = value.clone(),
+                    other => return Err(format!("outer-duty: unknown flag {other}")),
+                }
+                i += 1;
+            }
+            other => {
+                return Err(format!(
+                    "outer-duty: unexpected argument {other:?} (expected hold|check)"
+                ));
+            }
         }
         i += 1;
     }
-    OuterDutyArgs {
+    if action.is_empty() {
+        return Err("outer-duty: action required (hold|check)".into());
+    }
+    if project.is_empty() {
+        return Err("outer-duty: --project is required".into());
+    }
+    if action == "hold" && command.is_empty() {
+        return Err("outer-duty hold: a child command after `--` is required".into());
+    }
+    Ok(OuterDutyArgs {
         action,
         project,
         signature,
         duties,
         command,
-    }
+    })
 }
 
 fn route(argv: &[String]) -> Option<Route> {
@@ -133,7 +162,13 @@ fn route(argv: &[String]) -> Option<Route> {
         "doctor" => Some(Route::Doctor(DoctorCli::parse_from(&sub_argv).into_args())),
         "config" => Some(Route::Config(ConfigCli::parse_from(&sub_argv).into_args())),
         "olp-mcp-serve" => Some(Route::OlpMcpServe),
-        "outer-duty" => Some(Route::OuterDuty(parse_outer_duty_args(&sub_argv[1..]))),
+        "outer-duty" => match parse_outer_duty_args(&sub_argv[1..]) {
+            Ok(args) => Some(Route::OuterDuty(args)),
+            Err(message) => {
+                eprintln!("{message}");
+                Some(Route::UsageError)
+            }
+        },
         _ => unreachable!("guarded by SUBCOMMANDS"),
     }
 }
@@ -236,6 +271,7 @@ mod tests {
 
     /// #38-r1 E: outer-duty route golden — recognized, args parsed, unknown
     /// action rejected, `--` splitting, exit codes.
+    #[cfg(unix)]
     #[test]
     fn route_outer_duty_golden() {
         let argv = |a: &[&str]| -> Vec<String> {
@@ -243,7 +279,8 @@ mod tests {
                 .chain(a.iter().map(|s| s.to_string()))
                 .collect()
         };
-        let args = parse_outer_duty_args(&["check".into(), "--project".into(), "/tmp".into()][..]);
+        let args = parse_outer_duty_args(&["check".into(), "--project".into(), "/tmp".into()][..])
+            .expect("valid check parses");
         assert_eq!(args.action, "check");
         assert_eq!(args.project, "/tmp");
         assert!(args.command.is_empty());
@@ -260,15 +297,53 @@ mod tests {
                 "agent".into(),
                 "--flag".into(),
             ][..],
-        );
+        )
+        .expect("valid hold parses");
         assert_eq!(args.action, "hold");
         assert_eq!(args.signature, "s");
         assert_eq!(args.duties, "d");
         assert_eq!(args.command, vec!["agent", "--flag"]);
+
+        // Negative golden (#38-r2 B4): unknown flag / unknown action /
+        // missing --project / hold without a child → parse error (exit 2).
+        assert!(
+            parse_outer_duty_args(
+                &[
+                    "check".into(),
+                    "--project".into(),
+                    "/tmp".into(),
+                    "--wat".into(),
+                    "x".into()
+                ][..]
+            )
+            .is_err()
+        );
+        assert!(
+            parse_outer_duty_args(&["fly".into(), "--project".into(), "/tmp".into()][..]).is_err()
+        );
+        assert!(parse_outer_duty_args(&["check".into()][..]).is_err());
+        assert!(
+            parse_outer_duty_args(&["hold".into(), "--project".into(), "/tmp".into()][..]).is_err()
+        );
+        // A flag missing its value is an error too.
+        assert!(parse_outer_duty_args(&["check".into(), "--project".into()][..]).is_err());
+
         // Routing: recognized as a subcommand.
         assert!(matches!(
-            route(&argv(&["outer-duty", "check"])),
+            route(&argv(&["outer-duty", "check", "--project", "/tmp"])),
             Some(Route::OuterDuty(_))
+        ));
+        // Unknown flag routes to UsageError (exit 2 path).
+        assert!(matches!(
+            route(&argv(&[
+                "outer-duty",
+                "check",
+                "--project",
+                "/tmp",
+                "--wat",
+                "x"
+            ])),
+            Some(Route::UsageError)
         ));
     }
 

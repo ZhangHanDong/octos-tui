@@ -54,17 +54,24 @@ fn run_hold(args: &OuterDutyArgs, project: &std::path::Path) -> i32 {
             return 1;
         }
     };
-    // Diagnostic sidecar (best-effort; corruption never affects the lock).
-    let _ = outer_duty::write_metadata(&hold.lock_path, &args.signature, &args.duties);
-    // #38-r1 A: the child INHERITS the lock fd (CLOEXEC cleared in pre_exec)
-    // — authority co-lives with the real agent, not just this wrapper.
-    let mut child = match outer_duty::spawn_holder_child(&hold.file, &args.command) {
+    // #38-r2: spawn first (the sidecar wants the child pid), guardian
+    // death-coupled (setpgid + PDEATHSIG) — the wrapper is the sole fd
+    // holder and waits; child exit ends the wrapper and releases the lock.
+    let mut child = match outer_duty::spawn_holder_child(&args.command) {
         Ok(child) => child,
         Err(err) => {
             eprintln!("outer-duty hold: {err:#}");
             return 1;
         }
     };
+    // Diagnostic sidecar (best-effort; corruption never affects the lock);
+    // wrapper+child PID & starttime give operators a reuse-proof locator.
+    let _ = outer_duty::write_metadata(
+        &hold.lock_path,
+        &args.signature,
+        &args.duties,
+        Some(child.id()),
+    );
     // The wrapper keeps its fd while waiting — both holders must die before
     // the lock is released.
     let status = match child.wait() {

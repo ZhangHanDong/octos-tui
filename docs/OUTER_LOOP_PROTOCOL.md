@@ -10,6 +10,11 @@
 > wontdo 分歧规则);result.md frontmatter v1 schema 固化(见附录 A);
 > sub_providers 车道模板(见附录 B)。v1 语法只约束生效日(2026-08-24)起
 > 新增的 ACK 行,历史行不重写、由契约测试豁免清单覆盖。
+>
+> v1 → v2 变更(2026-08-30 生效,#38-r1):新增 R7 主审权 OS 独占锁
+> (outer-duty hold/check;锁即 authority、check 仅观察、活锁接管归
+> operator、metadata/TTL 仅诊断;Unix-only 单机 flock,Windows
+> LockFileEx 另立条目,NFS 不适用)。AGENTS.md 引用同步 v2。
 
 ## 角色
 
@@ -350,7 +355,7 @@ v1 起其 YAML frontmatter **必须包含**以下字段集合,恰为 6 个
 | `updated_unix` | integer | 最近更新的 Unix 时间戳(秒) |
 | `turn` | integer | 该 peer 已运行的 turn 数 |
 | `verified` | string | R2 验证级别:`verified` / `partially-verified` / `unverified` |
-| `protocol` | string | 写入时遵循的协议版本,如 `olp/v1` |
+| `protocol` | string | 写入时遵循的协议版本,当前 `olp/v2` |
 
 **消费侧约定**:未知字段必须忽略(forward compatibility)——消费方按上述
 6 字段清单取数,对 frontmatter 中出现的任何其他字段不做解释、不得报错。

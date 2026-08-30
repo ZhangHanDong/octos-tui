@@ -5,16 +5,13 @@
 //! support is a separate follow-up entry. The module does not compile on
 //! non-Unix targets by design (honest shrink, per the countersign).
 //!
-//! Lifecycle binding (#38-r1 BLOCKER A — the PRIMARY safety boundary): the
-//! authority lives with the REAL agent, not the wrapper. The lock fd is
-//! inherited by the spawned child (CLOEXEC cleared via pre_exec), and the
-//! child runs in its own process group with the wrapper as its group leader
-//! — when the wrapper dies, SIGHUP reaches the group, and even if the child
-//! lingers the fd it inherited is the authority: a NEW contender cannot
-//! acquire until every fd holder (the real agent included) is gone. The
-//! contract test inverts the old pin: wrapper SIGKILL must leave the lock
-//! HELD while the inheriting child lives, and VACANT only after the child
-//! itself dies.
+//! Lifecycle binding (#38-r2 adjudicated: GUARDIAN death coupling): the
+//! wrapper is the sole fd holder (CLOEXEC stays set — the lock never leaks
+//! to descendants); the child gets setpgid + PR_SET_PDEATHSIG(SIGKILL), so
+//! wrapper death kills the agent and releases the authority immediately —
+//! no split brain, no lingering authority. Grandchildren hold no fd: an
+//! agent that exits while leaving a grandchild running yields VACANT. Both
+//! invariants are contract-pinned with real processes.
 //!
 //! Lock naming is a STABLE protocol: SHA-256 over the domain-prefixed
 //! canonical project path (DefaultHasher is not stable across Rust versions
@@ -69,22 +66,30 @@ pub fn lock_path(project: &Path) -> Result<PathBuf> {
     }
     let canonical = std::fs::canonicalize(project)
         .wrap_err_with(|| format!("cannot canonicalize project path: {}", project.display()))?;
-    let mut hasher = sha2::Sha256::new();
-    use sha2::Digest as _;
-    hasher.update(LOCK_DOMAIN.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(canonical.to_string_lossy().as_bytes());
-    let digest_bytes = hasher.finalize();
-    let mut digest = String::with_capacity(digest_bytes.len() * 2);
-    for byte in digest_bytes {
-        use std::fmt::Write as _;
-        let _ = write!(digest, "{byte:02x}");
-    }
+    let digest = lock_digest(canonical.to_string_lossy().as_bytes());
     Ok(Path::new(&home)
         .join(".octos")
         .join("outer")
         .join("duty")
         .join(format!("{digest}.lock")))
+}
+
+/// Pure, stable lock-name digest: SHA-256 over
+/// `LOCK_DOMAIN ++ [0] ++ canonical_path_bytes` → 64 lowercase hex chars.
+/// Golden-pinned by a fixed input in tests (NOT a mirror of this code).
+pub fn lock_digest(canonical_path: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(LOCK_DOMAIN.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(canonical_path);
+    let bytes = hasher.finalize();
+    let mut digest = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(digest, "{byte:02x}");
+    }
+    digest
 }
 
 /// Hold guard: the fd IS the lock.
@@ -105,10 +110,12 @@ fn open_lock_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
 
 /// Tighten permissions on a possibly pre-existing (e.g. 0644) file/dir so a
 /// permissive umask or an old artifact cannot leave wide-open state behind.
+/// Fail-closed: a failed tightening is an ERROR, not silently swallowed.
 #[cfg(unix)]
-fn tighten(path: &Path, mode: u32) {
+fn tighten(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .wrap_err_with(|| format!("failed to tighten {} to {:o}", path.display(), mode))
 }
 
 /// Acquire the duty lock NONBLOCKING, or fail structurally on contention.
@@ -117,11 +124,11 @@ pub fn acquire(project: &Path) -> Result<DutyHold> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .wrap_err_with(|| format!("failed to create duty lock dir: {}", parent.display()))?;
-        tighten(parent, 0o700);
+        tighten(parent, 0o700)?;
     }
     let file = open_lock_file(&path, 0o600)
         .wrap_err_with(|| format!("failed to open duty lockfile: {}", path.display()))?;
-    tighten(&path, 0o600);
+    tighten(&path, 0o600)?;
     match fs2::FileExt::try_lock_exclusive(&file) {
         Ok(()) => Ok(DutyHold {
             file,
@@ -209,21 +216,39 @@ fn sanitize_field(value: &str) -> String {
 /// Write the diagnostic metadata sidecar atomically: unique 0600 tempfile +
 /// file fsync + rename (unique names so concurrent diagnostic writes cannot
 /// collide; corruption never affects adjudication).
-pub fn write_metadata(lock: &Path, signature: &str, duties: &str) -> Result<()> {
+pub fn write_metadata(
+    lock: &Path,
+    signature: &str,
+    duties: &str,
+    child_pid: Option<u32>,
+) -> Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let sidecar = lock.with_extension("meta");
     let payload = format!(
-        "{{\"signature\":{:?},\"duties\":{:?},\"written_at_unix\":{}}}\n",
+        "{{\"signature\":{:?},\"duties\":{:?},\"written_at_unix\":{},\"wrapper_pid\":{},\"wrapper_starttime\":{}}}\n",
         sanitize_field(signature),
         sanitize_field(duties),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
-            .unwrap_or(0)
-    );
+            .unwrap_or(0),
+        std::process::id(),
+        process_starttime(std::process::id()),
+    )
+    .trim_end_matches('\n')
+    .to_string()
+    .replace(
+        "}",
+        &format!(
+            ",\"child_pid\":{},\"child_starttime\":{}}}",
+            child_pid.map(|p| p.to_string()).unwrap_or("null".into()),
+            child_pid.map(process_starttime).unwrap_or(0),
+        ),
+    )
+    + "\n";
     if let Some(parent) = sidecar.parent() {
         std::fs::create_dir_all(parent)?;
-        tighten(parent, 0o700);
+        let _ = tighten(parent, 0o700);
     }
     let tmp = sidecar.with_extension(format!("meta.tmp.{}", std::process::id()));
     {
@@ -236,7 +261,7 @@ pub fn write_metadata(lock: &Path, signature: &str, duties: &str) -> Result<()> 
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
     }
-    tighten(&tmp, 0o600);
+    let _ = tighten(&tmp, 0o600);
     std::fs::rename(&tmp, &sidecar)
         .wrap_err_with(|| format!("failed to rename metadata sidecar: {}", sidecar.display()))
 }
@@ -265,25 +290,34 @@ pub fn held_diagnostics(lock: &Path) -> String {
     }
 }
 
-/// Spawn the duty-wrapped child: the lock fd is DUPLICATED into the child
-/// (CLOEXEC cleared on the child's copy) and the child gets its own process
-/// group with the wrapper as leader — authority co-lives with the real
-/// agent (#38-r1 A).
-pub fn spawn_holder_child(file: &std::fs::File, command: &[String]) -> Result<std::process::Child> {
-    use std::os::unix::io::AsRawFd as _;
+/// Spawn the duty-wrapped child with GUARDIAN death coupling (#38-r2
+/// adjudicated design): the wrapper is the ONLY fd holder (CLOEXEC stays
+/// set — the lock never leaks to descendants); the child runs in its own
+/// process group with PR_SET_PDEATHSIG(SIGKILL) — when the wrapper dies,
+/// the agent dies with it, releasing the authority immediately (no
+/// split brain). The wrapper then waits on the child: when the agent
+/// exits (normally or not), the wrapper exits and the lock releases.
+///
+/// PDEATHSIG semantics boundary: the signal is delivered when the child's
+/// *parent thread* dies; it is Linux-specific (hence the linux-gnu target
+/// confinement) and does NOT chain to grandchildren — a grandchild that
+/// outlives its parent holds no fd and no authority (pinned by contract).
+pub fn spawn_holder_child(command: &[String]) -> Result<std::process::Child> {
     use std::os::unix::process::CommandExt as _;
-    let raw_fd = file.as_raw_fd();
     let mut cmd = std::process::Command::new(&command[0]);
     cmd.args(&command[1..]);
     #[allow(unsafe_code)]
     unsafe {
-        cmd.pre_exec(move || {
-            // The child keeps a copy of the lock fd (no CLOEXEC on it) and
-            // joins its own process group led by the wrapper (SIGHUP on
-            // wrapper death reaches the group).
-            // CLEAR the CLOEXEC flag (flags=0) so execve keeps this fd:
-            // the real agent holds the authority after the wrapper is gone.
-            if libc::fcntl(raw_fd, libc::F_SETFD, 0) == -1 {
+        cmd.pre_exec(|| {
+            // Own process group: signals to the wrapper's group (e.g. an
+            // interactive ^C) do not reach the duty child directly.
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Death coupling: wrapper dies ⇒ agent gets SIGKILL. The window
+            // between parent death and signal delivery is kernel-side and
+            // covered by the contract's poll-to-VACANT.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -291,4 +325,20 @@ pub fn spawn_holder_child(file: &std::fs::File, command: &[String]) -> Result<st
     }
     cmd.spawn()
         .wrap_err_with(|| format!("failed to spawn duty child: {}", command[0]))
+}
+
+/// /proc/<pid>/stat field 22 (starttime in clock ticks since boot) — a
+/// PID-reuse-proof locator for operators; 0 when unreadable.
+#[cfg(unix)]
+fn process_starttime(pid: u32) -> u64 {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(_) => return 0,
+    };
+    // field 22; comm may contain spaces/parens — parse after the last ')'.
+    let rest = stat.rsplit(')').next().unwrap_or("");
+    rest.split_whitespace()
+        .nth(19)
+        .and_then(|f| f.parse().ok())
+        .unwrap_or(0)
 }

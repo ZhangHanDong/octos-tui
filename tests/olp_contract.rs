@@ -219,9 +219,20 @@ fn olp_version_consistent_across_docs() {
         ("AGENTS.md", agents.as_str()),
         ("docs/OUTER_LOOP_PROTOCOL.md", protocol.as_str()),
     ] {
+        // Unique CURRENT version: parse the header line ("> `protocol:
+        // olp/vN`"), not substring presence — stray v1 references must not
+        // satisfy the pin.
+        let header = text
+            .lines()
+            .find(|l| l.contains("protocol: olp/v"))
+            .unwrap_or_else(|| panic!("{rel} has no protocol header"));
         assert!(
-            text.contains("olp/v2"),
-            "{rel} must reference protocol version olp/v2 (R7 bump)"
+            header.contains("olp/v2") && !header.contains("olp/v1"),
+            "{rel} current version must be exactly olp/v2 (header: {header})"
+        );
+        assert!(
+            !text.replace(header, "").contains("olp/v1\n"),
+            "{rel} must not carry stray olp/v1 references"
         );
     }
     // Neither file's own protocol declaration may still say v0. (Quoted
