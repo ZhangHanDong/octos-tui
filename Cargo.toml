@@ -29,6 +29,7 @@ ttfx = { git = "https://github.com/omacom-io/ttfx", rev = "6e24dac78e3011d89bd7f
 clap = { version = "4", features = ["derive"] }
 eyre = "0.6"
 fs2 = "0.4"
+libc = "0.2"
 color-eyre = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

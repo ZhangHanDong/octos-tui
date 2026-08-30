@@ -1640,6 +1640,7 @@ dependencies = [
  "eyre",
  "fs2",
  "futures",
+ "libc",
  "octos-core",
  "ratatui",
  "reqwest 0.12.28",

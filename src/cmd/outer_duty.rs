@@ -1,5 +1,7 @@
-//! `octoscode outer-duty` (OUTER_LOOP_REVIEW #38): hold/check entrypoints
-//! over [`crate::outer_duty`].
+#![cfg(unix)]
+
+//! `octoscode outer-duty` (OUTER_LOOP_REVIEW #38/#38-r1): hold/check
+//! entrypoints over [`crate::outer_duty`]. Unix-only (#38-r1 adjudication).
 
 use super::OuterDutyArgs;
 use crate::outer_duty::{self, DutyState};
@@ -17,6 +19,8 @@ pub fn run(args: OuterDutyArgs) -> i32 {
     }
 }
 
+/// stdout carries the state token ALONE — exactly one line, machine
+/// parseable; diagnostics go to stderr as one JSON line (#38-r1 C).
 fn run_check(project: &std::path::Path) -> i32 {
     match outer_duty::check(project) {
         DutyState::Vacant => {
@@ -24,24 +28,11 @@ fn run_check(project: &std::path::Path) -> i32 {
             0
         }
         DutyState::Held => {
-            // Diagnostics only — a corrupt sidecar reports METADATA_CORRUPT
-            // but NEVER changes the lock verdict.
-            let mut note = String::new();
-            if let Ok(path) = outer_duty::lock_path(project) {
-                match outer_duty::read_metadata(&path) {
-                    Some(meta) => {
-                        note = format!(
-                            " holder={} duties={}",
-                            meta.get("signature")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("?"),
-                            meta.get("duties").and_then(|v| v.as_str()).unwrap_or("?"),
-                        )
-                    }
-                    None => note = " METADATA_CORRUPT".into(),
-                }
-            }
-            println!("HELD{note}");
+            let diag = outer_duty::lock_path(project)
+                .map(|p| outer_duty::held_diagnostics(&p))
+                .unwrap_or_else(|_| "{\"diagnostics\":\"unavailable\"}".into());
+            eprintln!("{diag}");
+            println!("HELD");
             0
         }
         DutyState::Error => {
@@ -65,15 +56,21 @@ fn run_hold(args: &OuterDutyArgs, project: &std::path::Path) -> i32 {
     };
     // Diagnostic sidecar (best-effort; corruption never affects the lock).
     let _ = outer_duty::write_metadata(&hold.lock_path, &args.signature, &args.duties);
-    // The fd lives in `hold` for the child's entire lifetime: lock-with-the-
-    // holder, auto-released on exit/SIGKILL.
-    let status = match std::process::Command::new(&args.command[0])
-        .args(&args.command[1..])
-        .status()
-    {
+    // #38-r1 A: the child INHERITS the lock fd (CLOEXEC cleared in pre_exec)
+    // — authority co-lives with the real agent, not just this wrapper.
+    let mut child = match outer_duty::spawn_holder_child(&hold.file, &args.command) {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("outer-duty hold: {err:#}");
+            return 1;
+        }
+    };
+    // The wrapper keeps its fd while waiting — both holders must die before
+    // the lock is released.
+    let status = match child.wait() {
         Ok(status) => status,
         Err(err) => {
-            eprintln!("outer-duty hold: failed to spawn child: {err}");
+            eprintln!("outer-duty hold: child wait failed: {err}");
             return 1;
         }
     };

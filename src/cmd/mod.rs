@@ -44,6 +44,7 @@ where
         Some(Route::Doctor(args)) => Ok(Some(doctor::run(args)?)),
         Some(Route::Config(args)) => Ok(Some(config::run(args)?)),
         Some(Route::OlpMcpServe) => Ok(Some(olp_mcp::run())),
+        #[cfg(unix)]
         Some(Route::OuterDuty(args)) => Ok(Some(outer_duty::run(args))),
         None => Ok(None),
     }
