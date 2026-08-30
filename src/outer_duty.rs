@@ -17,7 +17,7 @@
 //! canonical project path (DefaultHasher is not stable across Rust versions
 //! — protocol-documented limitation). HOME missing ⇒ fail-closed error.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -248,7 +248,7 @@ pub fn write_metadata(
     + "\n";
     if let Some(parent) = sidecar.parent() {
         std::fs::create_dir_all(parent)?;
-        let _ = tighten(parent, 0o700);
+        tighten(parent, 0o700)?;
     }
     let tmp = sidecar.with_extension(format!("meta.tmp.{}", std::process::id()));
     {
@@ -261,7 +261,7 @@ pub fn write_metadata(
         file.write_all(payload.as_bytes())?;
         file.sync_all()?;
     }
-    let _ = tighten(&tmp, 0o600);
+    tighten(&tmp, 0o600)?;
     std::fs::rename(&tmp, &sidecar)
         .wrap_err_with(|| format!("failed to rename metadata sidecar: {}", sidecar.display()))
 }
@@ -308,17 +308,28 @@ pub fn spawn_holder_child(command: &[String]) -> Result<std::process::Child> {
     cmd.args(&command[1..]);
     #[allow(unsafe_code)]
     unsafe {
-        cmd.pre_exec(|| {
+        // The child's parent must be THIS wrapper: capture our own pid,
+        // not our parent's (the fork child's getppid() == wrapper pid).
+        let expected_parent = std::process::id();
+        cmd.pre_exec(move || {
             // Own process group: signals to the wrapper's group (e.g. an
             // interactive ^C) do not reach the duty child directly.
             if libc::setpgid(0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            // Death coupling: wrapper dies ⇒ agent gets SIGKILL. The window
-            // between parent death and signal delivery is kernel-side and
-            // covered by the contract's poll-to-VACANT.
+            // Death coupling: wrapper dies ⇒ agent gets SIGKILL.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // Classic PDEATHSIG install race: if the wrapper died between
+            // fork and prctl, we were reparented and the signal will never
+            // fire. Verify the parent is still the wrapper — else fail the
+            // exec (the wrapper's exit already released the lock; an
+            // orphaned agent must not outlive its authority).
+            if libc::getppid() != expected_parent as libc::pid_t {
+                return Err(std::io::Error::other(
+                    "duty child's parent changed before PDEATHSIG install",
+                ));
             }
             Ok(())
         });

@@ -324,3 +324,44 @@ fn outer_duty_wiring_three_surfaces_consistent() {
     );
     assert!(agents.contains("protocol: olp/v2"), "AGENTS synced to v2");
 }
+
+#[test]
+fn outer_duty_docs_pin_guardian_semantics_and_h1() {
+    let protocol = read("docs/OUTER_LOOP_PROTOCOL.md");
+    let boot = read("docs/OLP_OUTER_BOOT.md");
+    let agents = read("AGENTS.md");
+
+    // H1: the title line itself must carry the current version — a v1
+    // title with a v2 body header is the drift the final review caught.
+    let title = protocol.lines().next().unwrap_or_default().to_string();
+    assert!(
+        title.contains("v2") && !title.contains("v1"),
+        "PROTOCOL H1 (title) must be v2 (got: {title})"
+    );
+
+    // Guardian semantics must be present verbatim in all three surfaces.
+    for (rel, text) in [
+        ("docs/OUTER_LOOP_PROTOCOL.md", protocol.as_str()),
+        ("docs/OLP_OUTER_BOOT.md", boot.as_str()),
+        ("AGENTS.md", agents.as_str()),
+    ] {
+        assert!(
+            text.contains("守护式死亡耦合") || text.contains("PR_SET_PDEATHSIG"),
+            "{rel} must state the guardian death-coupling semantics"
+        );
+        // Old fd-inheritance semantics must NOT appear anywhere.
+        assert!(
+            !text.contains("fd 继承") && !text.contains("fd 由 agent 进程继承"),
+            "{rel} must not carry the retired fd-inheritance semantics"
+        );
+        assert!(
+            !text.contains("wrapper 亡而 agent 在则锁仍 HELD"),
+            "{rel} must not carry the retired 'wrapper dies, agent alive, still HELD' claim"
+        );
+        // Platform claim must be Linux-only, not Unix.
+        assert!(
+            !text.contains("Unix-only(flock") && !text.contains("Unix-only;锁与真实"),
+            "{rel} must claim Linux-only, not Unix-only"
+        );
+    }
+}

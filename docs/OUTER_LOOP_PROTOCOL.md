@@ -1,4 +1,4 @@
-# Outer-Loop Protocol (OLP) — v1
+# Outer-Loop Protocol (OLP) — v2
 
 > 让任意外部模型(Claude Code / Codex / 脚本化 agent)以标准方式**计划、监控、
 > 审查、指导** octos 的长程 goal 执行。本协议规范化的是已在实战中验证过的信道,
@@ -13,7 +13,7 @@
 >
 > v1 → v2 变更(2026-08-30 生效,#38-r1):新增 R7 主审权 OS 独占锁
 > (outer-duty hold/check;锁即 authority、check 仅观察、活锁接管归
-> operator、metadata/TTL 仅诊断;Unix-only 单机 flock,Windows
+> operator、metadata/TTL 仅诊断;Linux-only 单机 flock+PDEATHSIG,Windows
 > LockFileEx 另立条目,NFS 不适用)。AGENTS.md 引用同步 v2。
 
 ## 角色
@@ -91,12 +91,15 @@
 - **R7 — 主审权 OS 独占锁(outer-duty,olp/v2 起)**:多外环的主审权
   以 per-project 会话寿命 OS 锁为准——上岗外环必须经
   `octoscode outer-duty hold --project P --signature S --duties D -- <agent>`
-  启动(锁即 authority,与真实 agent 同生共死:fd 由 agent 进程继承,
-  wrapper 亡而 agent 在则锁仍 HELD);`check` 仅观察、绝不夺取;活锁
-  接管只归 operator(终止旧 holder 后再 acquire),无 agent 自助强夺。
-  metadata sidecar 与一切 TTL 仅诊断、绝不参与裁定。范围:单机
-  flock(LockFileEx 支持另立条目),NFS 不适用;本切片 fencing 为文档
-  层纪律,硬 gate(board-append/push 校验 lease)为后续条目。
+  启动(**守护式死亡耦合**:wrapper 是唯一锁 fd 持有者,CLOEXEC 保持
+  置位;agent 经 setpgid+PR_SET_PDEATHSIG(SIGKILL) 与 wrapper 同死——
+  wrapper 亡则 agent 必亡、锁即 VACANT,绝无 agent 活而锁 VACANT 的
+  split brain;孙辈进程不持有 fd,agent 退出而孙辈长驻亦为 VACANT);
+  `check` 仅观察、绝不夺取;活锁接管只归 operator(终止旧 holder 后
+  再 acquire),无 agent 自助强夺。metadata sidecar 与一切 TTL 仅诊断、绝不参与裁定。范围:**Linux-only**(单机 flock+PDEATHSIG+/proc;非
+  Linux 平台命令显式 unsupported 退出 2;Windows LockFileEx 另立条目),
+  NFS 不适用;本切片 fencing 为文档层纪律,硬 gate(board-append/push
+  校验 lease)为后续条目。
 - **R6 — 版本协商**:本文件头部 `protocol: olp/vN`;`AGENTS.md` 引用同版本。
   信道语义变更必须升版本。
 
