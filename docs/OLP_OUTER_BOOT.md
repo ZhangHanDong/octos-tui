@@ -13,6 +13,24 @@
 - 多外环并存:每条目**单一主审**;他人条目只可署名批注(陈述意见,不打回
   不改写);分歧升级 operator,`wontdo` 只能接受或上报。
 
+## 0b. 重启硬清单(内环重启后的外环巡检,四步)
+
+内环(重)启动后,外环逐项核对,禁止"记一笔稍后补":
+
+1. **serve 起**——operator 亲手执行(免沙箱启动属信任决策,永不由
+   agent 代劳)。
+2. **`/loop resume` 外环必代**——先 `/loop list` 取 id,再
+   `/loop resume <id>`(裸 resume 要 id 会拒)。实案注:**兜底瘫痪是
+   隐形的**——maintenance 心跳 paused 一整天无人察觉,直至夜间主道
+   断供 + goal 熔断 + 哨盲区三层同失才暴露,8 小时停摆。主机制
+   (turn-continuation)健康时,兜底层瘫痪完全不可见;兜底的健康只能
+   靠巡检,不能靠事故。
+3. **双哨挂载**——正信号哨(ACK 落板)+ 负信号哨(events.jsonl 的
+   `goal_transition blocked` / escalation);只盯正信号时,goal 熔断的
+   沉默与"还在干活"不可区分。
+4. **fallbacks 配置与新会话快照核对**——fallbacks 已配且**新会话已
+   快照**(改配置不重启 = 纸面保险;会话建立时快照工具表,不回补)。
+
 ## 1. 黑板(权威账本)
 
 - 每个仓库一块:`<repo>/.octos/OUTER_LOOP_REVIEW.md`。`docs/` 下同名文件
