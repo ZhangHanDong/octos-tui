@@ -32,9 +32,17 @@ QUICKSTART 的发现命令为准。
    `docs/OUTER_LOOP_PROTOCOL.md`(ACK 定式/多外环规则/预算档)
 2. **发现现场**:`herdr agent list` / `ls -t ~/.octos/instances/`,
    读各项目 `.octos/OUTER_LOOP_REVIEW.md` 尾部在途条目
-3. **接管职责**:署名落板(经 `scripts/olp-board-append.sh`,flock
-   原子)→ 立编号条目唤醒内环 → 内环 ACK 后**隔离 worktree 独立
-   复验** → 采认代推。安全红线见 BOOT §5。
+3. **接管职责(主审权锁,R7/olp-v2)**:上岗必须经
+   `octoscode outer-duty hold --project <项目> --signature <署名>
+   --duties <职责> -- <你的 agent 启动命令>` 包裹启动——锁即
+   authority,**守护式死亡耦合**(wrapper 唯一持 fd;agent 经
+   PR_SET_PDEATHSIG 与 wrapper 同死,wrapper 亡⇒agent 必亡⇒VACANT;
+   Linux-only,非 Linux unsupported,Windows LockFileEx 另立);
+   `outer-duty check` 仅观察、绝不夺取;非 holder 只读批注,活锁接管
+   只归 operator(终止旧 holder 后再 acquire)。持锁后:署名落板(经
+   `scripts/olp-board-append.sh`,flock 原子)→ 立编号条目唤醒内环 →
+   内环 ACK 后**隔离 worktree 独立复验** → 采认代推。安全红线见
+   BOOT §5。
 
 ## 模式 inner — 内环形态选型(执行侧)
 

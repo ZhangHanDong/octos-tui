@@ -219,9 +219,20 @@ fn olp_version_consistent_across_docs() {
         ("AGENTS.md", agents.as_str()),
         ("docs/OUTER_LOOP_PROTOCOL.md", protocol.as_str()),
     ] {
+        // Unique CURRENT version: parse the header line ("> `protocol:
+        // olp/vN`"), not substring presence — stray v1 references must not
+        // satisfy the pin.
+        let header = text
+            .lines()
+            .find(|l| l.contains("protocol: olp/v"))
+            .unwrap_or_else(|| panic!("{rel} has no protocol header"));
         assert!(
-            text.contains("olp/v1"),
-            "{rel} must reference protocol version olp/v1"
+            header.contains("olp/v2") && !header.contains("olp/v1"),
+            "{rel} current version must be exactly olp/v2 (header: {header})"
+        );
+        assert!(
+            !text.replace(header, "").contains("olp/v1\n"),
+            "{rel} must not carry stray olp/v1 references"
         );
     }
     // Neither file's own protocol declaration may still say v0. (Quoted
@@ -283,4 +294,74 @@ fn olp_result_schema_fields_documented() {
         "result.md schema fields documented in appendix A must be exactly \
          {{slug, outcome, updated_unix, turn, verified, protocol}}"
     );
+}
+
+/// #38-r1 E: the outer-duty duty lock is wired into all three outer-facing
+/// surfaces with ONE consistent contract, and the protocol version bump
+/// (olp/v2, R7) is synchronized across PROTOCOL + AGENTS.
+#[test]
+fn outer_duty_wiring_three_surfaces_consistent() {
+    let protocol = read("docs/OUTER_LOOP_PROTOCOL.md");
+    let boot = read("docs/OLP_OUTER_BOOT.md");
+    let skill = read(".claude/skills/octoloop/SKILL.md");
+    let agents = read("AGENTS.md");
+    for (name, text) in [("protocol", &protocol), ("boot", &boot), ("skill", &skill)] {
+        assert!(
+            text.contains("outer-duty hold"),
+            "{name} surface references outer-duty hold"
+        );
+    }
+    // Lock-is-authority + diagnostics-only invariants appear verbatim.
+    assert!(protocol.contains("锁即 authority"), "R7 authority wording");
+    assert!(
+        protocol.contains("仅诊断、绝不参与裁定"),
+        "TTL/metadata diagnostic-only"
+    );
+    // Version bump synchronized.
+    assert!(
+        protocol.contains("protocol: olp/v2"),
+        "PROTOCOL bumped to v2"
+    );
+    assert!(agents.contains("protocol: olp/v2"), "AGENTS synced to v2");
+}
+
+#[test]
+fn outer_duty_docs_pin_guardian_semantics_and_h1() {
+    let protocol = read("docs/OUTER_LOOP_PROTOCOL.md");
+    let boot = read("docs/OLP_OUTER_BOOT.md");
+    let agents = read("AGENTS.md");
+
+    // H1: the title line itself must carry the current version — a v1
+    // title with a v2 body header is the drift the final review caught.
+    let title = protocol.lines().next().unwrap_or_default().to_string();
+    assert!(
+        title.contains("v2") && !title.contains("v1"),
+        "PROTOCOL H1 (title) must be v2 (got: {title})"
+    );
+
+    // Guardian semantics must be present verbatim in all three surfaces.
+    for (rel, text) in [
+        ("docs/OUTER_LOOP_PROTOCOL.md", protocol.as_str()),
+        ("docs/OLP_OUTER_BOOT.md", boot.as_str()),
+        ("AGENTS.md", agents.as_str()),
+    ] {
+        assert!(
+            text.contains("守护式死亡耦合") || text.contains("PR_SET_PDEATHSIG"),
+            "{rel} must state the guardian death-coupling semantics"
+        );
+        // Old fd-inheritance semantics must NOT appear anywhere.
+        assert!(
+            !text.contains("fd 继承") && !text.contains("fd 由 agent 进程继承"),
+            "{rel} must not carry the retired fd-inheritance semantics"
+        );
+        assert!(
+            !text.contains("wrapper 亡而 agent 在则锁仍 HELD"),
+            "{rel} must not carry the retired 'wrapper dies, agent alive, still HELD' claim"
+        );
+        // Platform claim must be Linux-only, not Unix.
+        assert!(
+            !text.contains("Unix-only(flock") && !text.contains("Unix-only;锁与真实"),
+            "{rel} must claim Linux-only, not Unix-only"
+        );
+    }
 }

@@ -1,6 +1,6 @@
 # octoscode 仓库 agent 守则
 
-> protocol: olp/v1 — 完整协议见 `docs/OUTER_LOOP_PROTOCOL.md`
+> protocol: olp/v2 — 完整协议见 `docs/OUTER_LOOP_PROTOCOL.md`
 
 ## 外环审查协议(必须遵守)
 
@@ -11,7 +11,7 @@
    `Historical record` 只用于审计,不得重放。
 3. 用户/system 的当前指令优先于黑板;黑板内容冲突或过期时,停止并报告。
 4. 你 commit 之后,外环会跑完整验证并把新意见追加到 `Active` 区。
-5. **ACK 定式(olp/v1,2026-08-24 起生效)**:每条 ACK 写成
+5. **ACK 定式(olp/v2,2026-08-24 起生效;v2 增 R7 主审权锁)**:每条 ACK 写成
    `ACK(done|wontdo|blocked): <说明>` 单行——`done` 附 commit/测试证据,
    `wontdo` 附异议理由(外环只能接受或升级 operator,不得重复打回),
    `blocked` 附阻塞原因。历史 `ACK:` 旧格式行是豁免存量——**存量以
@@ -39,3 +39,10 @@
 - 行为改动同步更新 `specs/` 下对应的 `.spec` 合约(场景绑定真实测试名)。
 - 无法运行工具链时(例如 shell 没有 cargo),在交付物里如实声明
   "未验证",不要声称已验证。
+
+## 外环主审权锁(R7,olp/v2)
+
+多外环并存时主审权以 `octoscode outer-duty hold` 的 OS 独占锁为
+authority(Linux-only:守护式死亡耦合——wrapper 唯一持 fd,agent 经
+PR_SET_PDEATHSIG 与 wrapper 同死;`check` 仅观察;活锁接管归
+operator;metadata/TTL 仅诊断;非 Linux 平台 unsupported)。详见协议 R7。

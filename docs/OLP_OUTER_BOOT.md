@@ -53,6 +53,19 @@ tail -f ~/.octos/instances/<实例>/profiles/<档>/data/events.jsonl
 octos goal status --goal <id> / octos peer list           # 结构面(项目目录下)
 ```
 
+## 3.5 主审权锁(outer-duty,olp/v2 R7)
+
+上岗即以 `octoscode outer-duty hold --project <项目> --signature <署名>
+--duties <职责> -- <agent 启动命令>` 包裹启动:锁即 authority,**守护式
+死亡耦合**——wrapper 是唯一锁 fd 持有者,agent 经 PR_SET_PDEATHSIG
+(SIGKILL) 与 wrapper 同死(wrapper 亡⇒agent 必亡⇒锁 VACANT);
+`outer-duty check --project <项目>` 仅观察(stdout 恰一态
+VACANT|HELD|ERROR);非 holder 只读批注;活锁接管只归 operator(终止
+旧 holder 后再 acquire),无 agent 自助强夺;metadata sidecar 与 TTL 仅
+诊断绝不参与裁定。Linux-only(flock+PDEATHSIG;非 Linux unsupported;Windows LockFileEx 另立条目),
+NFS 不适用。本切片 fencing 为文档层纪律;硬 gate(写入面校验 lease)
+为后续条目。
+
 ## 4. 复验与代推(主审义务)
 
 - 内环 ACK 的自验声明**不可轻信**:在隔离 worktree 独立重跑——
