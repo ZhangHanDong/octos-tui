@@ -447,7 +447,23 @@ fn duty_corrupt_metadata_keeps_ownership() {
         project.as_path(),
         env.sentinel().as_path(),
     );
-    std::fs::write(env.lock_path().with_extension("meta"), "{not json").unwrap();
+    // #38-r5: wait for the wrapper's healthy sidecar to LAND before
+    // corrupting it — otherwise the corruption races the wrapper's own
+    // atomic rename and can be overwritten by the fresh healthy JSON
+    // (holder field present = the write completed).
+    let sidecar = env.lock_path().with_extension("meta");
+    let mut settled = false;
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&sidecar) {
+            if text.contains("holder") || text.contains("signature") {
+                settled = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(settled, "wrapper never wrote a healthy sidecar to corrupt");
+    std::fs::write(&sidecar, "{not json").unwrap();
     let out = duty(env.home().as_path())
         .args(["check", "--project", project.to_str().unwrap()])
         .output()
