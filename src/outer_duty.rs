@@ -111,11 +111,38 @@ fn open_lock_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// The permission-tightening operation, as an injectable seam (#38-r7):
+/// production default is the real chmod (zero behavior change); tests may
+/// install a failing implementation to prove fail-closed propagation.
+pub type TightenResult = eyre::Result<()>;
+pub type TightenFn = fn(&Path, u32) -> TightenResult;
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    /// Test-injectable override; `None` in production (real chmod runs).
+    pub static TIGHTEN_OVERRIDE: std::cell::RefCell<Option<TightenFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_os = "linux")]
+pub fn set_tighten_override(f: Option<TightenFn>) {
+    TIGHTEN_OVERRIDE.with(|slot| *slot.borrow_mut() = f);
+}
+
 /// Tighten permissions on a possibly pre-existing (e.g. 0644) file/dir so a
 /// permissive umask or an old artifact cannot leave wide-open state behind.
 /// Fail-closed: a failed tightening is an ERROR, not silently swallowed.
 #[cfg(target_os = "linux")]
 fn tighten(path: &Path, mode: u32) -> Result<()> {
+    if let Some(injected) = TIGHTEN_OVERRIDE.with(|slot| *slot.borrow()) {
+        return injected(path, mode);
+    }
+    real_tighten(path, mode)
+}
+
+/// The production chmod (the injectable seam's default path).
+#[cfg(target_os = "linux")]
+fn real_tighten(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .wrap_err_with(|| format!("failed to tighten {} to {:o}", path.display(), mode))
