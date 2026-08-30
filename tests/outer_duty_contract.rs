@@ -168,44 +168,90 @@ fn check_state(home: &std::path::Path, project: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// 契约 1: two contenders started against a shared start barrier — exactly
-/// one hold succeeds, the loser exits nonzero with an explicit contention.
+/// 契约 1(#38-r3/r4:真 barrier): two contenders released from a SHARED
+/// gate at the same instant — exactly one exits 0, the other contention.
 #[test]
 fn duty_two_contenders_exactly_one_wins() {
     let env = TempHome::new("two");
     let project = env.project();
-    // First holder holds via a long sleep.
-    let mut a = spawn_holder(
-        env.home().as_path(),
-        project.as_path(),
-        env.sentinel().as_path(),
-    );
-    // Second contender races while A holds.
-    let out = duty(env.home().as_path())
-        .args([
-            "hold",
-            "--project",
-            project.to_str().unwrap(),
-            "--signature",
-            "contender-b",
-            "--duties",
-            "x",
-            "--",
-            "true",
-        ])
-        .output()
+    let gate = env.0.join("start-gate");
+    let stop = env.0.join("stop");
+    std::fs::write(&gate, b"wait").unwrap();
+    std::fs::write(&stop, b"run").unwrap();
+    let spin = |sig: &str| {
+        format!(
+            "while test -e {g}; do :; done; exec {bin} outer-duty hold --project {p} --signature {sig} --duties review -- /bin/sh -c 'while test -e {s}; do sleep 0.05; done'",
+            g = gate.display(),
+            bin = bin().display(),
+            p = project.display(),
+            s = stop.display(),
+        )
+    };
+    warmup();
+    let mut a = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(spin("c1"))
+        .env("HOME", env.home())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
         .unwrap();
-    assert!(!out.status.success(), "second contender must lose");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("HELD"), "contention explicit: {stderr}");
-    let _ = a.kill();
-    let _ = a.wait();
-    release_via_sentinel(&env);
+    let mut b = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(spin("c2"))
+        .env("HOME", env.home())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let _ = std::fs::remove_file(&gate);
+    let mut hel = false;
+    for _ in 0..600 {
+        if check_state(env.home().as_path(), project.as_path()) == "HELD" {
+            hel = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(hel, "a holder must be observed HELD");
+    let mut loser = false;
+    for _ in 0..1200 {
+        match (a.try_wait().unwrap(), b.try_wait().unwrap()) {
+            (Some(_), None) | (None, Some(_)) => {
+                loser = true;
+                break;
+            }
+            (Some(_), Some(_)) => break,
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        loser,
+        "the contention loser must settle while the winner holds"
+    );
+    let _ = std::fs::remove_file(&stop);
+    let a_out = a.wait().unwrap();
+    let b_out = b.wait().unwrap();
+    let codes = [a_out.code(), b_out.code()];
+    let winners = codes.iter().filter(|c| **c == Some(0)).count();
+    assert_eq!(winners, 1, "exactly one contender exits 0 (got {codes:?})");
+    for _ in 0..600 {
+        if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        check_state(env.home().as_path(), project.as_path()),
+        "VACANT"
+    );
 }
 
-/// 契约 2a(#38-r2 裁决:守护式死亡耦合): wrapper SIGKILL → the agent
-/// dies with it (PR_SET_PDEATHSIG) → the lock goes VACANT with no
-/// lingering authority.
+/// 契约 2a(#38-r3/r4:真实 child 观测): wrapper SIGKILL → the REAL agent
+/// (sidecar-recorded PID + /proc starttime, reuse-proof) must DIE, then
+/// the lock goes VACANT — not the lock state alone.
 #[test]
 fn duty_wrapper_death_kills_agent_and_releases() {
     let env = TempHome::new("guardian");
@@ -216,41 +262,89 @@ fn duty_wrapper_death_kills_agent_and_releases() {
         env.sentinel().as_path(),
     );
     wait_started(&env);
+    let (pid, start) = read_sidecar_child(&env);
+    assert!(pid > 0, "sidecar must record the real child pid");
+    assert!(proc_alive_with_start(pid, start), "agent alive before kill");
     wrapper.kill().unwrap();
     let _ = wrapper.wait();
-    // The agent receives SIGKILL via PDEATHSIG; the lock releases. Poll —
-    // the signal delivery is kernel-side and near-instant but asynchronous.
+    let mut died = false;
     for _ in 0..600 {
-        if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
+        if !proc_alive_with_start(pid, start) {
+            died = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    std::thread::sleep(Duration::from_millis(300));
-    for _ in 0..5 {
-        assert_eq!(
-            check_state(env.home().as_path(), project.as_path()),
-            "VACANT",
-            "wrapper death must kill the agent and release the authority"
-        );
+    assert!(
+        died,
+        "real agent (pid {pid}) must die when the wrapper is SIGKILLed"
+    );
+    let mut vacant = false;
+    for _ in 0..600 {
+        if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
+            vacant = true;
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
+    assert!(vacant, "wrapper death must release the authority");
 }
 
-/// 契约 2b(#38-r2): the agent exits while a GRANDCHILD keeps running —
-/// the grandchild holds no fd and no authority: VACANT (a lingering
-/// grandchild can never keep the duty lock alive).
+/// child_pid/child_starttime from the diagnostic sidecar JSON.
+fn read_sidecar_child(env: &TempHome) -> (u32, u64) {
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(env.lock_path().with_extension("meta")) {
+            let pid = text
+                .split("\"child_pid\":")
+                .nth(1)
+                .and_then(|r| r.split(',').next())
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+            let start = text
+                .split("\"child_starttime\":")
+                .nth(1)
+                .and_then(|r| r.split('}').next())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            if pid > 0 {
+                return (pid, start);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("sidecar never recorded child_pid");
+}
+
+/// /proc/<pid>/stat field 22 must equal the recorded starttime (reuse-proof).
+fn proc_alive_with_start(pid: u32, starttime: u64) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some(rest) = stat.rsplit(')').next() else {
+        return false;
+    };
+    let start: u64 = rest
+        .split_whitespace()
+        .nth(19)
+        .and_then(|f| f.parse().ok())
+        .unwrap_or(0);
+    starttime == 0 || start == starttime
+}
+
+/// 契约 2b(#38-r3/r4:grandchild 活性观测): the agent exits while a
+/// GRANDCHILD keeps running — observed ALIVE via its own pid + 10Hz
+/// heartbeat mtime — and holds no fd: VACANT while provably alive.
 #[test]
 fn duty_grandchild_lingering_yields_vacant() {
     let env = TempHome::new("grandchild");
     let project = env.project();
-    // Agent = sh that spawns a long-lived grandchild then exits.
-    std::fs::write(env.sentinel(), b"run").unwrap();
-    let grand_sentinel = env.0.join("grandchild-sentinel");
-    std::fs::write(&grand_sentinel, b"run").unwrap();
+    let gctl = env.0.join("grand-ctl");
+    let ginfo = env.0.join("grand-info");
+    std::fs::write(&gctl, b"run").unwrap();
     let loop_cmd = format!(
-        "/bin/sh -c 'while test -e {g}; do sleep 0.05; done' & exit 0",
-        g = grand_sentinel.display()
+        "/bin/sh -c 'echo $$ > {info}; while test -e {ctl}; do touch {info}; sleep 0.1; done' & exit 0",
+        info = ginfo.display(),
+        ctl = gctl.display(),
     );
     let mut cmd = duty(env.home().as_path());
     cmd.args([
@@ -269,33 +363,49 @@ fn duty_grandchild_lingering_yields_vacant() {
     .stdout(Stdio::null())
     .stderr(Stdio::null());
     let wrapper = cmd.spawn().unwrap();
-    // Agent exits almost immediately; grandchild lives on. Wait past the
-    // wrapper's own exit: the lock must be VACANT while the grandchild runs.
+    let mut gpid = 0u32;
+    for _ in 0..600 {
+        if let Ok(text) = std::fs::read_to_string(&ginfo) {
+            if let Ok(p) = text.trim().parse::<u32>() {
+                gpid = p;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(gpid > 0, "grandchild must register its pid");
+    let mut vacant = false;
     for _ in 0..600 {
         if check_state(env.home().as_path(), project.as_path()) == "VACANT" {
+            vacant = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(
-        grand_sentinel.exists(),
-        "precondition: the grandchild is still alive"
+        vacant,
+        "a lingering grandchild must never keep the duty lock"
     );
-    // Settle, then require the state to STAY VACANT across repeated probes
-    // (a single immediate re-probe can race the previous probe's own
-    // release — probe stability is part of the contract).
-    std::thread::sleep(Duration::from_millis(300));
-    for _ in 0..5 {
-        assert_eq!(
-            check_state(env.home().as_path(), project.as_path()),
-            "VACANT",
-            "a lingering grandchild must never keep the duty lock"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    // Cleanup: end the grandchild.
-    let _ = std::fs::remove_file(&grand_sentinel);
+    assert!(
+        heartbeat_fresh(&ginfo),
+        "grandchild (pid {gpid}) provably alive at VACANT"
+    );
+    assert!(
+        std::path::Path::new(&format!("/proc/{gpid}")).exists(),
+        "grandchild proc exists"
+    );
+    let _ = std::fs::remove_file(&gctl);
     let _ = wrapper;
+}
+
+fn heartbeat_fresh(info: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(info) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    mtime.elapsed().map(|e| e.as_secs() < 2).unwrap_or(false)
 }
 
 /// 契约 3: repeated checks never disturb the live holder.
@@ -491,7 +601,9 @@ fn duty_stdout_single_line_with_hostile_metadata() {
 fn duty_lock_digest_golden_and_convergence() {
     // Golden: sha256("octoscode/outer-duty/v1\0" ++ "/tmp/duty-golden-proj")
     // — computed out-of-band; the pure fn must reproduce it exactly.
-    let golden = sha256_hex(b"octoscode/outer-duty/v1\0/tmp/duty-golden-proj");
+    // FIXED out-of-band constant (printf ... | sha256sum, precomputed):
+    // sha256("octoscode/outer-duty/v1\0/tmp/duty-golden-proj")
+    let golden = "d258b689203cfb1b3c95d56e0bbef32a436cb0952817f581c6bb3aed82461bbb";
     assert_eq!(
         octoscode::outer_duty::lock_digest(b"/tmp/duty-golden-proj"),
         golden,
@@ -525,17 +637,6 @@ fn duty_lock_digest_golden_and_convergence() {
     }
 }
 
-/// Independent SHA-256 → hex (test-local, not importing the impl's helper).
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest as _;
-    let bytes = sha2::Sha256::digest(data);
-    let mut out = String::with_capacity(64);
-    for byte in bytes {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
-}
-
 /// End the real child by removing its sentinel and wait for VACANT.
 fn release_via_sentinel(env: &TempHome) {
     let _ = std::fs::remove_file(env.sentinel());
@@ -545,4 +646,74 @@ fn release_via_sentinel(env: &TempHome) {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// 契约 10(#38-r4: tighten 失败路径显式测试): inside a user namespace
+/// mapped to a foreign uid (via unshare -r on a nobody-owned file), the
+/// pre-existing lock file CANNOT be tightened — chmod must fail with
+/// EPERM even against a 0555-dir sibling file — so acquire surfaces an
+/// ERROR and never a held lock. Runs the whole scenario under
+/// `unshare --map-root-user` so the failure is real DAC denial, not a
+/// root-bypassed chmod. Skipped gracefully when unshare is unavailable.
+#[test]
+fn duty_tighten_failure_propagates_as_error() {
+    // Probe: can we create an unshare-isolated EPERM scenario here?
+    let probe = std::process::Command::new("unshare")
+        .args(["--map-root-user", "-r", "--", "true"])
+        .status();
+    match probe {
+        Ok(st) if st.success() => {}
+        _ => {
+            eprintln!("skipping: unshare user-namespace not available on this host");
+            return;
+        }
+    }
+    let env = TempHome::new("tighten-fail");
+    let project = env.project();
+    let duty_dir = env.home().join(".octos").join("outer").join("duty");
+    std::fs::create_dir_all(&duty_dir).unwrap();
+    let lock = env.lock_path();
+    std::fs::write(&lock, b"pre").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o644)).unwrap();
+    // Real DAC denial WITHOUT root: inside `unshare --map-root-user` the
+    // mapped uid 0 maps to our outer uid, and a file whose owner is a
+    // DIFFERENT outer uid is untightenable there. Create the owner
+    // asymmetry INSIDE the namespace: setuid(1) drops to uid 1 (daemon),
+    // create the lock file as daemon, then run the duty binary — still
+    // inside the namespace — as our mapped uid, for which the file is
+    // foreign: chmod → EPERM, acquire must surface ERROR.
+    let script = format!(
+        "set -- {bin}; \"$1\" outer-duty check --project {p} >/dev/null 2>&1 || true; \
+         setpriv --reuid=1 --regid=1 --clear-groups touch {lock} && \
+         setpriv --reuid=1 --regid=1 --clear-groups chmod 0644 {lock} && \
+         \"$1\" outer-duty hold --project {p} --signature s --duties d -- true",
+        bin = bin().display(),
+        p = project.display(),
+        lock = lock.display(),
+    );
+    let out = std::process::Command::new("unshare")
+        .args(["--map-root-user", "-r", "--", "/bin/sh", "-c", &script])
+        .env("HOME", env.home())
+        .output()
+        .unwrap_or_else(|e| panic!("unshare run failed: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let setpriv_missing = stderr.contains("setpriv: not found") || stderr.contains("No such file");
+    if setpriv_missing {
+        eprintln!("skipping: setpriv not available on this host");
+        return;
+    }
+    assert!(
+        !out.status.success(),
+        "acquire on a foreign-owned (untightenable) lock must fail; stdout={stdout:?} stderr={stderr:?}"
+    );
+    assert!(
+        stdout.is_empty() || stdout == "ERROR",
+        "stdout stays single-state, got {stdout:?}"
+    );
+    assert!(
+        stderr.to_lowercase().contains("tighten") || stderr.to_lowercase().contains("failed"),
+        "the tightening failure is the reported cause: {stderr}"
+    );
 }

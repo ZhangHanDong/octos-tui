@@ -47,13 +47,6 @@ where
         #[cfg(target_os = "linux")]
         Some(Route::OuterDuty(args)) => Ok(Some(outer_duty::run(args))),
         Some(Route::UsageError) => Ok(Some(2)),
-        #[cfg(not(target_os = "linux"))]
-        Some(Route::OuterDuty(_)) => {
-            eprintln!(
-                "outer-duty: unsupported on this platform (Linux-only; see OUTER_LOOP_PROTOCOL R7)"
-            );
-            Ok(Some(2))
-        }
         None => Ok(None),
     }
 }
@@ -178,6 +171,7 @@ fn route(argv: &[String]) -> Option<Route> {
             );
             Some(Route::UsageError)
         }
+
         _ => unreachable!("guarded by SUBCOMMANDS"),
     }
 }

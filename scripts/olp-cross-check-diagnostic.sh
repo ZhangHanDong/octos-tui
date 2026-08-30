@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# #38-r3 non-Linux compile gate (completable evidence).
+# #38-r4: DIAGNOSTIC ONLY — this is NOT a completed compile gate.
 #
-# The full dep graph cannot finish linking on this host (no MSVC/MinGW C
-# toolchain for ring/aws-lc-sys). What we CAN and DO verify: the check
-# progresses through `Compiling octoscode` — i.e. rustc type-checks OUR
-# crate for the windows target — and the ONLY error in the whole run is
-# the ring build script, never a cfg/type error in octoscode code.
+# The full dep graph cannot finish on this host (no MSVC/MinGW C toolchain
+# for ring/aws-lc-sys), so this script CANNOT prove a full windows build.
+# It only checks that rustc begins type-checking our crate and that no
+# non-dependency error appears before the C-toolchain failure. The real
+# non-Linux compile gate is a CI windows job (tracked as a follow-up
+# blackboard item, not claimed as locally proven here).
 set -euo pipefail
 cd "$(dirname "$0")"
 TARGET="${1:-x86_64-pc-windows-msvc}"
