@@ -226,11 +226,15 @@ fn duty_wrapper_death_kills_agent_and_releases() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(
-        check_state(env.home().as_path(), project.as_path()),
-        "VACANT",
-        "wrapper death must kill the agent and release the authority"
-    );
+    std::thread::sleep(Duration::from_millis(300));
+    for _ in 0..5 {
+        assert_eq!(
+            check_state(env.home().as_path(), project.as_path()),
+            "VACANT",
+            "wrapper death must kill the agent and release the authority"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// 契约 2b(#38-r2): the agent exits while a GRANDCHILD keeps running —
@@ -277,11 +281,18 @@ fn duty_grandchild_lingering_yields_vacant() {
         grand_sentinel.exists(),
         "precondition: the grandchild is still alive"
     );
-    assert_eq!(
-        check_state(env.home().as_path(), project.as_path()),
-        "VACANT",
-        "a lingering grandchild must never keep the duty lock"
-    );
+    // Settle, then require the state to STAY VACANT across repeated probes
+    // (a single immediate re-probe can race the previous probe's own
+    // release — probe stability is part of the contract).
+    std::thread::sleep(Duration::from_millis(300));
+    for _ in 0..5 {
+        assert_eq!(
+            check_state(env.home().as_path(), project.as_path()),
+            "VACANT",
+            "a lingering grandchild must never keep the duty lock"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // Cleanup: end the grandchild.
     let _ = std::fs::remove_file(&grand_sentinel);
     let _ = wrapper;
