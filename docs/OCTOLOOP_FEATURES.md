@@ -21,7 +21,7 @@
   模型拿到纠错反馈重发。
 - **预算 checkpoint**:50 轮迭代耗尽且工作树脏时,自动 wip commit +
   阶段版 result(有 .result-owner 时写 result.checkpoint.md,不覆盖
-  peer 终稿),goal 转 budget_exhausted 独立状态。缺省:开。体感:
+  peer 终稿),goal 转 budget_limited 独立状态。缺省:开。体感:
   超时任务的工作不再全丢,可从 checkpoint 续。
 - **turn-continuation 钩子**:活 goal 的 turn 之间零延迟自动续拍
   (引擎特性)。缺省:开。体感:goal 推进不再等外环唤醒节拍。
