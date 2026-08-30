@@ -220,8 +220,8 @@ fn olp_version_consistent_across_docs() {
         ("docs/OUTER_LOOP_PROTOCOL.md", protocol.as_str()),
     ] {
         assert!(
-            text.contains("olp/v1"),
-            "{rel} must reference protocol version olp/v1"
+            text.contains("olp/v2"),
+            "{rel} must reference protocol version olp/v2 (R7 bump)"
         );
     }
     // Neither file's own protocol declaration may still say v0. (Quoted
@@ -283,4 +283,33 @@ fn olp_result_schema_fields_documented() {
         "result.md schema fields documented in appendix A must be exactly \
          {{slug, outcome, updated_unix, turn, verified, protocol}}"
     );
+}
+
+/// #38-r1 E: the outer-duty duty lock is wired into all three outer-facing
+/// surfaces with ONE consistent contract, and the protocol version bump
+/// (olp/v2, R7) is synchronized across PROTOCOL + AGENTS.
+#[test]
+fn outer_duty_wiring_three_surfaces_consistent() {
+    let protocol = read("docs/OUTER_LOOP_PROTOCOL.md");
+    let boot = read("docs/OLP_OUTER_BOOT.md");
+    let skill = read(".claude/skills/octoloop/SKILL.md");
+    let agents = read("AGENTS.md");
+    for (name, text) in [("protocol", &protocol), ("boot", &boot), ("skill", &skill)] {
+        assert!(
+            text.contains("outer-duty hold"),
+            "{name} surface references outer-duty hold"
+        );
+    }
+    // Lock-is-authority + diagnostics-only invariants appear verbatim.
+    assert!(protocol.contains("锁即 authority"), "R7 authority wording");
+    assert!(
+        protocol.contains("仅诊断、绝不参与裁定"),
+        "TTL/metadata diagnostic-only"
+    );
+    // Version bump synchronized.
+    assert!(
+        protocol.contains("protocol: olp/v2"),
+        "PROTOCOL bumped to v2"
+    );
+    assert!(agents.contains("protocol: olp/v2"), "AGENTS synced to v2");
 }

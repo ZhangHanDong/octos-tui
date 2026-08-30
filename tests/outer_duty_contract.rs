@@ -147,18 +147,6 @@ fn spawn_holder(
     panic!("holder never acquired the lock; wrapper_err={wrapper_err:?}");
 }
 
-/// End the REAL child (remove sentinel) and wait for VACANT.
-fn release_holder(home: &std::path::Path, project: &std::path::Path, sentinel: &std::path::Path) {
-    let _ = std::fs::remove_file(sentinel);
-    for _ in 0..600 {
-        if check_state(home, project) == "VACANT" {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    panic!("lock never released after sentinel removal");
-}
-
 fn check_state(home: &std::path::Path, project: &std::path::Path) -> String {
     let out = duty(home)
         .args(["check", "--project", project.to_str().unwrap()])

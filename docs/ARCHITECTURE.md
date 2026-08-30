@@ -490,7 +490,7 @@ added without a row here.
 | `src/cmd/mod.rs` | 273 | `octoscode` subcommands: `update` and `doctor` (design doc). |
 | `src/cmd/update.rs` | 606 | `octoscode update` — install-method-aware updater (design §A). |
 | `src/cmd/olp_mcp.rs` | 20 | `octoscode olp-mcp-serve` entry — OUTER_LOOP_REVIEW #31 OLP-MCP server subcommand. |
-| `src/cmd/outer_duty.rs` | 88 | `octoscode outer-duty` entry — OUTER_LOOP_REVIEW #38 per-project duty lock (hold/check). |
+| `src/cmd/outer_duty.rs` | 91 | `octoscode outer-duty` entry — OUTER_LOOP_REVIEW #38 per-project duty lock (hold/check). |
 | `src/lib.rs` | 317 | Crate root — module declarations and the shared public surface. |
 | `src/main.rs` | 53 | Binary entry point: subcommand dispatch, then `event_loop::run`. |
 
@@ -501,7 +501,7 @@ added without a row here.
 | `src/client_event.rs` | 377 | Decoded RPC results and autonomy results, in the shape the store reduces. |
 | `src/event_loop.rs` | 7047 | Terminal raw mode, alternate screen, draw loop, keyboard dispatch, backend polling, send-error handling. |
 | `src/model.rs` | 11612 | `AppState`, the TUI view models, `AppUiCommand`, and the mapping from AppUI snapshots/tasks/messages into renderable state. |
-| `src/outer_duty.rs` | 175 | Outer-duty kernel lock: fs2 try_lock_exclusive, VACANT/HELD/ERROR, atomic 0600 metadata sidecar (#38). |
+| `src/outer_duty.rs` | 294 | Outer-duty kernel lock: fs2 try_lock_exclusive, VACANT/HELD/ERROR, atomic 0600 metadata sidecar (#38). |
 | `src/olp_mcp.rs` | 397 | OLP-MCP outer-loop server: newline JSON-RPC stdio, mailbox quota/timeout, board audit (#31). |
 | `src/store.rs` | 37021 | The AppUI reducer: snapshots, RPC results, notifications, local commands, approvals, diffs, task output and queued prompts folded into `AppState`. |
 

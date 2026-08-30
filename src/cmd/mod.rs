@@ -234,6 +234,44 @@ mod tests {
         parts.iter().map(|s| s.to_string()).collect()
     }
 
+    /// #38-r1 E: outer-duty route golden — recognized, args parsed, unknown
+    /// action rejected, `--` splitting, exit codes.
+    #[test]
+    fn route_outer_duty_golden() {
+        let argv = |a: &[&str]| -> Vec<String> {
+            std::iter::once("octoscode".to_string())
+                .chain(a.iter().map(|s| s.to_string()))
+                .collect()
+        };
+        let args = parse_outer_duty_args(&["check".into(), "--project".into(), "/tmp".into()][..]);
+        assert_eq!(args.action, "check");
+        assert_eq!(args.project, "/tmp");
+        assert!(args.command.is_empty());
+        let args = parse_outer_duty_args(
+            &[
+                "hold".into(),
+                "--project".into(),
+                "/tmp".into(),
+                "--signature".into(),
+                "s".into(),
+                "--duties".into(),
+                "d".into(),
+                "--".into(),
+                "agent".into(),
+                "--flag".into(),
+            ][..],
+        );
+        assert_eq!(args.action, "hold");
+        assert_eq!(args.signature, "s");
+        assert_eq!(args.duties, "d");
+        assert_eq!(args.command, vec!["agent", "--flag"]);
+        // Routing: recognized as a subcommand.
+        assert!(matches!(
+            route(&argv(&["outer-duty", "check"])),
+            Some(Route::OuterDuty(_))
+        ));
+    }
+
     #[test]
     fn route_returns_none_for_no_subcommand() {
         // Plain launch — no subcommand → TUI path.

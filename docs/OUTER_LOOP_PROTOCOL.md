@@ -4,7 +4,7 @@
 > 审查、指导** octos 的长程 goal 执行。本协议规范化的是已在实战中验证过的信道,
 > 不发明新机制;L1/L2 是短期补齐路线。
 >
-> `protocol: olp/v1`
+> `protocol: olp/v2`
 >
 > v0 → v1 变更(2026-08-24 生效):R1 ACK 定式语法化(done/wontdo/blocked +
 > wontdo 分歧规则);result.md frontmatter v1 schema 固化(见附录 A);
@@ -83,6 +83,15 @@
   (octos #20-20c 移交,作为 R4 子条款,不升协议版本。)
 - **R5 — 指导幂等**:outer 的意见带日期与唯一编号,只在 `Active` 区可执行;
   ACK 后移入历史区且永不重放。重复投递以 ACK 为去重依据。
+- **R7 — 主审权 OS 独占锁(outer-duty,olp/v2 起)**:多外环的主审权
+  以 per-project 会话寿命 OS 锁为准——上岗外环必须经
+  `octoscode outer-duty hold --project P --signature S --duties D -- <agent>`
+  启动(锁即 authority,与真实 agent 同生共死:fd 由 agent 进程继承,
+  wrapper 亡而 agent 在则锁仍 HELD);`check` 仅观察、绝不夺取;活锁
+  接管只归 operator(终止旧 holder 后再 acquire),无 agent 自助强夺。
+  metadata sidecar 与一切 TTL 仅诊断、绝不参与裁定。范围:单机
+  flock(LockFileEx 支持另立条目),NFS 不适用;本切片 fencing 为文档
+  层纪律,硬 gate(board-append/push 校验 lease)为后续条目。
 - **R6 — 版本协商**:本文件头部 `protocol: olp/vN`;`AGENTS.md` 引用同版本。
   信道语义变更必须升版本。
 
