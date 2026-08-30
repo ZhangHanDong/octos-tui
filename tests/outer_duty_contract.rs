@@ -303,7 +303,20 @@ fn duty_corrupt_metadata_keeps_ownership() {
 fn duty_files_tighten_preexisting_permissive() {
     let env = TempHome::new("perm");
     let project = env.project();
-    // Pre-create the lock dir + lockfile WORLD-READABLE; umask 0.
+    // Permissive umask EXPLICITLY set for the whole test (countersign D:
+    // umask 显式设置) — restored on exit.
+    struct UmaskGuard(libc::mode_t);
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::umask(self.0)
+            };
+        }
+    }
+    #[allow(unsafe_code)]
+    let _umask_guard = UmaskGuard(unsafe { libc::umask(0o000) });
+    // Pre-create the lock dir + lockfile WORLD-READABLE.
     let lock = env.lock_path();
     let dir = lock.parent().unwrap();
     std::fs::create_dir_all(dir).unwrap();
