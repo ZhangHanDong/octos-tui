@@ -3300,6 +3300,19 @@ pub fn slugify_profile_id(value: &str) -> String {
     slug
 }
 
+/// Decode a peer slug only when presenting it to the operator.
+///
+/// Peer session topics are URI-safe identifiers, so a Chinese slug can arrive
+/// as `%E5%88%86...`. The encoded form remains the identity used for session
+/// lookup and routing; this helper is deliberately for human-facing text only.
+/// A malformed percent escape or non-UTF-8 byte sequence is retained verbatim.
+pub fn peer_slug_for_display(slug: &str) -> String {
+    percent_encoding::percent_decode_str(slug)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| slug.to_owned())
+}
+
 /// Suggest a default profile id from the chosen model/provider family. Known
 /// families map to a short, friendly handle (the zai/glm family suggests `glm`,
 /// deepseek suggests `deepseek`, …); an unrecognized-but-present family is
@@ -3868,6 +3881,10 @@ pub struct PendingPeerPrepare {
 /// matches the `pre_token_turns` TTL self-heal).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerKickoff {
+    /// Human-facing peer name from the server. The session topic may instead
+    /// contain an opaque, URI-safe slug, so it must not be reconstructed from
+    /// the session key for display.
+    pub slug: String,
     pub brief: String,
     pub brief_path: String,
     pub go: bool,
@@ -9654,13 +9671,11 @@ impl AppState {
     pub fn take_pending_peer_kickoff(&mut self, session_id: &SessionKey) -> Option<PeerKickoff> {
         self.prune_stale_peer_kickoffs();
         let kickoff = self.pending_peer_kickoffs.remove(session_id)?;
-        // Slug derivation mirrors `Store::peer_slug_for_key` (store.rs): a
-        // peer session's topic is `peer-<slug>`; strip the prefix for display.
-        let slug = session_id
-            .topic()
-            .and_then(|topic| topic.strip_prefix("peer-"))
-            .unwrap_or(session_id.0.as_str())
-            .to_owned();
+        // The server can use an opaque slug in the session topic (for example
+        // `peer-6f7d...`) while the staged event carries the operator-facing
+        // Chinese name. Keep that name instead of trying to reconstruct it
+        // from the routing identifier.
+        let slug = peer_slug_for_display(&kickoff.slug);
         // Durable peer identity — this is the single production chokepoint where
         // a peer session is registered, so record it here (insert-only; never
         // pruned, unlike the dock roster below).
@@ -9668,7 +9683,7 @@ impl AppState {
         self.peer_session_meta.insert(
             session_id.clone(),
             PeerMeta {
-                slug,
+                slug: peer_slug_for_display(&slug),
                 brief_path: kickoff.brief_path.clone(),
                 agent_staged: kickoff.agent_staged,
                 created: kickoff.created,
@@ -12307,6 +12322,15 @@ mod tests {
         assert_eq!(slugify_profile_id("  My Profile!!  "), "my-profile");
         assert_eq!(slugify_profile_id("a__b--c"), "a-b-c");
         assert_eq!(slugify_profile_id("---"), "");
+    }
+
+    #[test]
+    fn peer_slug_display_decodes_utf8_percent_encoding_without_changing_invalid_input() {
+        assert_eq!(
+            peer_slug_for_display("%E5%88%86%E6%9E%90octos%E6%9E%B6%E6%9E%84"),
+            "分析octos架构"
+        );
+        assert_eq!(peer_slug_for_display("%FF"), "%FF");
     }
 
     #[test]
