@@ -44,6 +44,7 @@ crossterm = "0.28"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 unicode-width = "0.2"
 unicode-segmentation = "1"
+percent-encoding = "2"
 # Syntax highlighting for fenced code blocks in the transcript. `default-fancy`
 # keeps the regex engine pure-Rust (no onig C toolchain), matching the repo's
 # no-C-deps convention (see the rustls-only note below).

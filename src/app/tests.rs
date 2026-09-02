@@ -11925,10 +11925,11 @@ mod tests {
 
         // Stage a peer: insert into pending (simulates peer/staged) AND pop
         // it via take_pending_peer_kickoff (simulates session/opened landing).
-        let sid = SessionKey("local:tui#peer-refactor".into());
+        let sid = SessionKey("local:tui#peer-6f7d64e5b2c69ac0".into());
         app.pending_peer_kickoffs.insert(
             sid.clone(),
             crate::model::PeerKickoff {
+                slug: "中文显示测试".into(),
                 brief: "refactor auth".into(),
                 brief_path: "/tmp/brief.md".into(),
                 go: false,
@@ -11940,6 +11941,13 @@ mod tests {
         // After the take, pending is empty BUT the durable roster has it.
         assert!(app.pending_peer_kickoffs.is_empty());
         assert_eq!(app.peer_session_meta.len(), 1, "durable roster recorded");
+        assert_eq!(
+            app.peer_session_meta
+                .get(&sid)
+                .map(|meta| meta.slug.as_str()),
+            Some("中文显示测试"),
+            "the operator-facing peer name must not be reconstructed from an opaque session slug"
+        );
 
         // total counts the opened peer (review F1: previously 0 here).
         let (total, live, blocked, unread) = peer_dock_counts(&app);
@@ -11965,6 +11973,7 @@ mod tests {
         app.pending_peer_kickoffs.insert(
             sid.clone(),
             crate::model::PeerKickoff {
+                slug: "ci-red".into(),
                 brief: "ci-red".into(),
                 brief_path: "/tmp/brief.md".into(),
                 go: false,
@@ -11994,6 +12003,7 @@ mod tests {
         app.pending_peer_kickoffs.insert(
             sid.clone(),
             crate::model::PeerKickoff {
+                slug: "refactor".into(),
                 brief: "refactor auth".into(),
                 brief_path: "/tmp/brief.md".into(),
                 go: false,
@@ -12033,6 +12043,7 @@ mod tests {
         app.pending_peer_kickoffs.insert(
             sid.clone(),
             crate::model::PeerKickoff {
+                slug: "refactor".into(),
                 brief: "refactor auth".into(),
                 brief_path: "/tmp/brief.md".into(),
                 go: false,
@@ -12304,6 +12315,7 @@ mod tests {
         opening.pending_peer_kickoffs.insert(
             SessionKey("local:tui#peer-opening".into()),
             crate::model::PeerKickoff {
+                slug: "opening".into(),
                 brief: "audit".into(),
                 brief_path: "/tmp/audit.md".into(),
                 go: true,

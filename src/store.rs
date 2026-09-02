@@ -1195,12 +1195,32 @@ impl Store {
     /// The peer slug for a minted peer session key: the key's topic is
     /// `peer-<slug>` by construction, so strip the prefix (fall back to the
     /// full topic, then the raw key, for defensive rendering).
-    fn peer_slug_for_key(session_id: &SessionKey) -> String {
-        session_id
+    fn peer_slug_for_key(&self, session_id: &SessionKey) -> String {
+        if let Some(meta) = self.state.peer_session_meta.get(session_id) {
+            return meta.slug.clone();
+        }
+        let slug = session_id
             .topic()
             .map(|topic| topic.strip_prefix("peer-").unwrap_or(topic))
-            .unwrap_or(session_id.0.as_str())
-            .to_owned()
+            .unwrap_or(session_id.0.as_str());
+        crate::model::peer_slug_for_display(slug)
+    }
+
+    /// The local peer runtime persists an optional operator-facing name next
+    /// to `brief.md`. `peer/staged` predates that metadata and only carries an
+    /// opaque routing slug for agent-created peers, so recover the name when
+    /// both client and runtime share the local filesystem. Remote or older
+    /// runtimes simply retain the decoded slug.
+    fn peer_display_name(brief_path: &str, slug: &str) -> String {
+        let fallback = crate::model::peer_slug_for_display(slug);
+        let Some(peer_dir) = std::path::Path::new(brief_path).parent() else {
+            return fallback;
+        };
+        std::fs::read_to_string(peer_dir.join("name"))
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(fallback)
     }
 
     /// `turn/steer` result (octos#1807). `steered:true` — the text joined
@@ -1344,6 +1364,7 @@ impl Store {
                 self.state.pending_peer_kickoffs.insert(
                     session_id.clone(),
                     crate::model::PeerKickoff {
+                        slug: entry.slug.clone(),
                         brief,
                         brief_path: entry.brief_path.clone(),
                         go: pending.go && index == 0,
@@ -1368,7 +1389,7 @@ impl Store {
             self.state.status = t!(
                 "status.peer_fleet_opening",
                 n = total,
-                slug = result.slug.clone()
+                slug = crate::model::peer_slug_for_display(&result.slug)
             )
             .into_owned();
             return first_open;
@@ -1383,6 +1404,7 @@ impl Store {
         self.state.pending_peer_kickoffs.insert(
             session_id.clone(),
             crate::model::PeerKickoff {
+                slug: result.slug.clone(),
                 brief: pending.brief,
                 brief_path: result.brief_path,
                 go: pending.go,
@@ -1390,7 +1412,11 @@ impl Store {
                 created: std::time::Instant::now(),
             },
         );
-        self.state.status = t!("status.peer_opening", slug = result.slug.clone()).into_owned();
+        self.state.status = t!(
+            "status.peer_opening",
+            slug = crate::model::peer_slug_for_display(&result.slug)
+        )
+        .into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
                 session_id,
@@ -1420,6 +1446,7 @@ impl Store {
         &mut self,
         event: crate::model::PeerStagedParams,
     ) -> Option<AppUiCommand> {
+        let display_name = Self::peer_display_name(&event.brief_path, &event.slug);
         let session_id = octos_core::SessionKey::with_profile_topic(
             &event.profile_id,
             "local",
@@ -1434,8 +1461,7 @@ impl Store {
             .any(|session| session.id == session_id);
         let open_in_flight = self.state.pending_peer_kickoffs.contains_key(&session_id);
         if session_exists || open_in_flight {
-            self.state.status =
-                t!("status.peer_staged_known", slug = event.slug.clone()).into_owned();
+            self.state.status = t!("status.peer_staged_known", slug = display_name).into_owned();
             return None;
         }
         // A slug legitimately REUSED after a `peer/closed` restages here: clear
@@ -1446,6 +1472,7 @@ impl Store {
         self.state.pending_peer_kickoffs.insert(
             session_id.clone(),
             crate::model::PeerKickoff {
+                slug: display_name.clone(),
                 brief: event.brief,
                 brief_path: event.brief_path,
                 go: false,
@@ -1453,8 +1480,7 @@ impl Store {
                 created: std::time::Instant::now(),
             },
         );
-        self.state.status =
-            t!("status.peer_staged_by_agent", slug = event.slug.clone()).into_owned();
+        self.state.status = t!("status.peer_staged_by_agent", slug = display_name).into_owned();
         Some(AppUiCommand::OpenSession(
             octos_core::ui_protocol::SessionOpenParams {
                 session_id,
@@ -1677,7 +1703,7 @@ impl Store {
         self.state
             .pre_token_turns
             .insert(session_id.clone(), std::time::Instant::now());
-        let slug = Self::peer_slug_for_key(&session_id);
+        let slug = self.peer_slug_for_key(&session_id);
         self.state.status = t!("status.peer_started", slug = slug).into_owned();
         Some(AppUiCommand::SubmitPrompt(TurnStartParams {
             // Ordinary chat turn: context-scoped tools stay unadvertised.
@@ -11649,7 +11675,7 @@ impl Store {
                 // state, pre-token marker, gate housekeeping) targets it —
                 // submit the kickoff through it.
                 if let Some(kickoff) = peer_kickoff {
-                    let slug = Self::peer_slug_for_key(&session_id);
+                    let slug = self.peer_slug_for_key(&session_id);
                     let prompt = Self::peer_kickoff_prompt(&kickoff.brief, &kickoff.brief_path);
                     // Staging-aware submit (K3 review): a reused peer topic
                     // whose session already has a live turn must STAGE the
@@ -16371,6 +16397,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn peer_display_name_uses_local_metadata_before_opaque_slug() {
+        let peer_dir = tempfile::tempdir().expect("temporary peer directory");
+        let brief_path = peer_dir.path().join("brief.md");
+        std::fs::write(peer_dir.path().join("name"), "中文回归测试\n").expect("write peer name");
+
+        assert_eq!(
+            Store::peer_display_name(
+                brief_path.to_str().expect("utf-8 path"),
+                "peer-ebf0e70e9ff73635"
+            ),
+            "中文回归测试"
+        );
+        assert_eq!(
+            Store::peer_display_name("/missing/brief.md", "%E5%88%86%E6%9E%90"),
+            "分析"
+        );
+    }
+
     /// Regression (review #1): the delete guard must protect EVERY open session's
     /// profile, not just the selected one — sessions accumulate across switches.
     #[test]
@@ -17059,6 +17104,7 @@ mod tests {
         let opened_key = params.session_id.clone();
         store.state.pending_peer_kickoffs.remove(&opened_key); // (re-take path)
         let kickoff = crate::model::PeerKickoff {
+            slug: "fix-nav".into(),
             brief: "fix the nav".into(),
             brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
             go: false,
@@ -17356,6 +17402,7 @@ mod tests {
         store.state.pending_peer_kickoffs.insert(
             peer_key.clone(),
             crate::model::PeerKickoff {
+                slug: "fix-nav".into(),
                 brief: "fix the nav".into(),
                 brief_path: "/repo/.octos/peers/fix-nav/BRIEF.md".into(),
                 go: false,
