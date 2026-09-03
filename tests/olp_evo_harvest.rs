@@ -123,7 +123,10 @@ impl Sandbox {
         read_lines(self.evo_board())
             .iter()
             .filter(|l| l.starts_with("### EVO-"))
-            .map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
+            .map(|l| {
+                let tok = l.split_whitespace().nth(1).unwrap_or("");
+                tok.split(['（', ' ']).next().unwrap_or("").to_string()
+            })
             .collect()
     }
 }
@@ -365,7 +368,7 @@ fn olp_evo_harvest_partial_line_then_completed_yields_one_card() {
     let partial: &str =
         "{\"ts\":\"2026-08-30T03:00:00Z\",\"kind\":\"turn_error\",\"data\":{\"detail\":\"un";
     std::fs::write(&events, complete).unwrap();
-    let full_len = std::fs::metadata(&events).unwrap().len() as usize;
+    let complete_only_len = std::fs::metadata(&events).unwrap().len() as usize;
     std::fs::write(&events, format!("{complete}{partial}")).unwrap();
     let out = Command::new("bash")
         .arg(script())
@@ -385,7 +388,7 @@ fn olp_evo_harvest_partial_line_then_completed_yields_one_card() {
     )
     .unwrap();
     assert!(
-        state_text.contains(&format!("\"offset\":{}", full_len)),
+        state_text.contains(&format!("\"offset\": {}", complete_only_len)),
         "events offset must be the pre-partial byte count: {state_text}"
     );
     // complete the partial line and rerun
@@ -475,18 +478,14 @@ fn olp_evo_harvest_recovers_after_crash_between_append_and_commit() {
         .find(|p| p.ends_with("state.json"))
         .unwrap();
     let state_text = std::fs::read_to_string(&state_file).unwrap();
-    let events_size = std::fs::metadata(sb.root.join("events.jsonl"))
-        .unwrap()
-        .len();
-    let mcp_size = std::fs::metadata(sb.root.join("mcp-board.md"))
-        .unwrap()
-        .len();
+    let events_size = std::fs::metadata(&sb.events_path).unwrap().len();
+    let mcp_size = std::fs::metadata(&sb.mcp_path).unwrap().len();
     assert!(
-        state_text.contains(&format!("\"offset\":{}", events_size)),
+        state_text.contains(&format!("\"offset\": {}", events_size)),
         "{state_text}"
     );
     assert!(
-        state_text.contains(&format!("\"offset\":{}", mcp_size)),
+        state_text.contains(&format!("\"offset\": {}", mcp_size)),
         "{state_text}"
     );
 }
@@ -551,20 +550,19 @@ fn olp_evo_harvest_fails_without_review_board_before_creating_state() {
 
 fn olp_evo_harvest_dry_run_is_read_only_with_existing_state() {
     let sb = Sandbox::new("dry-run");
-    std::fs::write(
-        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
-        "### 1. base\n\nACK(blocked): first\n",
-    )
-    .unwrap();
+    // Given: one full harvest landed (8 cards), then a NEW ack line.
+    sb.full_trigger_board();
     let out = sb.run(false);
-    assert!(out.status.success());
-    assert_eq!(sb.evo_count(), 1);
-    // append a new trigger line
-    std::fs::write(
-        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
-        "### 1. base\n\nACK(blocked): first\n\n### 2. next\n\nACK(blocked): second\n",
-    )
-    .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(sb.evo_count(), 8);
+    let board = sb.repo.join(".octos/OUTER_LOOP_REVIEW.md");
+    let mut text = std::fs::read_to_string(&board).unwrap();
+    text.push_str("\n### 99. new\n\nACK(blocked): second run line\n");
+    std::fs::write(&board, text).unwrap();
     let before_board = sha256(&sb.evo_board());
     let before_state: Vec<String> = find_files(&sb.state_root)
         .iter()

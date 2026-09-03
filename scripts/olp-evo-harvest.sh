@@ -245,8 +245,12 @@ if [ -f "$EVO_BOARD" ]; then
     while IFS= read -r line; do
         case $line in
             '### EVO-'*)
+                # The id is followed directly by a fullwidth （, not a
+                # space — slice NUMERIC PREFIX ONLY (arithmetic on the
+                # raw remainder is a syntax error that would abort the
+                # whole reconcile loop under set -e).
                 local_id=${line#\#\#\# EVO-}
-                local_id=${local_id%% *}
+                local_id=${local_id%%[$'\uff08' ]*}
                 local_id=$((10#$local_id))
                 if [ "$local_id" -ge "$NEXT_ID" ]; then
                     NEXT_ID=$((local_id + 1))
