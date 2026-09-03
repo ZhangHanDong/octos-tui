@@ -857,16 +857,35 @@ fn olp_evo_init_appends_evolution_gitignore_once() {
             .output()
             .unwrap()
     };
+    // Exit 0 (all deps present) or 2 (dependency check found gaps, e.g. a
+    // CI runner without octoscode) — both are the script's defined
+    // semantics; the contract Then pins only the .gitignore content.
     let out = run();
+    let diag = |o: &std::process::Output| {
+        format!(
+            "exit={} stdout={} stderr={}",
+            o.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        )
+    };
     assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
+        matches!(out.status.code(), Some(0) | Some(2)),
+        "run 1 must exit 0 or 2: {}",
+        diag(&out)
     );
     let out2 = run();
-    assert!(out2.status.success());
+    assert!(
+        matches!(out2.status.code(), Some(0) | Some(2)),
+        "run 2 must exit 0 or 2: {}",
+        diag(&out2)
+    );
     let gi = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
-    assert_eq!(gi.matches(".octos/EVOLUTION.md").count(), 1);
+    assert_eq!(
+        gi.matches(".octos/EVOLUTION.md").count(),
+        1,
+        "gitignore content: {gi:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -888,13 +907,20 @@ fn olp_evo_init_skips_when_octos_dir_ignored() {
         .current_dir(&repo)
         .output()
         .unwrap();
+    // 0 (deps present) or 2 (dependency-check gap on the runner) are both
+    // defined; the contract Then pins only that nothing was appended.
     assert!(
-        out.status.success(),
-        "stderr: {}",
+        matches!(out.status.code(), Some(0) | Some(2)),
+        "must exit 0 or 2: exit={} stdout={} stderr={}",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let gi = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
-    assert!(!gi.contains(".octos/EVOLUTION.md"));
+    assert!(
+        !gi.contains(".octos/EVOLUTION.md"),
+        "gitignore must not gain the line: {gi:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
