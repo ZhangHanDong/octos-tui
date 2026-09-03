@@ -35,6 +35,8 @@ struct Sandbox {
     root: PathBuf,
     repo: PathBuf,
     state_root: PathBuf,
+    events_path: PathBuf,
+    mcp_path: PathBuf,
 }
 
 impl Sandbox {
@@ -48,10 +50,17 @@ impl Sandbox {
         let state_root = root.join("state");
         std::fs::create_dir_all(repo.join(".octos")).unwrap();
         std::fs::create_dir_all(&state_root).unwrap();
+        // Default optional sources point INSIDE the sandbox (nonexistent
+        // until a fixture installs them) — the host's real MCP board must
+        // never leak into a test.
+        let events_path = root.join("events.jsonl");
+        let mcp_path = root.join("mcp-board.md");
         Self {
             root,
             repo,
             state_root,
+            events_path,
+            mcp_path,
         }
     }
 
@@ -69,16 +78,8 @@ impl Sandbox {
             "review-board.md",
             &self.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
         );
-        let events = self.root.join("events.jsonl");
-        std::fs::copy(fixtures("events.jsonl"), &events).unwrap();
-        let mcp = self.root.join("mcp-board.md");
-        std::fs::copy(fixtures("mcp-board.md"), &mcp).unwrap();
-        // SAFETY: confined to this test process.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("OLP_EVO_EVENTS", &events);
-            std::env::set_var("OLP_EVO_MCP_BOARD", &mcp);
-        }
+        std::fs::copy(fixtures("events.jsonl"), &self.events_path).unwrap();
+        std::fs::copy(fixtures("mcp-board.md"), &self.mcp_path).unwrap();
     }
 
     fn run(&self, dry_run: bool) -> Output {
@@ -87,7 +88,23 @@ impl Sandbox {
         if dry_run {
             cmd.arg("--dry-run");
         }
-        cmd.env("OLP_EVO_STATE", &self.state_root);
+        cmd.env("OLP_EVO_STATE", &self.state_root)
+            .env("OLP_EVO_EVENTS", &self.events_path)
+            .env("OLP_EVO_MCP_BOARD", &self.mcp_path);
+        cmd.output().unwrap()
+    }
+
+    /// Run with explicit source env overrides (fault injection etc.).
+    fn run_env(&self, extra: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new("bash");
+        cmd.arg(script())
+            .arg(&self.repo)
+            .env("OLP_EVO_STATE", &self.state_root)
+            .env("OLP_EVO_EVENTS", &self.events_path)
+            .env("OLP_EVO_MCP_BOARD", &self.mcp_path);
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
         cmd.output().unwrap()
     }
 
@@ -106,7 +123,7 @@ impl Sandbox {
         read_lines(self.evo_board())
             .iter()
             .filter(|l| l.starts_with("### EVO-"))
-            .map(|l| l.split_whitespace().next().unwrap_or("").to_string())
+            .map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
             .collect()
     }
 }
@@ -148,7 +165,7 @@ fn sha256(path: &Path) -> String {
 
 /// Scenario: 全部触发器种类各落一卡
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_produces_cards_for_all_trigger_kinds() {
     let sb = Sandbox::new("all-kinds");
     sb.full_trigger_board();
@@ -161,9 +178,7 @@ fn olp_evo_harvest_produces_cards_for_all_trigger_kinds() {
     assert_eq!(sb.evo_count(), 8);
     assert_eq!(
         sb.evo_ids(),
-        (1..=8)
-            .map(|n| format!("### EVO-{n:04}"))
-            .collect::<Vec<_>>()
+        (1..=8).map(|n| format!("EVO-{n:04}")).collect::<Vec<_>>()
     );
     let lines = read_lines(sb.evo_board());
     for card in lines.iter().filter(|l| l.starts_with("### EVO-")) {
@@ -183,33 +198,25 @@ fn olp_evo_harvest_produces_cards_for_all_trigger_kinds() {
         assert!(envelope.is_some(), "card missing envelope: {block}");
         assert!(symptom.is_some(), "card missing symptom: {block}");
     }
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
 }
 
 /// Scenario: 负例矩阵零卡
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_negative_matrix_yields_zero_cards() {
     let sb = Sandbox::new("negative");
     sb.copy_fixture(
         "negative/review-board.md",
         &sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
     );
-    let events = sb.root.join("events.jsonl");
-    std::fs::copy(fixtures("negative/events.jsonl"), &events).unwrap();
-    let mcp = sb.root.join("mcp-board.md");
-    std::fs::copy(fixtures("negative/mcp-board.md"), &mcp).unwrap();
+    std::fs::copy(fixtures("negative/events.jsonl"), &sb.events_path).unwrap();
+    std::fs::copy(fixtures("negative/mcp-board.md"), &sb.mcp_path).unwrap();
     let out = Command::new("bash")
         .arg(script())
         .arg(&sb.repo)
         .env("OLP_EVO_STATE", &sb.state_root)
-        .env("OLP_EVO_EVENTS", &events)
-        .env("OLP_EVO_MCP_BOARD", &mcp)
+        .env("OLP_EVO_EVENTS", &sb.events_path)
+        .env("OLP_EVO_MCP_BOARD", &sb.mcp_path)
         .output()
         .unwrap();
     assert_eq!(
@@ -228,7 +235,7 @@ fn olp_evo_harvest_negative_matrix_yields_zero_cards() {
 
 /// Scenario: identity 区分条目并在重跑时去重
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_identity_distinguishes_entries_and_dedups_reruns() {
     let sb = Sandbox::new("dedup");
     // ### 12 and ### 13 each carry an identical ACK(blocked) line
@@ -238,12 +245,6 @@ fn olp_evo_harvest_identity_distinguishes_entries_and_dedups_reruns() {
         "### 12. A\n\nACK(blocked): identical text here\n\n### 13. B\n\nACK(blocked): identical text here\n",
     )
     .unwrap();
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
     let out1 = sb.run(false);
     assert!(out1.status.success());
     assert_eq!(sb.evo_count(), 2);
@@ -270,7 +271,7 @@ fn olp_evo_harvest_identity_distinguishes_entries_and_dedups_reruns() {
 
 /// Scenario: 采集从不触碰活板
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_never_writes_review_board_or_ack() {
     let sb = Sandbox::new("no-touch");
     sb.full_trigger_board();
@@ -284,17 +285,11 @@ fn olp_evo_harvest_never_writes_review_board_or_ack() {
         .filter(|l| l.starts_with("ACK("))
         .count();
     assert_eq!(ack_lines, 0);
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
 }
 
 /// Scenario: docs 冻结快照被忽略
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_ignores_docs_snapshot() {
     let sb = Sandbox::new("docs-snapshot");
     std::fs::write(
@@ -308,12 +303,6 @@ fn olp_evo_harvest_ignores_docs_snapshot() {
         "### 2. snapshot\n\nACK(blocked): frozen snapshot line\n",
     )
     .unwrap();
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
     let out = sb.run(false);
     assert!(out.status.success());
     assert_eq!(sb.evo_count(), 0);
@@ -321,7 +310,7 @@ fn olp_evo_harvest_ignores_docs_snapshot() {
 
 /// Scenario: MCP 卡不复制问询正文
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_mcp_symptom_excludes_question_text() {
     let sb = Sandbox::new("mcp-privacy");
     std::fs::write(
@@ -329,7 +318,7 @@ fn olp_evo_harvest_mcp_symptom_excludes_question_text() {
         "### 1. base\n\nnothing\n",
     )
     .unwrap();
-    let mcp = sb.root.join("mcp-board.md");
+    let mcp = sb.mcp_path.clone();
     std::fs::write(
         &mcp,
         "- 2026-08-30 05:00:00 MCP(ask_outer) blocked: id=abc123 reason=inner stuck needs=op question=SECRET-QUESTION\n",
@@ -362,7 +351,7 @@ fn olp_evo_harvest_mcp_symptom_excludes_question_text() {
 
 /// Scenario: 半行不触发,补齐换行后恰一卡
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_partial_line_then_completed_yields_one_card() {
     let sb = Sandbox::new("partial");
     std::fs::write(
@@ -370,7 +359,7 @@ fn olp_evo_harvest_partial_line_then_completed_yields_one_card() {
         "### 1. base\n\nnothing\n",
     )
     .unwrap();
-    let events = sb.root.join("events.jsonl");
+    let events = sb.events_path.clone();
     let complete =
         "{\"ts\":\"2026-08-30T02:00:00Z\",\"kind\":\"turn_error\",\"data\":{\"detail\":\"x\"}}\n";
     let partial: &str =
@@ -415,7 +404,7 @@ fn olp_evo_harvest_partial_line_then_completed_yields_one_card() {
 
 /// Scenario: 截断或替换后重置且不重复
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_resets_on_truncate_or_replace_without_duplicates() {
     let sb = Sandbox::new("reset");
     std::fs::write(
@@ -423,7 +412,7 @@ fn olp_evo_harvest_resets_on_truncate_or_replace_without_duplicates() {
         "### 1. base\n\nnothing\n",
     )
     .unwrap();
-    let events = sb.root.join("events.jsonl");
+    let events = sb.events_path.clone();
     let esc = |n: u32| {
         format!(
             "{{\"ts\":\"2026-08-30T0{n}:00:00Z\",\"kind\":\"escalation\",\"data\":{{\"goal_id\":\"g{n}\",\"detail\":\"d\"}}}}\n"
@@ -467,24 +456,12 @@ fn olp_evo_harvest_resets_on_truncate_or_replace_without_duplicates() {
 
 /// Scenario: 追加卡后提交状态前崩溃可恢复
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_recovers_after_crash_between_append_and_commit() {
     let sb = Sandbox::new("crash");
     sb.full_trigger_board();
-    let out = Command::new("bash")
-        .arg(script())
-        .arg(&sb.repo)
-        .env("OLP_EVO_STATE", &sb.state_root)
-        .env("OLP_EVO_TEST", "1")
-        .env("OLP_EVO_FAULT", "after-append")
-        .output()
-        .unwrap();
+    let out = sb.run_env(&[("OLP_EVO_TEST", "1"), ("OLP_EVO_FAULT", "after-append")]);
     assert_eq!(out.status.code(), Some(70));
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_TEST");
-        std::env::remove_var("OLP_EVO_FAULT");
-    }
     let out2 = sb.run(false);
     assert!(
         out2.status.success(),
@@ -512,17 +489,11 @@ fn olp_evo_harvest_recovers_after_crash_between_append_and_commit() {
         state_text.contains(&format!("\"offset\":{}", mcp_size)),
         "{state_text}"
     );
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
 }
 
 /// Scenario: 并发采集编号唯一
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_concurrent_runs_allocate_unique_ids() {
     let sb = Sandbox::new("concurrent");
     sb.full_trigger_board();
@@ -531,8 +502,8 @@ fn olp_evo_harvest_concurrent_runs_allocate_unique_ids() {
         let script = script();
         let repo = sb.repo.clone();
         let state = sb.state_root.clone();
-        let events = sb.root.join("events.jsonl");
-        let mcp = sb.root.join("mcp-board.md");
+        let events = sb.events_path.clone();
+        let mcp = sb.mcp_path.clone();
         handles.push(std::thread::spawn(move || {
             Command::new("bash")
                 .arg(script)
@@ -558,26 +529,14 @@ fn olp_evo_harvest_concurrent_runs_allocate_unique_ids() {
     unique.sort();
     unique.dedup();
     assert_eq!(ids.len(), unique.len(), "ids must be unique: {ids:?}");
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
 }
 
 /// Scenario: 活板缺失即失败且零创建
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_fails_without_review_board_before_creating_state() {
     let sb = Sandbox::new("no-board");
     // no .octos/OUTER_LOOP_REVIEW.md created; state root exists and is writable
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
     let out = sb.run(false);
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -589,7 +548,7 @@ fn olp_evo_harvest_fails_without_review_board_before_creating_state() {
 
 /// Scenario: dry-run 对已有状态零写入
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_dry_run_is_read_only_with_existing_state() {
     let sb = Sandbox::new("dry-run");
     std::fs::write(
@@ -597,12 +556,6 @@ fn olp_evo_harvest_dry_run_is_read_only_with_existing_state() {
         "### 1. base\n\nACK(blocked): first\n",
     )
     .unwrap();
-    // SAFETY: single test process; env changes are confined to it.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("OLP_EVO_EVENTS");
-        std::env::remove_var("OLP_EVO_MCP_BOARD");
-    }
     let out = sb.run(false);
     assert!(out.status.success());
     assert_eq!(sb.evo_count(), 1);
@@ -634,7 +587,7 @@ fn olp_evo_harvest_dry_run_is_read_only_with_existing_state() {
 
 /// Scenario: 可选来源缺失时跳过
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_skips_missing_optional_sources() {
     let sb = Sandbox::new("skip");
     std::fs::write(
@@ -660,7 +613,7 @@ fn olp_evo_harvest_skips_missing_optional_sources() {
 
 /// Scenario: 状态按项目隔离
 #[test]
-#[ignore]
+
 fn olp_evo_harvest_state_is_per_project() {
     let board_text = "### 1. base\n\nACK(blocked): one\n";
     let root = std::env::temp_dir().join(format!("olp-evo-two-projects-{}", std::process::id()));
@@ -712,7 +665,7 @@ fn olp_evo_harvest_state_is_per_project() {
 
 /// Scenario: 记录目录与记录校验
 #[test]
-#[ignore]
+
 fn olp_evo_records_dir_frontmatter_is_valid() {
     let dir = repo_root().join("knowledge/context/evolution");
     for name in ["README.md", "FLAW-template.md", "memory.md", "operators.md"] {
@@ -812,7 +765,7 @@ fn frontmatter(text: &str) -> Option<std::collections::HashMap<String, String>> 
 
 /// Scenario: olp-init 为只忽略活板的项目追加 EVOLUTION.md 忽略
 #[test]
-#[ignore]
+
 fn olp_evo_init_appends_evolution_gitignore_once() {
     let root = std::env::temp_dir().join(format!("olp-evo-init-append-{}", std::process::id()));
     let repo = root.join("repo");
@@ -845,7 +798,7 @@ fn olp_evo_init_appends_evolution_gitignore_once() {
 
 /// Scenario: olp-init 对整目录已忽略的项目不追加
 #[test]
-#[ignore]
+
 fn olp_evo_init_skips_when_octos_dir_ignored() {
     let root = std::env::temp_dir().join(format!("olp-evo-init-skip-{}", std::process::id()));
     let repo = root.join("repo");
