@@ -89,9 +89,11 @@ add_candidate() { # trigger source realpath identity line offset ts symptom
 # Review board: leading-whitespace-stripped lines starting ACK(blocked): /
 # ACK(wontdo): under the nearest preceding ### <number> heading.
 harvest_board() { # realpath
-    local rp=$1 line_no=0 entry=-1 trimmed trigger rest lsha ident
+    local rp=$1 line_no=0 entry=-1 trimmed trigger rest lsha ident byte_off=0
     while IFS= read -r line || [ -n "$line" ]; do
         line_no=$((line_no + 1))
+        local line_off=$byte_off
+        byte_off=$((byte_off + $(printf '%s' "$line" | wc -c) + 1))
         if [[ $line =~ ^\#\#\#[[:space:]]+([0-9]+) ]]; then
             entry=${BASH_REMATCH[1]}
         fi
@@ -107,7 +109,7 @@ harvest_board() { # realpath
             [ "$trigger" = ack_wontdo ] && kind=wontdo
             ident="board:$rp#$entry#$kind#$lsha"
             local symptom=${rest:0:200}
-            add_candidate "$trigger" review "$rp" "$ident" "$line_no" "" "$(now_rfc3339)" "$symptom"
+            add_candidate "$trigger" review "$rp" "$ident" "$line_no" "$line_off" "$(now_rfc3339)" "$symptom"
         fi
     done < "$BOARD"
 }
@@ -131,7 +133,10 @@ if data and not data.endswith(b"\n"):
 import os
 out_path = os.environ.get("OLP_EVO_EVENTS_OUT", "/tmp/.olp_evo_events_out")
 open(out_path, "w").close()
+byte_off = 0
 for i, line in enumerate(lines):
+    line_off = byte_off
+    byte_off += len(line.encode("utf-8")) + 1
     if not line.strip():
         continue
     try:
@@ -159,7 +164,9 @@ for i, line in enumerate(lines):
     ident = f"events:{rp}#{ts}#{kind}#{ref}#{lsha}"
     symptom = line[:200]
     with open(out_path, "a") as out:
-        out.write(f"{trigger}|events|{rp}|{ident}|{i+1}||{ts}|{symptom}\n")
+        import datetime as _dt
+        harvest_ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out.write(f"{trigger}|events|{rp}|{ident}|{i+1}|{line_off}|{harvest_ts}|{symptom}\n")
 PY
 }
 
@@ -168,9 +175,11 @@ PY
 harvest_mcp() { # realpath
     local rp=$1
     [ -f "$MCP_BOARD" ] || { skip "$MCP_BOARD"; return 0; }
-    local line_no=0 ts kind detail ask_id trigger symptom lsha ident
+    local line_no=0 ts kind detail ask_id trigger symptom lsha ident byte_off=0
     while IFS= read -r line || [ -n "$line" ]; do
         line_no=$((line_no + 1))
+        local line_off=$byte_off
+        byte_off=$((byte_off + ${#line} + 1))
         if [[ $line =~ ^-\ ([^[:space:]]+\ [^[:space:]]+)\ MCP\(ask_outer\)\ (blocked|timeout):\ (.*)$ ]]; then
             ts=${BASH_REMATCH[1]}
             kind=${BASH_REMATCH[2]}
@@ -187,7 +196,7 @@ harvest_mcp() { # realpath
             lsha=$(printf '%s' "$line" | sha256sum | cut -d' ' -f1)
             ident="mcp:$rp#$ts#$kind#$ask_id#$lsha"
             symptom="kind=$kind id=$ask_id reason=${reason:0:80}"
-            add_candidate "$trigger" mcp "$rp" "$ident" "$line_no" "" "$ts" "$symptom"
+            add_candidate "$trigger" mcp "$rp" "$ident" "$line_no" "$line_off" "$(now_rfc3339)" "$symptom"
         fi
     done < "$MCP_BOARD"
 }

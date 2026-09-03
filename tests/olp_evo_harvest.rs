@@ -201,6 +201,81 @@ fn olp_evo_harvest_produces_cards_for_all_trigger_kinds() {
         assert!(envelope.is_some(), "card missing envelope: {block}");
         assert!(symptom.is_some(), "card missing symptom: {block}");
     }
+    // #41-r1 ①: each card's envelope offset must equal the BYTE offset of
+    // its trigger line in the fixture source, and be strictly increasing
+    // per source (cards are emitted in source order).
+    let board_bytes = std::fs::read(fixtures("review-board.md")).unwrap();
+    let expected_board = line_byte_offsets(&board_bytes, |l| {
+        l.starts_with("ACK(blocked):") || l.starts_with("ACK(wontdo):")
+    });
+    let mcp_bytes = std::fs::read(fixtures("mcp-board.md")).unwrap();
+    let expected_mcp = line_byte_offsets(&mcp_bytes, |l| {
+        l.contains("MCP(ask_outer) blocked:") || l.contains("MCP(ask_outer) timeout:")
+    });
+    let events_bytes = std::fs::read(fixtures("events.jsonl")).unwrap();
+    let expected_events = line_byte_offsets(&events_bytes, |l| !l.trim().is_empty());
+    let mut got_review: Vec<usize> = Vec::new();
+    let mut got_mcp: Vec<usize> = Vec::new();
+    let mut got_events: Vec<usize> = Vec::new();
+    for block in text.split("### EVO-").skip(1) {
+        let envelope = block
+            .lines()
+            .find(|l| l.starts_with("envelope:"))
+            .expect("envelope line");
+        let offset: usize = envelope
+            .split("offset=")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|v| v.parse().ok())
+            .expect("offset value");
+        if block.contains("source: review ") {
+            got_review.push(offset);
+        } else if block.contains("source: mcp ") {
+            got_mcp.push(offset);
+        } else {
+            got_events.push(offset);
+        }
+        // ②: envelope ts must EQUAL the card title timestamp (collection
+        // time, UTC RFC3339) — not the source line's own time.
+        let title_ts = block.lines().next().unwrap_or("");
+        let title_ts = title_ts
+            .split('（')
+            .nth(1)
+            .and_then(|rest| rest.split('，').next())
+            .unwrap_or("");
+        let env_ts = envelope.split("ts=").nth(1).unwrap_or("").trim();
+        assert_eq!(
+            env_ts, title_ts,
+            "envelope ts must equal the title (collection) ts: {block}"
+        );
+    }
+    assert_eq!(
+        got_review, expected_board,
+        "review card offsets = fixture line byte offsets (increasing)"
+    );
+    assert_eq!(
+        got_mcp, expected_mcp,
+        "mcp card offsets = fixture line byte offsets (increasing)"
+    );
+    assert_eq!(
+        got_events, expected_events,
+        "events card offsets = fixture line byte offsets (increasing)"
+    );
+}
+
+/// Byte offset of the FIRST byte of each line matching `pred`, in file order.
+fn line_byte_offsets(data: &[u8], pred: impl Fn(&str) -> bool) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    for line in data.split(|b| *b == b'\n') {
+        let len = line.len();
+        let text = String::from_utf8_lossy(line);
+        if pred(&text) {
+            out.push(off);
+        }
+        off += len + 1;
+    }
+    out
 }
 
 /// Scenario: 负例矩阵零卡
