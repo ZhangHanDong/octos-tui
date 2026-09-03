@@ -683,7 +683,11 @@ fn olp_evo_records_dir_frontmatter_is_valid() {
             Some("context"),
             "{name}"
         );
-        assert!(fm.get("id").is_some_and(|v| v.len() == 1), "{name} id");
+        assert!(
+            fm.get("id")
+                .is_some_and(|v| v.starts_with("FLAW-") && v.len() > "FLAW-".len()),
+            "{name} id"
+        );
         ids.push(fm["id"].clone());
         assert!(fm.contains_key("repo"), "{name}");
         assert!(fm.contains_key("layers"), "{name}");
@@ -706,10 +710,7 @@ fn olp_evo_records_dir_frontmatter_is_valid() {
         );
         let severity = fm.get("severity").map(String::as_str);
         assert!(
-            matches!(
-                severity,
-                Some("low") | Some("medium") | Some("high") | Some("critical")
-            ),
+            matches!(severity, Some("S1") | Some("S2") | Some("S3")),
             "{name} severity: {severity:?}"
         );
         let recurrence = fm.get("recurrence").map(String::as_str).unwrap_or("");

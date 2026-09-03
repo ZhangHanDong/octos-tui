@@ -92,6 +92,14 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   else
     ok "黑板已在 .gitignore 中"
   fi
+  # 进化黑板(EVOLUTION.md)同样分支无关:仅在尚未被忽略时追加一行;
+  # 整目录 .octos 已忽略的项目不重复追加(git check-ignore 判定)。
+  if ! git check-ignore -q .octos/EVOLUTION.md 2>/dev/null; then
+    printf '.octos/EVOLUTION.md\n' >> .gitignore
+    ok "进化黑板已加入 .gitignore"
+  else
+    ok "进化黑板已被忽略"
+  fi
 fi
 
 say ""
