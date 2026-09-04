@@ -41,7 +41,11 @@ die() { echo "error: $*" >&2; exit 1; }
 skip() { echo "skip: $*" >&2; }
 
 # --- helpers -----------------------------------------------------------
-now_rfc3339() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+# 41-r4: sample the collection timestamp ONCE per run — the card title
+# and the envelope ts must be identical even when a second boundary passes
+# between candidate creation and emission (CI caught the double-sample).
+HARVEST_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+now_rfc3339() { printf '%s' "$HARVEST_TS"; }
 
 hex_of() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
 
@@ -120,7 +124,7 @@ harvest_events() { # realpath
     local rp=$1
     [ -z "$EVENTS" ] && return 0
     [ -f "$EVENTS" ] || { skip "$EVENTS"; return 0; }
-    OLP_EVO_EVENTS_OUT="/tmp/.olp_evo_events_out.$$" python3 - "$EVENTS" "$rp" <<'PY' || true
+    OLP_EVO_HARVEST_TS="$HARVEST_TS" OLP_EVO_EVENTS_OUT="/tmp/.olp_evo_events_out.$$" python3 - "$EVENTS" "$rp" <<'PY' || true
 import hashlib, json, sys, datetime
 
 path, rp = sys.argv[1], sys.argv[2]
@@ -164,8 +168,7 @@ for i, line in enumerate(lines):
     ident = f"events:{rp}#{ts}#{kind}#{ref}#{lsha}"
     symptom = line[:200]
     with open(out_path, "a") as out:
-        import datetime as _dt
-        harvest_ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        harvest_ts = os.environ.get("OLP_EVO_HARVEST_TS", "")
         out.write(f"{trigger}|events|{rp}|{ident}|{i+1}|{line_off}|{harvest_ts}|{symptom}\n")
 PY
 }
