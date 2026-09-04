@@ -108,6 +108,22 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 say ""
+say "== 外环侦听哨(~/.octos/outer/watch-board.sh) =="
+OUTER_DIR="$HOME/.octos/outer"
+SENTINEL_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/olp-watch-board.sh"
+if [ -f "$SENTINEL_SRC" ]; then
+  mkdir -p "$OUTER_DIR"
+  if [ -f "$OUTER_DIR/watch-board.sh" ]; then
+    ok "watch-board.sh 已存在,跳过(如需更新: cp $SENTINEL_SRC $OUTER_DIR/watch-board.sh)"
+  else
+    cp "$SENTINEL_SRC" "$OUTER_DIR/watch-board.sh" && chmod +x "$OUTER_DIR/watch-board.sh"
+    ok "已安装 watch-board.sh → $OUTER_DIR/"
+  fi
+else
+  say "  [--] 未找到 olp-watch-board.sh(curl 单文件运行时不装;从仓库运行 scripts/olp-init.sh 会安装)"
+fi
+
+say ""
 say "== 下一步(按序) =="
 say "  1. 启动内环(标准命令;--solo 是单人盒子安全门):"
 say "       octoscode --stdio-command 'octos serve --stdio --solo'"
