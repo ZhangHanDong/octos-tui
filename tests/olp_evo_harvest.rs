@@ -209,6 +209,9 @@ fn olp_evo_harvest_produces_cards_for_all_trigger_kinds() {
         l.starts_with("ACK(blocked):") || l.starts_with("ACK(wontdo):")
     });
     let mcp_bytes = std::fs::read(fixtures("mcp-board.md")).unwrap();
+    // The blocked line carries CJK detail (#41-r3): char-counting offsets
+    // drift on it, byte-true `wc -c` does not — this equality IS the CJK
+    // byte-offset assertion.
     let expected_mcp = line_byte_offsets(&mcp_bytes, |l| {
         l.contains("MCP(ask_outer) blocked:") || l.contains("MCP(ask_outer) timeout:")
     });
@@ -734,6 +737,37 @@ fn olp_evo_harvest_state_is_per_project() {
         .collect();
     assert_eq!(project_dirs.len(), 2, "two distinct project subdirs");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// #41-r3: the script must work from any cwd (board-append resolved via
+/// $(dirname "$0")); run it from a temp dir with an absolute repo-root.
+#[test]
+fn olp_evo_harvest_runs_from_outside_repo_cwd() {
+    let sb = Sandbox::new("outside-cwd");
+    sb.full_trigger_board();
+    let outside = sb.root.join("elsewhere");
+    std::fs::create_dir_all(&outside).unwrap();
+    let out = Command::new("bash")
+        .arg(script())
+        .arg(sb.repo.canonicalize().unwrap())
+        .current_dir(&outside)
+        .env("OLP_EVO_STATE", &sb.state_root)
+        .env("OLP_EVO_EVENTS", &sb.events_path)
+        .env("OLP_EVO_MCP_BOARD", &sb.mcp_path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "exit={} stdout={} stderr={}",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        sb.evo_count(),
+        8,
+        "cards must land when run from an outside cwd"
+    );
 }
 
 /// Scenario: 记录目录与记录校验

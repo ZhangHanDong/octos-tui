@@ -179,7 +179,7 @@ harvest_mcp() { # realpath
     while IFS= read -r line || [ -n "$line" ]; do
         line_no=$((line_no + 1))
         local line_off=$byte_off
-        byte_off=$((byte_off + ${#line} + 1))
+        byte_off=$((byte_off + $(printf '%s' "$line" | wc -c) + 1))
         if [[ $line =~ ^-\ ([^[:space:]]+\ [^[:space:]]+)\ MCP\(ask_outer\)\ (blocked|timeout):\ (.*)$ ]]; then
             ts=${BASH_REMATCH[1]}
             kind=${BASH_REMATCH[2]}
@@ -368,13 +368,13 @@ fi
 
 # Fault injection (tests only): after appending all cards, before state.
 if [ "${OLP_EVO_TEST:-0}" = "1" ] && [ "${OLP_EVO_FAULT:-}" = "after-append" ] && [ -n "$APPEND_TEXT" ]; then
-    printf '%s' "$APPEND_TEXT" | scripts/olp-board-append.sh "$EVO_BOARD" >/dev/null 2>&1 || true
+    printf '%s' "$APPEND_TEXT" | "$(dirname "$0")/olp-board-append.sh" "$EVO_BOARD" >/dev/null 2>&1 || true
     echo "fault-injected: after-append" >&2
     exit 70
 fi
 
 if [ -n "$APPEND_TEXT" ]; then
-    printf '%s' "$APPEND_TEXT" | scripts/olp-board-append.sh "$EVO_BOARD"
+    printf '%s' "$APPEND_TEXT" | "$(dirname "$0")/olp-board-append.sh" "$EVO_BOARD"
 fi
 export OLP_EVO_BOARD="$EVO_BOARD"
 
