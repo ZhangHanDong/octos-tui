@@ -18,7 +18,13 @@ MCP_BOARD="${OLP_EVO_MCP_BOARD:-$HOME/.octos/outer/OUTER_LOOP_MCP.md}"
 EVO_BOARD="${OLP_EVO_BOARD:-$REPO_ROOT/.octos/EVOLUTION.md}"
 STATE_ROOT="${OLP_EVO_STATE:-$HOME/.octos/outer/evo}"
 
-REAL_REPO=$(realpath "$REPO_ROOT" 2>/dev/null || realpath "$REPO_ROOT")
+# 41-r5a ⑤: a missing repo-root must exit 2 with zero side effects —
+# realpath would otherwise die (exit 1) under set -e before the board check.
+if [ ! -d "$REPO_ROOT" ] && [ ! -f "$REPO_ROOT" ]; then
+    echo "error: repo-root not found: $REPO_ROOT" >&2
+    exit 2
+fi
+REAL_REPO=$(realpath "$REPO_ROOT")
 PROJECT_KEY=$(printf '%s' "$REAL_REPO" | sha256sum | cut -c1-16)
 STATE_DIR="$STATE_ROOT/$PROJECT_KEY"
 STATE_FILE="$STATE_DIR/state.json"
@@ -160,9 +166,10 @@ for i, line in enumerate(lines):
             trigger = "goal_budget_limited"
     if not trigger:
         continue
-    ts = d.get("ts", "")
-    if not ts:
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # 41-r5a ③: a missing ts must NOT bake now() into the identity (a
+    # fresh stamp per run means the event never dedups). Identity uses
+    # '-'; the line sha256 still distinguishes events.
+    ts = d.get("ts", "") or "-"
     ref = d.get("goal_id") or d.get("slug") or d.get("session") or "-"
     lsha = hashlib.sha256(line.encode()).hexdigest()
     ident = f"events:{rp}#{ts}#{kind}#{ref}#{lsha}"
@@ -205,14 +212,18 @@ harvest_mcp() { # realpath
 }
 
 # --- offsets & change detection ----------------------------------------
-# Returns "<offset> <dev> <ino> <prefix_sha>" for a source path and its
-# recorded state (empty if fresh).
-source_state() { # state_json source_key
+# Returns "<offset> <dev> <ino> <prefix_sha>" for a source key from the
+# state FILE (41-r5a ①: the caller previously passed the JSON *text* while
+# this helper treated it as a path — the bare except swallowed the error,
+# so prev/dev/ino/prefix were never read and every rerun printed reset:).
+source_state() { # state_file source_key
     python3 - "$1" "$2" <<'PY'
 import json, sys
 try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except (OSError, ValueError) as exc:
+    sys.stderr.write(f"state-read-failed: {exc}\n")
     sys.exit(0)
 src = d.get("sources", {}).get(sys.argv[2])
 if src:
@@ -252,7 +263,20 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 # Reconcile with the evolution board (authoritative): recover next_id and
-# seen identities from what actually landed.
+# seen identities from what actually landed. Board identities AND the
+# state's stored seen set (both sha256(identity)) feed the same list.
+if [ -f "$STATE_FILE" ]; then
+    while IFS= read -r seen_sha; do
+        [ -n "$seen_sha" ] && SEEN_LIST+="$seen_sha"$'\n'
+    done < <(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("\n".join(d.get("seen", [])))
+except Exception:
+    pass
+' "$STATE_FILE")
+fi
 if [ -f "$EVO_BOARD" ]; then
     while IFS= read -r line; do
         case $line in
@@ -263,20 +287,31 @@ if [ -f "$EVO_BOARD" ]; then
                 # whole reconcile loop under set -e).
                 local_id=${line#\#\#\# EVO-}
                 local_id=${local_id%%[$'\uff08' ]*}
+                # 41-r5a ④: a non-numeric id (e.g. `### EVO-draft`) must be
+                # skipped with a warning, never abort the reconcile loop
+                # (`value too great for base` kills set -e scripts).
+                if ! [[ $local_id =~ ^[0-9]+$ ]]; then
+                    echo "warn: non-numeric EVO id ignored in reconcile: $line" >&2
+                    continue
+                fi
                 local_id=$((10#$local_id))
                 if [ "$local_id" -ge "$NEXT_ID" ]; then
                     NEXT_ID=$((local_id + 1))
                 fi
                 ;;
             identity:*)
-                SEEN_LIST+="${line#identity: }"$'\n'
+                # 41-r5a ②: state.seen stores sha256(identity) — normalize
+                # board-side identities into the same space for compare.
+                SEEN_LIST+="$(printf '%s' "${line#identity: }" | sha256sum | cut -d' ' -f1)"$'\n'
                 ;;
         esac
     done < "$EVO_BOARD"
 fi
 
 seen_contains() {
-    local want=${1%$'\r'}
+    # 41-r5a ②: compare in sha256 space (state stores hashes).
+    local want
+    want=$(printf '%s' "${1%$'\r'}" | sha256sum | cut -d' ' -f1)
     local list=$SEEN_LIST
     # trim leading/trailing newlines so here-string does not yield empty rows
     while [ -n "$list" ] && [ "${list:0:1}" = $'\n' ]; do list=${list#?}; done
@@ -302,10 +337,8 @@ collect_source() { # source_key path harvest_fn
         return 0
     fi
     local prev=0 prev_dev=0 prev_ino=0 prev_prefix=""
-    if [ "$DRY_RUN" -eq 0 ] && [ -f "$STATE_FILE" ]; then
-        read -r prev prev_dev prev_ino prev_prefix <<<"$(source_state "$(cat "$STATE_FILE")" "$key")"
-    elif [ "$DRY_RUN" -eq 1 ] && [ -f "$STATE_FILE" ]; then
-        read -r prev prev_dev prev_ino prev_prefix <<<"$(source_state "$(cat "$STATE_FILE")" "$key")"
+    if [ -f "$STATE_FILE" ]; then
+        read -r prev prev_dev prev_ino prev_prefix <<<"$(source_state "$STATE_FILE" "$key")"
     fi
     local rp
     rp=$(realpath "$path")

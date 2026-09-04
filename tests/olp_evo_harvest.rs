@@ -483,6 +483,109 @@ fn olp_evo_harvest_partial_line_then_completed_yields_one_card() {
     assert_eq!(sb.evo_count(), 2);
 }
 
+/// #41-r5a: an UNCHANGED rerun must print NO reset: (the cursor logic
+/// reads state correctly; reset fires only on real change).
+#[test]
+fn olp_evo_harvest_unchanged_rerun_prints_no_reset() {
+    let sb = Sandbox::new("no-reset");
+    sb.full_trigger_board();
+    let out1 = sb.run(false);
+    assert!(
+        out1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let out2 = sb.run(false);
+    assert!(out2.status.success());
+    let stderr = String::from_utf8_lossy(&out2.stderr);
+    assert!(
+        !stderr.contains("reset:"),
+        "unchanged rerun must not log reset: {stderr}"
+    );
+    assert_eq!(sb.evo_count(), 8);
+}
+
+/// #41-r5a ③: events WITHOUT a ts field must still dedup across reruns
+/// (identity uses '-', not a per-run now()).
+#[test]
+fn olp_evo_harvest_missing_ts_events_dedup_across_reruns() {
+    let sb = Sandbox::new("no-ts");
+    std::fs::write(
+        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
+        "### 1. base\n\nnothing\n",
+    )
+    .unwrap();
+    let no_ts = b"{\"kind\":\"escalation\",\"data\":{\"goal_id\":\"g1\",\"detail\":\"d\"}}\n";
+    std::fs::write(&sb.events_path, no_ts).unwrap();
+    let out1 = sb.run(false);
+    assert!(
+        out1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    assert_eq!(sb.evo_count(), 1, "first run harvests the ts-less event");
+    let out2 = sb.run(false);
+    assert!(out2.status.success());
+    assert_eq!(sb.evo_count(), 1, "ts-less event must dedup on rerun");
+}
+
+/// #41-r5a ④: a non-numeric EVO heading (### EVO-draft) on the board must
+/// not abort reconcile — harvesting still lands cards.
+#[test]
+fn olp_evo_harvest_survives_non_numeric_evo_id_on_board() {
+    let sb = Sandbox::new("draft-id");
+    std::fs::write(
+        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
+        "### 12. A\n\nACK(blocked): x\n",
+    )
+    .unwrap();
+    let out1 = sb.run(false);
+    assert!(out1.status.success());
+    assert_eq!(sb.evo_count(), 1);
+    // Plant a draft heading on the evolution board, then rerun with a new
+    // trigger to prove reconcile survived it.
+    std::fs::write(
+        sb.repo.join(".octos/EVOLUTION.md"),
+        "### EVO-draft（manual，human）\ntrigger: manual\n",
+    )
+    .unwrap();
+    std::fs::write(
+        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
+        "### 12. A\n\nACK(blocked): x\n\n### 13. B\n\nACK(wontdo): y\n",
+    )
+    .unwrap();
+    let out2 = sb.run(false);
+    assert!(
+        out2.status.success(),
+        "reconcile must survive non-numeric ids: stderr={}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    assert_eq!(sb.evo_count(), 2, "the new trigger still lands a card");
+}
+
+/// #41-r5a ⑤: a missing repo-root exits 2 with zero side effects.
+#[test]
+fn olp_evo_harvest_missing_repo_root_exits_two() {
+    let root = std::env::temp_dir().join(format!("olp-evo-norepo-{}", std::process::id()));
+    let missing = root.join("no-such-repo");
+    let state_root = root.join("state");
+    std::fs::create_dir_all(&state_root).unwrap();
+    let out = Command::new("bash")
+        .arg(script())
+        .arg(&missing)
+        .env("OLP_EVO_STATE", &state_root)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(find_files(&state_root).is_empty(), "zero side effects");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Scenario: 截断或替换后重置且不重复
 #[test]
 
