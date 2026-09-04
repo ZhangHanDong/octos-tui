@@ -99,10 +99,14 @@ add_candidate() { # trigger source realpath identity line offset ts symptom
 # Review board: leading-whitespace-stripped lines starting ACK(blocked): /
 # ACK(wontdo): under the nearest preceding ### <number> heading.
 harvest_board() { # realpath
+    # 41-r5b ⑦: only newline-TERMINATED lines fire (REQ-OLP-EVO-CURSOR);
+    # the trailing fragment (read fills $line but rc!=0) is skipped.
     local rp=$1 line_no=0 entry=-1 trimmed trigger rest lsha ident byte_off=0
-    while IFS= read -r line || [ -n "$line" ]; do
+    while IFS= read -r line; do
         line_no=$((line_no + 1))
         local line_off=$byte_off
+        # byte accumulation covers EVERY newline-terminated line — empty
+        # separator lines included (they still advance the offset).
         byte_off=$((byte_off + $(printf '%s' "$line" | wc -c) + 1))
         if [[ $line =~ ^\#\#\#[[:space:]]+([0-9]+) ]]; then
             entry=${BASH_REMATCH[1]}
@@ -154,6 +158,12 @@ for i, line in enumerate(lines):
     except Exception:
         sys.stderr.write(f"malformed: {path}:{i+1}\n")
         continue
+    # 41-r5b ⑥: valid JSON that is NOT an object (null/list/number) would
+    # crash d.get below (AttributeError, previously swallowed by || true
+    # and silently dropping every later event) — treat as malformed.
+    if not isinstance(d, dict):
+        sys.stderr.write(f"malformed: {path}:{i+1}\n")
+        continue
     kind = d.get("kind", "")
     trigger = None
     if kind in ("escalation", "turn_error"):
@@ -185,8 +195,9 @@ PY
 harvest_mcp() { # realpath
     local rp=$1
     [ -f "$MCP_BOARD" ] || { skip "$MCP_BOARD"; return 0; }
+    # 41-r5b ⑦: same newline-terminated rule as the board/events.
     local line_no=0 ts kind detail ask_id trigger symptom lsha ident byte_off=0
-    while IFS= read -r line || [ -n "$line" ]; do
+    while IFS= read -r line; do
         line_no=$((line_no + 1))
         local line_off=$byte_off
         byte_off=$((byte_off + $(printf '%s' "$line" | wc -c) + 1))
@@ -198,10 +209,19 @@ harvest_mcp() { # realpath
             if [[ $detail =~ id=([0-9a-fA-F]+) ]]; then
                 ask_id=${BASH_REMATCH[1]}
             fi
-            local reason=''
-            if [[ $detail =~ reason=([^\ ]*) ]]; then
-                reason=${BASH_REMATCH[1]}
-            fi
+            # 41-r5b ⑧: take up to 80 chars after `reason=`, stopping at
+            # the next ` key=` token or end of detail — not just one word.
+            # 41-r5b ⑧: reason = up to 80 chars after `reason=`, stopping
+            # at the NEXT ` key=` token. Bash ERE lacks lazy quantifiers
+            # (glob `%% [a-z_]*=*` eats to the FIRST word boundary), so
+            # cut with python (same interpreter the script already uses).
+            local reason
+            reason=$(printf '%s' "$detail" | python3 -c '
+import re, sys
+r = sys.argv[1][sys.argv[1].find("reason=") + len("reason="):]
+m = re.search(r"\s[a-z_]+=", r)
+print((r[: m.start()] if m else r)[:80])
+' "$detail")
             if [ "$kind" = blocked ]; then trigger=report_blocked; else trigger=ask_outer_timeout; fi
             lsha=$(printf '%s' "$line" | sha256sum | cut -d' ' -f1)
             ident="mcp:$rp#$ts#$kind#$ask_id#$lsha"

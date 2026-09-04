@@ -67,13 +67,15 @@ estimate: 1.5d
 - 测试为 Rust 集成测试 `tests/olp_evo_harvest.rs`,经 `std::process::Command` 调脚本;夹具源文件放
   `fixtures/evolution/`,每个测试复制到 `std::env::temp_dir()` 下唯一子目录,`OLP_EVO_STATE` 指向
   该子目录内的状态根。
-- 不新增 Cargo 依赖;脚本只依赖 bash、coreutils、flock、python3、sha256sum、stat。
+- 不新增 Cargo 依赖;脚本只依赖 bash、coreutils、flock、python3、sha256sum、stat。测试在缺 GNU flock 或 `stat -c` 的宿主(如 macOS 本地)显式打印 SKIP 并跳过,CI(ubuntu)保持全量严格。
 
 <!-- lint-ack: decision-coverage — 用法、状态形状、故障注入、退出码等决策由多个场景共同行使,不单列场景 -->
 
 ## 边界
 
 ### Allowed Changes
+- specs/task-req-olp-evo-p0.spec.md
+  <!-- self-allowance: 决策文字补充(如工具依赖说明)可改;场景与断言不可改 -->
 - scripts/olp-evo-harvest.sh
 - scripts/olp-init.sh
 - tests/olp_evo_harvest.rs

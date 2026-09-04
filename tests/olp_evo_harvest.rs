@@ -7,6 +7,30 @@
 //! per-test state root. The 17 test function names match the contract's
 //! scenario filters verbatim.
 
+/// #41-r5b ⑪: the script depends on GNU flock and stat -c; on hosts
+/// without them (e.g. macOS local), say so explicitly and skip rather
+/// than fail opaquely. CI (ubuntu) runs the full set.
+fn ensure_gnu_tooling_or_skip() -> bool {
+    let flock = Command::new("sh")
+        .arg("-c")
+        .arg("command -v flock >/dev/null 2>&1")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let stat_c = Command::new("stat")
+        .arg("-c")
+        .arg("%s")
+        .arg("/dev/null")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if flock && stat_c {
+        return true;
+    }
+    eprintln!("SKIP (explicit): host lacks GNU flock/stat -c; harvest script requires them");
+    false
+}
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,6 +107,9 @@ impl Sandbox {
     }
 
     fn run(&self, dry_run: bool) -> Output {
+        if !ensure_gnu_tooling_or_skip() {
+            panic!("host lacks required tooling; see stderr");
+        }
         let mut cmd = Command::new("bash");
         cmd.arg(script()).arg(&self.repo);
         if dry_run {
@@ -627,7 +654,7 @@ fn olp_evo_harvest_resets_on_truncate_or_replace_without_duplicates() {
     );
     assert_eq!(sb.evo_count(), 2, "no duplicate after truncate");
     // replace with a larger file with two NEW escalations
-    std::fs::write(&events, format!("{}{}{}", esc(3), esc(4), esc(5))).unwrap();
+    std::fs::write(&events, format!("{}{}", esc(3), esc(4))).unwrap();
     let out3 = run();
     assert!(out3.status.success());
     let stderr3 = String::from_utf8_lossy(&out3.stderr);
@@ -635,7 +662,11 @@ fn olp_evo_harvest_resets_on_truncate_or_replace_without_duplicates() {
         stderr3.contains("reset:"),
         "replace must log reset: {stderr3}"
     );
-    assert_eq!(sb.evo_count(), 5, "exactly +3 new cards after replace");
+    assert_eq!(
+        sb.evo_count(),
+        4,
+        "exactly +2 new cards after replace (contract: two new escalations)"
+    );
 }
 
 /// Scenario: 追加卡后提交状态前崩溃可恢复
@@ -871,6 +902,172 @@ fn olp_evo_harvest_runs_from_outside_repo_cwd() {
         8,
         "cards must land when run from an outside cwd"
     );
+}
+
+/// #41-r5b ⑥: JSON-valid but non-object events lines (null / arrays)
+/// count as malformed and processing CONTINUES past them.
+#[test]
+fn olp_evo_harvest_non_object_json_is_malformed_and_continues() {
+    let sb = Sandbox::new("non-object");
+    std::fs::write(
+        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
+        "### 1. base\n\nnothing\n",
+    )
+    .unwrap();
+    let esc = |n: u32| {
+        format!(
+            "{{\"ts\":\"2026-08-30T0{n}:00:00Z\",\"kind\":\"escalation\",\"data\":{{\"goal_id\":\"g{n}\"}}}}\n"
+        )
+    };
+    std::fs::write(
+        &sb.events_path,
+        format!("null\n[1,2]\n{}\"42\"\n{}", esc(1), esc(2)),
+    )
+    .unwrap();
+    let out = sb.run(false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.matches("malformed:").count() >= 3,
+        "null/array/number lines are malformed: {stderr}"
+    );
+    assert_eq!(sb.evo_count(), 2, "events AFTER the non-objects still fire");
+}
+
+/// #41-r5b ⑦: a board line without a trailing newline (half line) must
+/// not fire; completing it fires exactly once.
+#[test]
+fn olp_evo_harvest_board_partial_line_no_fire_until_newline() {
+    let sb = Sandbox::new("board-partial");
+    let board = sb.repo.join(".octos/OUTER_LOOP_REVIEW.md");
+    std::fs::write(&board, "### 12. A\n\nACK(blocked): complete\n").unwrap();
+    let out1 = sb.run(false);
+    assert!(out1.status.success());
+    assert_eq!(sb.evo_count(), 1);
+    // append a NEW trigger without trailing newline — must not fire yet
+    std::fs::write(
+        &board,
+        "### 12. A\n\nACK(blocked): complete\n\n### 13. B\n\nACK(wontdo): half",
+    )
+    .unwrap();
+    let out2 = sb.run(false);
+    assert!(out2.status.success());
+    assert_eq!(sb.evo_count(), 1, "half line (no newline) must not fire");
+    // complete it
+    std::fs::write(
+        &board,
+        "### 12. A\n\nACK(blocked): complete\n\n### 13. B\n\nACK(wontdo): half\n",
+    )
+    .unwrap();
+    let out3 = sb.run(false);
+    assert!(out3.status.success());
+    assert_eq!(sb.evo_count(), 2, "completed line fires exactly once");
+}
+
+/// #41-r5b ⑦ (MCP side): same newline rule for the MCP board.
+#[test]
+fn olp_evo_harvest_mcp_partial_line_no_fire_until_newline() {
+    let sb = Sandbox::new("mcp-partial");
+    std::fs::write(
+        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
+        "### 1. base\n\nnothing\n",
+    )
+    .unwrap();
+    let full = "- 2026-08-30 05:00:00 MCP(ask_outer) blocked: id=a1 reason=r1\n";
+    std::fs::write(&sb.mcp_path, full).unwrap();
+    let out1 = sb.run(false);
+    assert!(out1.status.success());
+    assert_eq!(sb.evo_count(), 1);
+    std::fs::write(
+        &sb.mcp_path,
+        "- 2026-08-30 05:00:00 MCP(ask_outer) blocked: id=a1 reason=r1\n- 2026-08-30 06:00:00 MCP(ask_outer) timeout: id=a2 reason=r2",
+    )
+    .unwrap();
+    let out2 = sb.run(false);
+    assert!(out2.status.success());
+    assert_eq!(sb.evo_count(), 1, "MCP half line must not fire");
+    std::fs::write(
+        &sb.mcp_path,
+        "- 2026-08-30 05:00:00 MCP(ask_outer) blocked: id=a1 reason=r1\n- 2026-08-30 06:00:00 MCP(ask_outer) timeout: id=a2 reason=r2\n",
+    )
+    .unwrap();
+    let out3 = sb.run(false);
+    assert!(out3.status.success());
+    assert_eq!(sb.evo_count(), 2);
+}
+
+/// #41-r5b ⑧: the MCP symptom carries reason= up to the NEXT key token
+/// (not just the first word).
+#[test]
+fn olp_evo_harvest_mcp_reason_takes_phrase_not_first_word() {
+    let sb = Sandbox::new("reason-phrase");
+    std::fs::write(
+        sb.repo.join(".octos/OUTER_LOOP_REVIEW.md"),
+        "### 1. base\n\nnothing\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &sb.mcp_path,
+        "- 2026-08-30 05:00:00 MCP(ask_outer) blocked: id=a1 reason=inner loop stuck on step three needs=op question=SECRET-QUESTION\n",
+    )
+    .unwrap();
+    let out = sb.run(false);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(sb.evo_board()).unwrap_or_default();
+    assert!(!text.contains("SECRET-QUESTION"));
+    let symptom = text
+        .lines()
+        .find(|l| l.starts_with("symptom:"))
+        .expect("card");
+    assert!(
+        symptom.contains("reason=inner loop stuck on step three"),
+        "reason keeps the phrase until the next key: {symptom}"
+    );
+    assert!(
+        !symptom.contains("needs="),
+        "reason stops at the next key token: {symptom}"
+    );
+}
+
+/// #41-r5b ⑨: appending the EVOLUTION ignore when .gitignore lacks a
+/// trailing newline must not glue onto the last line.
+#[test]
+fn olp_evo_init_pads_missing_trailing_newline() {
+    let root = std::env::temp_dir().join(format!("olp-evo-init-pad-{}", std::process::id()));
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".octos")).unwrap();
+    // note: NO trailing newline on the last line
+    std::fs::write(repo.join(".gitignore"), ".octos/OUTER_LOOP_REVIEW.md").unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let out = Command::new("bash")
+        .arg(init_script())
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(out.status.code(), Some(0) | Some(2)),
+        "exit={} stderr={}",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let gi = std::fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert!(
+        gi.lines().any(|l| l.trim() == ".octos/EVOLUTION.md"),
+        "EVOLUTION.md must be its OWN line, got:\n{gi}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Scenario: 记录目录与记录校验
