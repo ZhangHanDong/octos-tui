@@ -471,12 +471,95 @@ fn olp_evo_retro_no_cards_exit_zero() {
     assert!(!sb.retro_dir().exists());
 }
 
-/// Scenario: skill 卡 outer 第 5 步就位且受保护章节原文不变
+/// #42c: skill outer step 5 present; protected sections byte-identical
+/// to the phase-0 baseline (origin/main 18907aa).
 #[test]
-#[ignore]
-fn olp_evo_retro_skill_step5_and_protected_sections_golden() {}
+fn olp_evo_retro_skill_step5_and_protected_sections_golden() {
+    let skill =
+        std::fs::read_to_string(repo_root().join(".claude/skills/octoloop/SKILL.md")).unwrap();
 
-/// Scenario: BOOT §7 新增定式且 §0 至 §6 原文不变
+    // protected-section constants (sha256, baseline 18907aa)
+    const DESC: &str = "b2c32593cc6a5dacbc6e42ded9186c9ac94171c0d9d1883aa19f6ac760c5ccb4";
+    const INIT: &str = "71cd93889dcf5a437f0cd35e08ce069e1f8f589f2d0243553dd9017d6d73bcee";
+    const INNER: &str = "1e21d03921302a2125df06eb439bcc02edf14e1dc91bf77395238f8b78289597";
+    const DISC: &str = "adbb09472cc51deae4184c80c989e916ba9d1c03360487bfaa86a5c22a263f84";
+
+    let desc_line = skill
+        .lines()
+        .find(|l| l.starts_with("description:"))
+        .expect("description line");
+    assert_eq!(sha256_str(desc_line), DESC);
+
+    fn section<'a>(text: &'a str, header: &str) -> &'a str {
+        let start = text.find(header).expect("header");
+        let idx = text[start + header.len()..]
+            .find("\n## ")
+            .map(|i| start + header.len() + i);
+        let end = idx.unwrap_or(text.len());
+        &text[start..end]
+    }
+    assert_eq!(
+        sha256_str(&format!("{}\n", section(&skill, "## 模式 init"))),
+        INIT
+    );
+    assert_eq!(
+        sha256_str(&format!("{}\n", section(&skill, "## 模式 inner"))),
+        INNER
+    );
+    assert_eq!(
+        sha256_str(&format!("{}\n", section(&skill, "## 自主性纪律"))),
+        DISC
+    );
+
+    let outer = section(&skill, "## 模式 outer");
+    assert!(outer.contains("上岗五步"), "outer must list five steps");
+    assert!(outer.contains("olp-evo-retro.sh"));
+    assert!(outer.contains("R2 记档"));
+    assert!(outer.contains("operator"));
+}
+
+fn sha256_str(s: &str) -> String {
+    // sha256sum-compatible hex via the sha2 crate already in the tree
+    use sha2::Digest as _;
+    let d = sha2::Sha256::digest(s.as_bytes());
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// #42c: BOOT §7 has the adjudication forms; §0-§6 byte-identical.
 #[test]
-#[ignore]
-fn olp_evo_retro_boot_section7_and_golden() {}
+fn olp_evo_retro_boot_section7_and_golden() {
+    let boot = std::fs::read_to_string(repo_root().join("docs/OLP_OUTER_BOOT.md")).unwrap();
+
+    const BOOT_0_TO_6: &str = "89a820c60e5758db9be3d8e6c8573f9b0b15101fa9234ef92dd008c00e464836";
+    let slice = &boot[boot.find("## 0.").unwrap()..boot.find("## 7.").unwrap()];
+    assert_eq!(sha256_str(slice), BOOT_0_TO_6);
+
+    let s7 = &boot[boot.find("## 7.").unwrap()..];
+    assert!(s7.contains("改判(作废 #"), "override form present");
+    assert!(s7.contains("R2 记档(#"), "r2-record form present");
+    assert!(s7.contains("未 ACK"), "un-ACK rule present");
+}
+
+/// Scenario: issue 模板与 FEATURES 就位
+#[test]
+fn olp_evo_retro_issue_template_and_features_in_place() {
+    let tmpl =
+        std::fs::read_to_string(repo_root().join("knowledge/context/evolution/ISSUE-template.md"))
+            .unwrap();
+    for section in [
+        "## Summary",
+        "## Environment",
+        "## Reproduction",
+        "## Root cause",
+        "## Expected behavior",
+        "## Tests requested",
+        "## Related",
+    ] {
+        assert!(tmpl.contains(section), "missing {section}");
+    }
+    for fm in ["repo:", "evo:", "layers:", "severity:"] {
+        assert!(tmpl.contains(fm), "missing frontmatter {fm}");
+    }
+    let features = std::fs::read_to_string(repo_root().join("docs/OCTOLOOP_FEATURES.md")).unwrap();
+    assert!(features.contains("外环私有工作纸"));
+}
